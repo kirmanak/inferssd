@@ -453,14 +453,20 @@ ggml_tensor * llm_build_qwen4exp::build_qsa_sel(
     ggml_build_forward_expand(gf, sel_idx);
 
     // scatter zeros for the selected cells into an all -inf row, each dead slot into its own dump row n_kv + slot
-    // seeding from the score keeps the scatter storage on the layer's device
+    // seeding from the score keeps the scatter storage on the layer's device.
+    // Vulkan's repeat shader is f32-only. Casting the seed to f16 before the repeat
+    // allocates that mask on the CPU, and the in-place set_rows is still scheduled
+    // on the GPU, which faults in ggml_vk_tensor_subbuffer. Repeat f32, then cast.
     const int64_t n_kv = inp_kpool->n_kv;
 
     ggml_tensor * seed = ggml_view_1d(ctx0, score, 1, 0);
 
-    ggml_tensor * mask_all = ggml_fill(ctx0, type_mask == GGML_TYPE_F32 ? seed : ggml_cast(ctx0, seed, type_mask), -INFINITY);
+    ggml_tensor * mask_all = ggml_fill(ctx0, seed, -INFINITY);
     mask_all = ggml_repeat_4d(ctx0, mask_all, 1, n_kv + n_sel, n_tokens, 1);
     mask_all = ggml_reshape_3d(ctx0, mask_all, 1, n_kv + n_sel, n_tokens);
+    if (type_mask != GGML_TYPE_F32) {
+        mask_all = ggml_cast(ctx0, mask_all, type_mask);
+    }
 
     // the scattered values stay f32, set_rows converts them to the mask type
     ggml_tensor * zeros = ggml_fill(ctx0, seed, 0.0f);
