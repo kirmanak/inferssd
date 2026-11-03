@@ -43,24 +43,59 @@ anonymous RAM, so the copy is an ordinary staging upload.
 ## Tried
 
 1. Admit prefill misses into resident cache slots, read straight into the
-   slot, publish after the consumer. The next prompt's existing
-   `prepare_prefill_read` should hit. Cold path still streams, so the first
-   prompt should stay near 59 tok/s.
-2. When a layer has any cache hit, wait out the remaining misses and run one
-   Vulkan graph for the up/gate pairs and one for the down projections.
-   A fully cold layer stays on the streaming consumer so compute still
-   overlaps the read. `INFERSSD_PREFILL_GPU=0` disables the batch.
+   slot, publish after the consumer. A second prompt hits. Cold still
+   streams. Waiting for every miss deadlocks the 8-slot ring, so misses
+   keep streaming and only an all-hit layer takes the batch.
+2. One Vulkan graph for the up/gate pairs and one for the down projections.
+   `INFERSSD_PREFILL_GPU=0` disables it. Outputs come back on one fence.
+   Per-tensor fences, a 1 GB packed upload, mapped BAR reads, and a
+   pinned-host graph were slower or crashed. 512-expert chunks did not
+   beat 96 on the server.
+3. Import the cache arena with `VK_EXT_external_memory_host` so the GEMM
+   reads weights in place. Not wired in. See the bench below.
 
-Not tried yet, in order if the warm rate is short of 100:
+Not the path to 100:
 
-- Overlap the miss reads with the hit batch, instead of waiting first.
-- Import the cache arena instead of staging a copy.
-- Sort cold reads by file offset. That can approach 7 GB/s, about 70 tok/s
-  cold, and does not reach 100.
-- A fused SwiGLU so the down projection does not wait on a CPU round trip.
+- Sorting cold reads can approach 7 GB/s, about 70 tok/s cold.
+- A fused SwiGLU removes a CPU round trip inside the expert batch. That is
+  part of the 0.6 s of batch overhead, not the 1.7 s still missing.
 
 ## Results
 
-Not measured yet. The number that counts is the second prompt in one
-process, same 507-token file, greedy, with decode tok/s on a short
-generation still near 10 tok/s once the cache is warm.
+Second prompt in one process, 500 tokens from the 507-token file, commit
+`ec9a46d`. Decode was not remeasured: `n_predict` 1 does not time
+generation, and this path is not on the decode graph.
+
+| | time | tok/s |
+| --- | --- | --- |
+| cold | 8516 ms | 58.7 |
+| warm | 6707 ms | 74.55 |
+
+Warm split from the batch timers: expert batch 3.69 s (upload 1.77, GEMM
+0.87, one-fence download 0.42), and 3.02 s of dense graph plus scheduler.
+138 SSD misses are not the limiter. 100 tok/s is 5.00 s, so 1.71 s has to
+come off this split.
+
+Host import works. A 4096-byte-aligned anonymous mapping imports through
+1 GB (`caps.buffer_from_host_ptr` is still false; the function pointer is
+set). Q4_K, K=2560, N=640, 16 tokens, same weights, samples match
+(`-0.00152 0.00486`):
+
+| experts | weight | staged | import | ratio |
+| --- | --- | --- | --- | --- |
+| 64 | 59 MB | 6.18 ms | 4.38 ms | 0.71 |
+| 256 | 236 MB | 24.7 ms | 24.3 ms | 0.99 |
+| 512 | 472 MB | 51.9 ms | 47.9 ms | 0.92 |
+
+At 512 the upload drops from 17.8 ms to 2.8 ms and the GEMM grows from
+28.7 ms to 39.8 ms. The shader reads the imported weights over PCIe, so
+the copy is not removed, it moves. Scaled to 40 GB the save is about
+0.33 s, roughly 78 tok/s. Not worth the path.
+
+100 tok/s needs the 1.77 s upload to overlap the 3.02 s dense graph, or
+the dense graph to shrink by about 1.7 s. The router runs after attention
+in the same split, so the selected experts are not known in time to hide
+that layer's upload in that layer's attention. The remaining idea is to
+upload every expert of the layer on the transfer queue while attention
+runs, about 1.5 GB against a 63 ms layer. That only works if the transfer
+queue actually overlaps compute.
