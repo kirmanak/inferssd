@@ -1,8 +1,10 @@
 // Prompt-expert matmul on the Vulkan backend's existing quantized kernels.
 // One staging buffer is reused across experts. No new GEMM shader.
 #include "../ggml-ssd/gpu/vulkan-expert.h"
+#include "ggml-vulkan.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -44,6 +46,7 @@ struct expert_session {
     ggml_backend_buffer_t buffer = nullptr;
     uint64_t staging = 0;
     ggml_backend_buffer_t batch_buffer = nullptr;
+    ggml_backend_buffer_type_t batch_buft = nullptr;
     uint64_t batch_staging = 0;
     ggml_context * ctx = nullptr;
     ggml_tensor * weight = nullptr;
@@ -204,7 +207,7 @@ bool expert_mul_mat(void * raw, int32_t type, int64_t k, int64_t n, int n_tokens
 }
 
 constexpr uint64_t k_batch_cap = 1536ull << 20;
-constexpr int k_batch_experts = 96;
+constexpr int k_batch_experts = 512;
 
 bool expert_batch_chunk(expert_session * session, const ggml_vk_expert_matmul * items, int begin, int count,
         char * error, size_t error_size) {
@@ -267,13 +270,14 @@ bool expert_batch_chunk(expert_session * session, const ggml_vk_expert_matmul * 
         set_error(error, error_size, "vulkan expert batch exceeds the staging cap");
         return false;
     }
-    if (!session->batch_buffer || session->batch_staging < cursor) {
+    if (!session->batch_buffer || session->batch_staging < cursor || session->batch_buft != buft) {
         if (session->batch_buffer) {
             ggml_backend_buffer_free(session->batch_buffer);
             session->batch_buffer = nullptr;
             session->batch_staging = 0;
         }
         session->batch_buffer = ggml_backend_buft_alloc_buffer(buft, cursor);
+        session->batch_buft = buft;
         if (!session->batch_buffer) {
             ggml_free(ctx);
             set_error(error, error_size, "vulkan expert batch staging allocation failed");
@@ -300,11 +304,14 @@ bool expert_batch_chunk(expert_session * session, const ggml_vk_expert_matmul * 
         return false;
     }
     for (int i = 0; i < count; ++i) { ggml_build_forward_expand(graph, built[size_t(i)].output); }
+    const auto t0 = std::chrono::steady_clock::now();
     for (int i = 0; i < count; ++i) {
         const auto & item = items[begin + i];
         ggml_backend_tensor_set(built[size_t(i)].weight, item.weight, 0, item.weight_bytes);
-        ggml_backend_tensor_set(built[size_t(i)].input, item.input, 0, size_t(item.k) * size_t(item.n_tokens) * sizeof(float));
+        ggml_backend_tensor_set(built[size_t(i)].input, item.input, 0,
+                size_t(item.k) * size_t(item.n_tokens) * sizeof(float));
     }
+    const auto set_us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count();
     const enum ggml_status status = ggml_backend_graph_compute(session->backend, graph);
     if (status != GGML_STATUS_SUCCESS) {
         ggml_free(ctx);
@@ -312,9 +319,27 @@ bool expert_batch_chunk(expert_session * session, const ggml_vk_expert_matmul * 
         return false;
     }
     ggml_backend_synchronize(session->backend);
+    const auto compute_us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count() - set_us;
+    const auto t1 = std::chrono::steady_clock::now();
+    const size_t n_out = size_t(count);
+    std::vector<const ggml_tensor *> outs(n_out);
+    std::vector<void *> dsts(n_out);
+    std::vector<size_t> sizes(n_out);
     for (int i = 0; i < count; ++i) {
         const auto & item = items[begin + i];
-        ggml_backend_tensor_get(built[size_t(i)].output, item.output, 0, size_t(item.n) * size_t(item.n_tokens) * sizeof(float));
+        outs[size_t(i)] = built[size_t(i)].output;
+        dsts[size_t(i)] = item.output;
+        sizes[size_t(i)] = size_t(item.n) * size_t(item.n_tokens) * sizeof(float);
+    }
+    if (!ggml_vk_copy_tensors_fenced(outs.data(), dsts.data(), sizes.data(), count)) {
+        for (int i = 0; i < count; ++i) {
+            ggml_backend_tensor_get(built[size_t(i)].output, dsts[size_t(i)], 0, sizes[size_t(i)]);
+        }
+    }
+    const auto get_us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t1).count();
+    if (count >= 64) {
+        std::fprintf(stderr, "[kimi_vulkan_batch] n=%d set_us=%.0f compute_us=%.0f get_us=%.0f\n",
+                count, set_us, compute_us, get_us);
     }
     ggml_free(ctx);
     return true;

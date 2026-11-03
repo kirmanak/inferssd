@@ -22,6 +22,10 @@ GGML_BACKEND_API ggml_backend_buffer_type_t ggml_backend_vk_buffer_type(size_t d
 // pinned host buffer for use with the CPU backend for faster copies between CPU and GPU
 GGML_BACKEND_API ggml_backend_buffer_type_t ggml_backend_vk_host_buffer_type(void);
 
+// One fence for many device-to-host copies. Returns false if the tensors do not
+// share a Vulkan device buffer.
+GGML_BACKEND_API bool ggml_vk_copy_tensors_fenced(const struct ggml_tensor ** tensors, void ** dsts, const size_t * sizes, int n);
+
 GGML_BACKEND_API ggml_backend_reg_t ggml_backend_vk_reg(void);
 
 #ifdef  __cplusplus

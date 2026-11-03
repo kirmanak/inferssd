@@ -1130,7 +1130,9 @@ struct expert_cache {
 
         for (auto & request : requests) {
             if (request.vram_slot >= 0 || request.cache_hit >= 0) { continue; }
-            for (size_t index = found->begin; index < found->begin + found->count; ++index) {
+            // A prefill admission may borrow a free slot from another layer, so the
+        // hit search is the whole arena, not this layer's uniform slice.
+        for (size_t index = 0; index < entries.size(); ++index) {
                 auto & e = entries[index];
                 if (!e.enabled || !e.valid || !e.resident || e.layer_index != layer_index ||
                         e.id != request.id || !matches(e, request)) { continue; }
@@ -1174,15 +1176,15 @@ struct expert_cache {
                 if (request.role[role].nbytes > role_bytes[role]) { fits = false; }
             }
             if (!fits) { continue; }
-            auto free = entries.begin() + found->begin + found->count;
-            for (auto candidate = entries.begin() + found->begin; candidate != entries.begin() + found->begin + found->count; ++candidate) {
+            auto free = entries.end();
+            for (auto candidate = entries.begin(); candidate != entries.end(); ++candidate) {
                 if (candidate->enabled && candidate->resident && !candidate->valid && !candidate->reserved &&
-                        !candidate->inflight && candidate->layer_index == layer_index) {
+                        !candidate->inflight) {
                     free = candidate;
                     break;
                 }
             }
-            if (free == entries.begin() + found->begin + found->count) {
+            if (free == entries.end()) {
                 ++stats.admission_skips;
                 continue;
             }

@@ -13615,6 +13615,47 @@ static void ggml_backend_vk_buffer_set_tensor(ggml_backend_buffer_t buffer, ggml
     ggml_vk_buffer_write(buf, vk_tensor_offset(tensor) + tensor->view_offs + offset, data, size);
 }
 
+extern "C" bool ggml_vk_copy_tensors_fenced(const ggml_tensor ** tensors, void ** dsts, const size_t * sizes, int n) {
+    if (n <= 0) { return true; }
+    if (!tensors || !dsts || !sizes || !tensors[0] || !tensors[0]->buffer) { return false; }
+    auto * buf_ctx = static_cast<ggml_backend_vk_buffer_context *>(tensors[0]->buffer->context);
+    if (!buf_ctx || !buf_ctx->dev_buffer) { return false; }
+    vk_buffer src = buf_ctx->dev_buffer;
+    vk_device device = src->device;
+    size_t total = 0;
+    for (int i = 0; i < n; ++i) {
+        if (!tensors[i] || tensors[i]->buffer != tensors[0]->buffer || !dsts[i] || sizes[i] == 0) { return false; }
+        total += sizes[i];
+    }
+    std::lock_guard<std::recursive_mutex> guard(device->mutex);
+    ggml_vk_ensure_sync_staging_buffer(device, total);
+    vk_buffer & staging = device->sync_staging;
+    vk_context subctx = ggml_vk_create_temporary_context(device->transfer_queue.cmd_pool);
+    ggml_vk_ctx_begin(device, subctx);
+    const size_t n_copies = size_t(n);
+    std::vector<VkBufferCopy> copies(n_copies);
+    size_t cursor = 0;
+    for (int i = 0; i < n; ++i) {
+        copies[size_t(i)].srcOffset = vk_tensor_offset(tensors[i]) + tensors[i]->view_offs;
+        copies[size_t(i)].dstOffset = cursor;
+        copies[size_t(i)].size = sizes[i];
+        cursor += sizes[i];
+    }
+    vkCmdCopyBuffer(subctx->s->buffer->buf, (VkBuffer) src->buffer, (VkBuffer) staging->buffer,
+            uint32_t(n), copies.data());
+    ggml_vk_ctx_end(subctx);
+    ggml_vk_submit(subctx, device->fence);
+    VK_CHECK(device->device.waitForFences({ device->fence }, true, UINT64_MAX), "ggml_vk_copy_tensors_fenced");
+    device->device.resetFences({ device->fence });
+    ggml_vk_queue_command_pools_cleanup(device);
+    cursor = 0;
+    for (int i = 0; i < n; ++i) {
+        std::memcpy(dsts[i], static_cast<const uint8_t *>(staging->ptr) + cursor, sizes[i]);
+        cursor += sizes[i];
+    }
+    return true;
+}
+
 static void ggml_backend_vk_buffer_get_tensor(ggml_backend_buffer_t buffer, const ggml_tensor * tensor, void * data, size_t offset, size_t size) {
     VK_LOG_DEBUG("ggml_backend_vk_buffer_get_tensor(" << buffer << ", " << tensor << ", " << data << ", " << offset << ", " << size << ")");
     ggml_backend_vk_buffer_context * buf_ctx = (ggml_backend_vk_buffer_context *)buffer->context;

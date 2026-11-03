@@ -3348,58 +3348,43 @@ bool kimi_cpu_sink_stream_hybrid(struct kimi_cpu_sink * sink,
                 if (request.cache_hit >= 0) { any_hit = true; }
                 else { any_miss = true; }
             }
-            // A cold layer stays on the streaming consumer so compute overlaps the
-            // read. A layer with any retained expert waits out the misses, then
-            // one Vulkan batch covers the hits and the misses together.
-            if (any_hit) {
-                if (any_miss) {
-                    for (size_t expert = 0; expert < sink->requests.size(); ++expert) {
-                        auto & request = sink->requests[expert];
-                        if (request.cache_hit >= 0 || request.vram_slot >= 0 || request.vram_transient) { continue; }
-                        sink_slot & slot = sink->slots[request.io_slot];
-                        const auto wait_start = sink_clock::now();
-                        std::unique_lock<std::mutex> lock(sink->io_mutex);
-                        sink->io_cv.wait(lock, [&] {
-                            return (slot.state == sink_slot::ready && slot.request == expert) || !sink->io_error.empty();
-                        });
-                        sink->current.wait_io_us += elapsed_us(wait_start);
-                        if (!sink->io_error.empty()) { break; }
-                    }
+            // Hits are already in RAM. Batch those on Vulkan without waiting for
+            // misses: waiting would deadlock the 8-slot ring. Misses keep streaming.
+            if (any_hit && !any_miss) {
+                std::vector<const void *> ups(sink->requests.size());
+                std::vector<const void *> gates(sink->requests.size());
+                std::vector<const void *> downs(sink->requests.size());
+                for (size_t i = 0; i < sink->requests.size(); ++i) {
+                    const auto & request = sink->requests[i];
+                    if (request.cache_hit < 0) { continue; }
+                    ups[i] = sink->cache.data(request.cache_hit, 0) + request.role[0].data_offset;
+                    gates[i] = sink->cache.data(request.cache_hit, 1) + request.role[1].data_offset;
+                    downs[i] = sink->cache.data(request.cache_hit, 2) + request.role[2].data_offset;
                 }
-                if (sink->io_error.empty()) {
-                    std::vector<const void *> ups(sink->requests.size());
-                    std::vector<const void *> gates(sink->requests.size());
-                    std::vector<const void *> downs(sink->requests.size());
-                    for (size_t i = 0; i < sink->requests.size(); ++i) {
-                        const auto & request = sink->requests[i];
-                        const int slot = request.cache_hit >= 0 ? request.cache_hit : request.cache_admit;
-                        const void * base[3];
-                        for (int role = 0; role < 3; ++role) {
-                            base[role] = slot >= 0 ? sink->cache.data(slot, role) : request.read_target[role];
-                            base[role] = static_cast<const char *>(base[role]) + request.role[role].data_offset;
-                        }
-                        ups[i] = base[0];
-                        gates[i] = base[1];
-                        downs[i] = base[2];
-                    }
-                    const auto resident_start = sink_clock::now();
-                    resident_done = batch->resident_vulkan(userdata, ups.data(), gates.data(), downs.data(),
-                            int(sink->requests.size()));
-                    if (resident_done) {
-                        sink->current.compute_us += elapsed_us(resident_start);
-                        for (size_t i = 0; i < sink->requests.size(); ++i) {
-                            auto & request = sink->requests[i];
-                            if (request.cache_admit >= 0) { sink->cache.admit(request, sink->current); }
-                            if (request.cache_hit < 0 && request.vram_slot < 0 && !request.vram_transient) {
-                                sink_slot & slot = sink->slots[request.io_slot];
-                                std::lock_guard<std::mutex> lock(sink->io_mutex);
-                                if (slot.request == i && slot.state == sink_slot::ready) { slot.state = sink_slot::empty; }
-                            }
-                        }
-                        sink->io_cv.notify_all();
-                    }
+                const auto resident_start = sink_clock::now();
+                resident_done = batch->resident_vulkan(userdata, ups.data(), gates.data(), downs.data(),
+                        int(sink->requests.size()));
+                if (resident_done) { sink->current.compute_us += elapsed_us(resident_start); }
+            } else if (any_hit) {
+                std::vector<const void *> ups(sink->requests.size());
+                std::vector<const void *> gates(sink->requests.size());
+                std::vector<const void *> downs(sink->requests.size());
+                for (size_t i = 0; i < sink->requests.size(); ++i) {
+                    const auto & request = sink->requests[i];
+                    if (request.cache_hit < 0) { continue; }
+                    ups[i] = sink->cache.data(request.cache_hit, 0) + request.role[0].data_offset;
+                    gates[i] = sink->cache.data(request.cache_hit, 1) + request.role[1].data_offset;
+                    downs[i] = sink->cache.data(request.cache_hit, 2) + request.role[2].data_offset;
+                }
+                const auto resident_start = sink_clock::now();
+                if (batch->resident_vulkan(userdata, ups.data(), gates.data(), downs.data(),
+                            int(sink->requests.size()))) {
+                    sink->current.compute_us += elapsed_us(resident_start);
+                    resident_done = false; // misses still need the consumer
+                    any_miss = true;
                 }
             }
+            (void) any_miss;
         }
         for (size_t expert = 0; expert < sink->requests.size() && !resident_done; ++expert) {
             auto & request = sink->requests[expert];
