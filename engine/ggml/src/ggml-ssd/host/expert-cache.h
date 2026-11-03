@@ -619,9 +619,24 @@ struct expert_cache {
             // The receipt names both terms: on a discrete GPU the cgroup term should be the smaller one.
             uint64_t surplus = 0;
             const bool readable = check_room(0, nullptr, &surplus) == room_ok;
+            // The real role lengths are learned while the load-time arena is still
+            // mapped. Those pages are released before the replacement is filled, so
+            // they are room this cache can keep. Leaving them in the measured
+            // usage sizes the replacement to the leftover surplus (about 1 GiB
+            // under the 52G cap) and the generation working set no longer fits.
+            uint64_t kept_arena = 0;
+            if (readable && !tier_caches && arena && stats.committed_bytes) {
+                kept_arena = stats.committed_bytes;
+                surplus = add(surplus, kept_arena);
+            }
             budget = tier_caches
                     ? multiply(multiply(layers.size(), uint64_t(std::max(1, staging_per_layer))), next_stride)
                     : (readable ? surplus : 0);
+            if (kept_arena) {
+                std::fprintf(stderr,
+                        "[kimi_cpu_sink_cache] resize_keeps_arena=1 committed_bytes=%llu surplus_with_arena=%llu\n",
+                        (unsigned long long) kept_arena, (unsigned long long) surplus);
+            }
             const auto & r = last_room;
             std::fprintf(stderr, "[kimi_cpu_sink_cache] auto_budget=%llu unified=%d tier=%d slot_bytes=%zu cgroup_surplus=%llu system_surplus=%llu available=%llu floor=%llu binding=%s\n",
                     (unsigned long long) budget, int(ledger.state().unified), int(tier_caches), next_stride,
