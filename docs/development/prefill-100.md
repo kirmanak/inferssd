@@ -229,3 +229,28 @@ acquire, then the existing matmul:
 The GEMM is fine. The copy is not. A 472 MB staging buffer write-allocates;
 the 15 ms set uses a small staging buffer that stays in cache. Submitting
 the slow copy without waiting does not make it the fast one. Not wired in.
+
+## Background small-staging set
+
+At the end of layer N, a background thread calls the existing
+`ggml_backend_tensor_set` for every cached expert of layer N+1. That is
+the 15 ms / 472 MB path, not a packed memcpy. The next layer joins before
+it touches the cache, then skips `tensor_set` for a matching pointer.
+Decode does not start the thread (`ntokens` must be above 32).
+
+Two warm 500-token prompts on that binary:
+
+| | time | tok/s |
+| --- | --- | --- |
+| warm 1 | 6183 ms | 80.87 |
+| warm 2 | 6298 ms | 79.39 |
+
+Both beat 6573 ms. On the first of those, the background set moved 37.6 GB
+in 1.62 s and the batch skipped 34059 uploads. The join still waited
+0.92 s, so the upload is only partly hidden. Expert-callback time fell
+from about 3.7 s to 2.25 s. No fallback.
+
+`llama-completion -n 128` on the same binary: 9.72 tok/s, then 10.77.
+The clean binary's short run was 10.43. The 9.72 sample is noise; 10.77
+is above the 10.68 baseline. The thread does not run on that tool's
+decode path. Kept.

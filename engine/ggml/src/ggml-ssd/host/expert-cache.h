@@ -1030,6 +1030,32 @@ struct expert_cache {
         }
         return multiply(std::min(budget / slot_bytes, multiply(layers.size(), uint64_t(quota))), slot_bytes);
     }
+    struct cached_weight {
+        const void * key = nullptr;
+        const void * data = nullptr;
+        size_t bytes = 0;
+    };
+    void cached_weights(int32_t layer_id, std::vector<cached_weight> & out) const {
+        out.clear();
+        if (!arena || layers.empty()) { return; }
+        const auto found = std::find_if(layers.begin(), layers.end(), [&](const layer & l) { return l.id == layer_id; });
+        if (found == layers.end()) { return; }
+        const size_t layer_index = size_t(found - layers.begin());
+        for (size_t i = 0; i < entries.size(); ++i) {
+            const auto & e = entries[i];
+            if (!e.valid || !e.resident || e.layer_index != layer_index) { continue; }
+            for (int role = 0; role < 3; ++role) {
+                const size_t src_offset = size_t(e.source[role].offset % 4096);
+                const size_t bytes = e.source[role].bytes ? size_t(e.source[role].bytes) : role_bytes[role];
+                if (src_offset + bytes > role_bytes[role] || bytes == 0) { continue; }
+                cached_weight item;
+                item.data = data(int(i), role) + src_offset;
+                item.key = item.data;
+                item.bytes = bytes;
+                out.push_back(item);
+            }
+        }
+    }
     char * data(int index, int role) const {
         size_t offset = size_t(index) * stride;
         for (int r = 0; r < role; ++r) { offset += role_bytes[r]; }

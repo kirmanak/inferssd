@@ -9,6 +9,9 @@
 #include <cstdio>
 #include <cstring>
 #include <new>
+#include <thread>
+#include <unordered_map>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -48,6 +51,12 @@ struct expert_session {
     ggml_backend_buffer_t batch_buffer = nullptr;
     ggml_backend_buffer_type_t batch_buft = nullptr;
     uint64_t batch_staging = 0;
+    ggml_backend_buffer_t ahead_buffer = nullptr;
+    uint64_t ahead_cap = 0;
+    std::thread ahead_thread;
+    std::unordered_map<const void *, size_t> ahead_at;
+    std::unordered_map<const void *, size_t> ahead_bytes;
+    int ahead_used = 0;
     ggml_context * ctx = nullptr;
     ggml_tensor * weight = nullptr;
     ggml_tensor * input = nullptr;
@@ -70,10 +79,20 @@ struct expert_session {
         n_tokens = 0;
     }
 
+    void join_ahead() {
+        if (!ahead_thread.joinable()) { return; }
+        const auto t0 = std::chrono::steady_clock::now();
+        ahead_thread.join();
+        std::fprintf(stderr, "[kimi_vk_ahead] join_us=%.0f\n",
+                std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count());
+    }
+
     ~expert_session() {
+        join_ahead();
         drop_graph();
         if (buffer) { ggml_backend_buffer_free(buffer); }
         if (batch_buffer) { ggml_backend_buffer_free(batch_buffer); }
+        if (ahead_buffer) { ggml_backend_buffer_free(ahead_buffer); }
     }
 };
 
@@ -230,6 +249,7 @@ bool expert_batch_chunk(expert_session * session, const ggml_vk_expert_matmul * 
     const size_t alignment = std::max<size_t>(ggml_backend_buft_get_alignment(buft), 128);
     size_t cursor = 0;
     std::vector<size_t> offsets(size_t(count) * 3, 0);
+    std::vector<size_t> ahead_off(size_t(count), SIZE_MAX);
     for (int i = 0; i < count; ++i) {
         const auto & item = items[begin + i];
         if (!expert_supports(item.type) || item.k <= 0 || item.n <= 0 || item.n_tokens <= 0 ||
@@ -259,7 +279,14 @@ bool expert_batch_chunk(expert_session * session, const ggml_vk_expert_matmul * 
             return false;
         }
         ggml_tensor * tensors[3] = { built[size_t(i)].weight, built[size_t(i)].input, built[size_t(i)].output };
+        const auto ahead = session->ahead_at.find(item.weight);
+        if (ahead != session->ahead_at.end() && session->ahead_buffer &&
+                session->ahead_bytes[item.weight] >= item.weight_bytes &&
+                ahead->second + item.weight_bytes <= ggml_backend_buffer_get_size(session->ahead_buffer)) {
+            ahead_off[size_t(i)] = ahead->second;
+        }
         for (int t = 0; t < 3; ++t) {
+            if (t == 0 && ahead_off[size_t(i)] != SIZE_MAX) { continue; }
             cursor = align_up(cursor, alignment);
             offsets[size_t(i) * 3 + t] = cursor;
             cursor += ggml_backend_buft_get_alloc_size(buft, tensors[t]);
@@ -286,9 +313,19 @@ bool expert_batch_chunk(expert_session * session, const ggml_vk_expert_matmul * 
         session->batch_staging = ggml_backend_buffer_get_size(session->batch_buffer);
     }
     void * base = ggml_backend_buffer_get_base(session->batch_buffer);
+    void * ahead_base = session->ahead_buffer ? ggml_backend_buffer_get_base(session->ahead_buffer) : nullptr;
     for (int i = 0; i < count; ++i) {
         ggml_tensor * tensors[3] = { built[size_t(i)].weight, built[size_t(i)].input, built[size_t(i)].output };
+        if (ahead_off[size_t(i)] != SIZE_MAX) {
+            if (ggml_backend_tensor_alloc(session->ahead_buffer, tensors[0],
+                    static_cast<char *>(ahead_base) + ahead_off[size_t(i)]) != GGML_STATUS_SUCCESS) {
+                ggml_free(ctx);
+                set_error(error, error_size, "vulkan expert ahead placement failed");
+                return false;
+            }
+        }
         for (int t = 0; t < 3; ++t) {
+            if (t == 0 && ahead_off[size_t(i)] != SIZE_MAX) { continue; }
             if (ggml_backend_tensor_alloc(session->batch_buffer, tensors[t],
                     static_cast<char *>(base) + offsets[size_t(i) * 3 + t]) != GGML_STATUS_SUCCESS) {
                 ggml_free(ctx);
@@ -307,7 +344,11 @@ bool expert_batch_chunk(expert_session * session, const ggml_vk_expert_matmul * 
     const auto t0 = std::chrono::steady_clock::now();
     for (int i = 0; i < count; ++i) {
         const auto & item = items[begin + i];
-        ggml_backend_tensor_set(built[size_t(i)].weight, item.weight, 0, item.weight_bytes);
+        if (ahead_off[size_t(i)] == SIZE_MAX) {
+            ggml_backend_tensor_set(built[size_t(i)].weight, item.weight, 0, item.weight_bytes);
+        } else {
+            ++session->ahead_used;
+        }
         ggml_backend_tensor_set(built[size_t(i)].input, item.input, 0,
                 size_t(item.k) * size_t(item.n_tokens) * sizeof(float));
     }
@@ -348,6 +389,10 @@ bool expert_batch_chunk(expert_session * session, const ggml_vk_expert_matmul * 
 bool expert_mul_mat_batch(void * raw, const ggml_vk_expert_matmul * items, int count,
         char * error, size_t error_size) {
     auto * session = static_cast<expert_session *>(raw);
+    if (session) {
+        session->join_ahead();
+        session->ahead_used = 0;
+    }
     if (!session || (count > 0 && !items)) {
         set_error(error, error_size, "vulkan expert batch is missing buffers");
         return false;
@@ -372,6 +417,64 @@ bool expert_mul_mat_batch(void * raw, const ggml_vk_expert_matmul * items, int c
         if (!expert_batch_chunk(session, items, begin, n, error, error_size)) { return false; }
         begin += n;
     }
+    if (session->ahead_used) {
+        std::fprintf(stderr, "[kimi_vk_ahead] used=%d\n", session->ahead_used);
+    }
+    return true;
+}
+
+constexpr uint64_t k_ahead_cap = 1536ull << 20;
+
+bool expert_ahead(void * raw, const ggml_vk_expert_ahead * items, int count) {
+    auto * session = static_cast<expert_session *>(raw);
+    if (!session) { return false; }
+    session->join_ahead();
+    if (!items || count <= 0) { return true; }
+    ggml_backend_buffer_type_t buft = ggml_backend_get_default_buffer_type(session->backend);
+    const size_t align = std::max<size_t>(ggml_backend_buft_get_alignment(buft), 256);
+    struct planned { const void * key; const void * data; size_t bytes; size_t offset; };
+    std::vector<planned> plan;
+    plan.reserve(size_t(count));
+    size_t cursor = 0;
+    for (int i = 0; i < count; ++i) {
+        if (!items[i].key || !items[i].data || items[i].bytes == 0) { continue; }
+        const size_t off = align_up(cursor, align);
+        if (off + items[i].bytes > k_ahead_cap) { break; }
+        plan.push_back({ items[i].key, items[i].data, items[i].bytes, off });
+        cursor = off + items[i].bytes;
+    }
+    if (plan.empty()) { return false; }
+    if (!session->ahead_buffer || session->ahead_cap < cursor) {
+        if (session->ahead_buffer) { ggml_backend_buffer_free(session->ahead_buffer); }
+        session->ahead_buffer = ggml_backend_buft_alloc_buffer(buft, cursor);
+        session->ahead_cap = session->ahead_buffer ? ggml_backend_buffer_get_size(session->ahead_buffer) : 0;
+        if (!session->ahead_buffer) { return false; }
+    }
+    session->ahead_at.clear();
+    session->ahead_bytes.clear();
+    session->ahead_thread = std::thread([session, plan = std::move(plan)]() {
+        const size_t mem = ggml_tensor_overhead() * plan.size() + 65536;
+        ggml_context * ctx = ggml_init({ mem, nullptr, true });
+        if (!ctx || !session->ahead_buffer) { if (ctx) { ggml_free(ctx); } return; }
+        void * base = ggml_backend_buffer_get_base(session->ahead_buffer);
+        const auto t0 = std::chrono::steady_clock::now();
+        size_t bytes = 0;
+        int queued = 0;
+        for (const auto & item : plan) {
+            ggml_tensor * tensor = ggml_new_tensor_1d(ctx, GGML_TYPE_I8, int64_t(item.bytes));
+            if (!tensor) { break; }
+            if (ggml_backend_tensor_alloc(session->ahead_buffer, tensor,
+                    static_cast<char *>(base) + item.offset) != GGML_STATUS_SUCCESS) { break; }
+            ggml_backend_tensor_set(tensor, item.data, 0, item.bytes);
+            session->ahead_at[item.key] = item.offset;
+            session->ahead_bytes[item.key] = item.bytes;
+            bytes += item.bytes;
+            ++queued;
+        }
+        std::fprintf(stderr, "[kimi_vk_ahead] queued=%d bytes=%zu set_us=%.0f\n", queued, bytes,
+                std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count());
+        ggml_free(ctx);
+    });
     return true;
 }
 
@@ -387,6 +490,7 @@ extern "C" const ggml_vk_expert_api_v1 * ggml_backend_vk_expert_api_v1(void) {
         reinterpret_cast<uint64_t (*)(void *)>(expert_staging_bytes),
         reinterpret_cast<bool (*)(void *, int32_t, int64_t, int64_t, int, const void *, size_t, const float *, float *, char *, size_t)>(expert_mul_mat),
         reinterpret_cast<bool (*)(void *, const ggml_vk_expert_matmul *, int, char *, size_t)>(expert_mul_mat_batch),
+        reinterpret_cast<bool (*)(void *, const ggml_vk_expert_ahead *, int)>(expert_ahead),
     };
     return &api;
 }

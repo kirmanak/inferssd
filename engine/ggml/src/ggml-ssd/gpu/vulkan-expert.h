@@ -29,6 +29,17 @@ struct ggml_vk_expert_api_v1 {
     // Null on an older build; a false return leaves outputs untouched.
     bool (*mul_mat_batch)(void * session, const struct ggml_vk_expert_matmul * items, int count,
             char * error, size_t error_size);
+    // Copy these host weights with the existing per-tensor set, on a background
+    // thread. Returns before the copies finish. The next mul_mat_batch joins and
+    // skips the upload for a matching weight pointer. Null if this build has no
+    // ahead path. count 0 only joins an earlier call.
+    bool (*ahead)(void * session, const struct ggml_vk_expert_ahead * items, int count);
+};
+
+struct ggml_vk_expert_ahead {
+    const void * key;
+    const void * data;
+    size_t bytes;
 };
 
 // One expert in a mul_mat_batch. output is caller storage, written only on success.

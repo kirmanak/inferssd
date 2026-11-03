@@ -3080,6 +3080,9 @@ bool kimi_cpu_sink_stream_hybrid(struct kimi_cpu_sink * sink,
     if (stats) { *stats = {}; }
     if (!sink) { sink_error(error, error_size, "null CPU sink"); return false; }
     std::lock_guard<sink_run_mutex> serial(sink->run_mutex); sink->prefetch_drain();
+    if (sink->vulkan_api && sink->vulkan_api->ahead && sink->vulkan_session) {
+        sink->vulkan_api->ahead(sink->vulkan_session, nullptr, 0);
+    }
     const auto start = sink_clock::now();
     const uint64_t completed_before = sink->ring.completed();
     sink->current = {};
@@ -3455,6 +3458,21 @@ bool kimi_cpu_sink_stream_hybrid(struct kimi_cpu_sink * sink,
         }
         // CPU-consumed RAM leases were released immediately. Transient GPU
         // sources remain leased until finish drained H2D and compute.
+        if (batch->ntokens > 32 && sink->vulkan_api && sink->vulkan_api->ahead && sink->vulkan_session && up) {
+            int layer = -1, consumed = 0;
+            if (std::sscanf(up->name, "blk.%d.ffn_up_exps.weight%n", &layer, &consumed) == 1 &&
+                    consumed && !up->name[consumed]) {
+                std::vector<sink_cache::cached_weight> cached;
+                sink->cache.cached_weights(layer + 1, cached);
+                if (!cached.empty()) {
+                    std::vector<ggml_vk_expert_ahead> items(cached.size());
+                    for (size_t i = 0; i < cached.size(); ++i) {
+                        items[i] = { cached[i].key, cached[i].data, cached[i].bytes };
+                    }
+                    sink->vulkan_api->ahead(sink->vulkan_session, items.data(), int(items.size()));
+                }
+            }
+        }
         sink->cache.release_prefill_leases(sink->requests);
         batch->ssd_bytes = sink->current.read_bytes;
         if (sink->vulkan_note.used) {
