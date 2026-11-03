@@ -119,6 +119,26 @@ layer's matmul skipped the upload (`set_us` fell to 48). The GEMM then
 took 150–400 ms for ~70 experts instead of ~15 ms, and later chunks went
 past a second. A concurrently shared buffer, so the copy and the shader
 did not need a queue-family acquire, did not change that. The 500-token
-request did not finish in 7 minutes. The copy is not in the tree. A
-shader that reads a buffer just filled by the graphics queue is not a
-usable expert path on this RADV.
+request did not finish in 7 minutes. That wiring is not in the tree.
+
+The isolated sequence is fine. 512 Q4_K experts, K=2560 N=640, 16 tokens,
+exclusive device buffer, graphics-queue copy, one acquire, then the
+existing mul_mat:
+
+| | time |
+| --- | --- |
+| staged set | 15.0 ms |
+| staged GEMM | 6.6 ms |
+| one-blob copy | 15.3 ms |
+| acquire | 0.16 ms |
+| GEMM after acquire | 6.3 ms, then 6.1 ms |
+| sample error | 0 |
+
+So a shader can read an exclusive buffer the graphics queue just filled,
+once the compute queue has acquired it. What failed in the server was
+the wiring (concurrent buffer, no acquire, copies still in flight), not
+the GEMM. 512 separate region copies from an imported mapping were not
+the same: 124 ms to copy 472 MB, and the first GEMM was 30 ms. One
+contiguous copy is the usable shape. It is not faster than the current
+per-tensor set when done synchronously (both ~15 ms / 472 MB). It only
+pays if the copy runs during the next layer's attention.

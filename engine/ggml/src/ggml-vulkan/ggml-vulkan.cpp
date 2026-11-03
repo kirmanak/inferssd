@@ -13656,6 +13656,163 @@ extern "C" bool ggml_vk_copy_tensors_fenced(const ggml_tensor ** tensors, void *
     return true;
 }
 
+static bool upload_acquired_from(ggml_backend_vk_buffer_context * dst_ctx, vk_buffer src, const ggml_vk_copy_region * regions, int n) {
+    vk_device device = dst_ctx->dev_buffer->device;
+    const uint32_t transfer_family = device->transfer_queue.queue_family_index;
+    const uint32_t compute_family = device->compute_queue.queue_family_index;
+    vk::CommandPool transfer_pool;
+    vk::CommandPool acquire_pool;
+    vk::Fence transfer_fence;
+    vk::Fence acquire_fence;
+    const auto t0 = std::chrono::steady_clock::now();
+    try {
+        transfer_pool = device->device.createCommandPool({ vk::CommandPoolCreateFlagBits::eTransient, transfer_family });
+        vk::CommandBuffer copy = device->device.allocateCommandBuffers({ transfer_pool, vk::CommandBufferLevel::ePrimary, 1 })[0];
+        copy.begin({ vk::CommandBufferUsageFlagBits::eOneTimeSubmit });
+        for (int i = 0; i < n; ++i) {
+            vk::BufferCopy region{ regions[i].src_offset, regions[i].dst_offset, regions[i].bytes };
+            copy.copyBuffer(src->buffer, dst_ctx->dev_buffer->buffer, region);
+        }
+        if (transfer_family != compute_family) {
+            vk::BufferMemoryBarrier release{ vk::AccessFlagBits::eTransferWrite, {},
+                    transfer_family, compute_family, dst_ctx->dev_buffer->buffer, 0, VK_WHOLE_SIZE };
+            copy.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer, vk::PipelineStageFlagBits::eBottomOfPipe,
+                    {}, nullptr, release, nullptr);
+        }
+        copy.end();
+        transfer_fence = device->device.createFence({});
+        {
+            std::lock_guard<std::mutex> guard(queue_mutex);
+            device->transfer_queue.queue.submit(vk::SubmitInfo{ {}, {}, copy }, transfer_fence);
+        }
+        (void) device->device.waitForFences(transfer_fence, VK_TRUE, UINT64_MAX);
+        const double copy_us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count();
+        double acquire_us = 0;
+        if (transfer_family != compute_family) {
+            const auto t1 = std::chrono::steady_clock::now();
+            acquire_pool = device->device.createCommandPool({ vk::CommandPoolCreateFlagBits::eTransient, compute_family });
+            vk::CommandBuffer acquire_cmd = device->device.allocateCommandBuffers({ acquire_pool, vk::CommandBufferLevel::ePrimary, 1 })[0];
+            acquire_cmd.begin({ vk::CommandBufferUsageFlagBits::eOneTimeSubmit });
+            vk::BufferMemoryBarrier acquire{ {}, vk::AccessFlagBits::eShaderRead,
+                    transfer_family, compute_family, dst_ctx->dev_buffer->buffer, 0, VK_WHOLE_SIZE };
+            acquire_cmd.pipelineBarrier(vk::PipelineStageFlagBits::eTopOfPipe, vk::PipelineStageFlagBits::eComputeShader,
+                    {}, nullptr, acquire, nullptr);
+            acquire_cmd.end();
+            acquire_fence = device->device.createFence({});
+            {
+                std::lock_guard<std::mutex> guard(queue_mutex);
+                device->compute_queue.queue.submit(vk::SubmitInfo{ {}, {}, acquire_cmd }, acquire_fence);
+            }
+            (void) device->device.waitForFences(acquire_fence, VK_TRUE, UINT64_MAX);
+            acquire_us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t1).count();
+        }
+        std::fprintf(stderr, "[kimi_vk_upload] regions=%d copy_us=%.0f acquire_us=%.0f\n", n, copy_us, acquire_us);
+    } catch (const vk::SystemError & e) {
+        std::fprintf(stderr, "[kimi_vk_upload] failed: %s\n", e.what());
+        if (transfer_fence) { device->device.destroyFence(transfer_fence); }
+        if (acquire_fence) { device->device.destroyFence(acquire_fence); }
+        if (transfer_pool) { device->device.destroyCommandPool(transfer_pool); }
+        if (acquire_pool) { device->device.destroyCommandPool(acquire_pool); }
+        return false;
+    }
+    if (transfer_fence) { device->device.destroyFence(transfer_fence); }
+    if (acquire_fence) { device->device.destroyFence(acquire_fence); }
+    if (transfer_pool) { device->device.destroyCommandPool(transfer_pool); }
+    if (acquire_pool) { device->device.destroyCommandPool(acquire_pool); }
+    return true;
+}
+
+extern "C" bool ggml_vk_copy_regions_acquired(ggml_backend_buffer_t dst, ggml_backend_buffer_t src,
+        const ggml_vk_copy_region * regions, int n) {
+    if (!dst || !src || !regions || n <= 0) { return false; }
+    auto * dst_ctx = static_cast<ggml_backend_vk_buffer_context *>(dst->context);
+    auto * src_ctx = static_cast<ggml_backend_vk_buffer_context *>(src->context);
+    if (!dst_ctx || !src_ctx || !dst_ctx->dev_buffer || !src_ctx->dev_buffer) { return false; }
+    return upload_acquired_from(dst_ctx, src_ctx->dev_buffer, regions, n);
+}
+
+extern "C" bool ggml_vk_upload_acquired(ggml_backend_buffer_t dst, size_t dst_offset, const void * src, size_t bytes) {
+    if (!dst || !src || bytes == 0) { return false; }
+    auto * buf_ctx = static_cast<ggml_backend_vk_buffer_context *>(dst->context);
+    if (!buf_ctx || !buf_ctx->dev_buffer) { return false; }
+    vk_device device = buf_ctx->dev_buffer->device;
+    const uint32_t transfer_family = device->transfer_queue.queue_family_index;
+    const uint32_t compute_family = device->compute_queue.queue_family_index;
+    std::fprintf(stderr, "[kimi_vk_upload] transfer_family=%u compute_family=%u bytes=%zu\n",
+            transfer_family, compute_family, bytes);
+    vk_buffer staging;
+    vk::CommandPool transfer_pool;
+    vk::CommandPool acquire_pool;
+    vk::Fence transfer_fence;
+    vk::Fence acquire_fence;
+    const auto t0 = std::chrono::steady_clock::now();
+    try {
+        staging = ggml_vk_create_buffer(device, bytes, {
+                vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent });
+        if (!staging || !staging->ptr) { return false; }
+        std::memcpy(staging->ptr, src, bytes);
+        const double memcpy_us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count();
+
+        transfer_pool = device->device.createCommandPool({ vk::CommandPoolCreateFlagBits::eTransient, transfer_family });
+        vk::CommandBuffer copy = device->device.allocateCommandBuffers({ transfer_pool, vk::CommandBufferLevel::ePrimary, 1 })[0];
+        copy.begin({ vk::CommandBufferUsageFlagBits::eOneTimeSubmit });
+        vk::BufferCopy region{ 0, dst_offset, bytes };
+        copy.copyBuffer(staging->buffer, buf_ctx->dev_buffer->buffer, region);
+        if (transfer_family != compute_family) {
+            vk::BufferMemoryBarrier release{ vk::AccessFlagBits::eTransferWrite, {},
+                    transfer_family, compute_family, buf_ctx->dev_buffer->buffer, dst_offset, bytes };
+            copy.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer, vk::PipelineStageFlagBits::eBottomOfPipe,
+                    {}, nullptr, release, nullptr);
+        } else {
+            vk::BufferMemoryBarrier barrier{ vk::AccessFlagBits::eTransferWrite, vk::AccessFlagBits::eShaderRead,
+                    VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED, buf_ctx->dev_buffer->buffer, dst_offset, bytes };
+            copy.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer, vk::PipelineStageFlagBits::eComputeShader,
+                    {}, nullptr, barrier, nullptr);
+        }
+        copy.end();
+        transfer_fence = device->device.createFence({});
+        {
+            std::lock_guard<std::mutex> guard(queue_mutex);
+            device->transfer_queue.queue.submit(vk::SubmitInfo{ {}, {}, copy }, transfer_fence);
+        }
+        (void) device->device.waitForFences(transfer_fence, VK_TRUE, UINT64_MAX);
+        const double copy_us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count() - memcpy_us;
+
+        double acquire_us = 0;
+        if (transfer_family != compute_family) {
+            const auto t1 = std::chrono::steady_clock::now();
+            acquire_pool = device->device.createCommandPool({ vk::CommandPoolCreateFlagBits::eTransient, compute_family });
+            vk::CommandBuffer acquire_cmd = device->device.allocateCommandBuffers({ acquire_pool, vk::CommandBufferLevel::ePrimary, 1 })[0];
+            acquire_cmd.begin({ vk::CommandBufferUsageFlagBits::eOneTimeSubmit });
+            vk::BufferMemoryBarrier acquire{ {}, vk::AccessFlagBits::eShaderRead,
+                    transfer_family, compute_family, buf_ctx->dev_buffer->buffer, dst_offset, bytes };
+            acquire_cmd.pipelineBarrier(vk::PipelineStageFlagBits::eTopOfPipe, vk::PipelineStageFlagBits::eComputeShader,
+                    {}, nullptr, acquire, nullptr);
+            acquire_cmd.end();
+            acquire_fence = device->device.createFence({});
+            {
+                std::lock_guard<std::mutex> guard(queue_mutex);
+                device->compute_queue.queue.submit(vk::SubmitInfo{ {}, {}, acquire_cmd }, acquire_fence);
+            }
+            (void) device->device.waitForFences(acquire_fence, VK_TRUE, UINT64_MAX);
+            acquire_us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t1).count();
+        }
+        std::fprintf(stderr, "[kimi_vk_upload] memcpy_us=%.0f copy_us=%.0f acquire_us=%.0f\n", memcpy_us, copy_us, acquire_us);
+    } catch (const vk::SystemError & e) {
+        std::fprintf(stderr, "[kimi_vk_upload] failed: %s\n", e.what());
+        if (transfer_fence) { device->device.destroyFence(transfer_fence); }
+        if (acquire_fence) { device->device.destroyFence(acquire_fence); }
+        if (transfer_pool) { device->device.destroyCommandPool(transfer_pool); }
+        if (acquire_pool) { device->device.destroyCommandPool(acquire_pool); }
+        return false;
+    }
+    if (transfer_fence) { device->device.destroyFence(transfer_fence); }
+    if (acquire_fence) { device->device.destroyFence(acquire_fence); }
+    if (transfer_pool) { device->device.destroyCommandPool(transfer_pool); }
+    if (acquire_pool) { device->device.destroyCommandPool(acquire_pool); }
+    return true;
+}
+
 static void ggml_backend_vk_buffer_get_tensor(ggml_backend_buffer_t buffer, const ggml_tensor * tensor, void * data, size_t offset, size_t size) {
     VK_LOG_DEBUG("ggml_backend_vk_buffer_get_tensor(" << buffer << ", " << tensor << ", " << data << ", " << offset << ", " << size << ")");
     ggml_backend_vk_buffer_context * buf_ctx = (ggml_backend_vk_buffer_context *)buffer->context;

@@ -26,6 +26,15 @@ GGML_BACKEND_API ggml_backend_buffer_type_t ggml_backend_vk_host_buffer_type(voi
 // share a Vulkan device buffer.
 GGML_BACKEND_API bool ggml_vk_copy_tensors_fenced(const struct ggml_tensor ** tensors, void ** dsts, const size_t * sizes, int n);
 
+// One graphics-queue copy into an exclusive device buffer, then one acquire on
+// the compute queue. The caller runs the shader only after this returns.
+GGML_BACKEND_API bool ggml_vk_upload_acquired(ggml_backend_buffer_t dst, size_t dst_offset, const void * src, size_t bytes);
+
+struct ggml_vk_copy_region { size_t src_offset; size_t dst_offset; size_t bytes; };
+// Same acquire, many regions, source already a Vulkan buffer. One fence.
+GGML_BACKEND_API bool ggml_vk_copy_regions_acquired(ggml_backend_buffer_t dst, ggml_backend_buffer_t src,
+        const struct ggml_vk_copy_region * regions, int n);
+
 GGML_BACKEND_API ggml_backend_reg_t ggml_backend_vk_reg(void);
 
 #ifdef  __cplusplus
