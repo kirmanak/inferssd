@@ -72,6 +72,15 @@ Unified memory is shared by the CPU and GPU. SSD capacities are nominal. See [ha
 
 **N/S:** Muse is not currently supported by Colibri.
 
+## Qwen3.8-Flash-Next on Vulkan
+
+Commit `6912c4f` plus the local changes in this checkout run
+Qwen3.8-Flash-Next UD-Q4_K_XL on Linux with an AMD GPU. Dense layers
+stay on Vulkan. Prompt experts that fit the VRAM budget use the
+existing quantized matmul, and generation reads the host expert cache.
+Build, the measured rates, and the OpenCode server are in
+[docs/qwen38-vulkan.md](docs/qwen38-vulkan.md).
+
 ## Get started
 
 Install on Apple Silicon macOS or on Linux with an NVIDIA GPU:

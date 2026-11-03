@@ -6,6 +6,7 @@
 ## Using InferSSD
 
 - [Quick start](quickstart.md): build and launch on macOS or Linux.
+- [Qwen3.8-Flash-Next on Vulkan](qwen38-vulkan.md): the local RX 9070 XT changes, measured rates, and the OpenCode server.
 - [Apple Silicon deployment](mac-launcher.md): Metal build, cache and thread settings.
 - [Configuration](configuration.md): the typed `inferssd-settings 1` contract.
 - [Deployment resources](engine-resources.md): engine descriptors for installations outside a checkout.
