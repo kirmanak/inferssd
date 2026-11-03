@@ -13731,6 +13731,93 @@ extern "C" bool ggml_vk_copy_regions_acquired(ggml_backend_buffer_t dst, ggml_ba
     return upload_acquired_from(dst_ctx, src_ctx->dev_buffer, regions, n);
 }
 
+struct ggml_vk_upload_ticket {
+    vk_device device;
+    vk_buffer staging;
+    vk::CommandPool transfer_pool;
+    vk::Fence transfer_fence;
+    vk::Buffer dst = VK_NULL_HANDLE;
+    size_t dst_offset = 0;
+    size_t bytes = 0;
+    uint32_t transfer_family = 0;
+    uint32_t compute_family = 0;
+};
+
+extern "C" void * ggml_vk_upload_begin(ggml_backend_buffer_t dst, size_t dst_offset, const void * src, size_t bytes) {
+    if (!dst || !src || bytes == 0) { return nullptr; }
+    auto * buf_ctx = static_cast<ggml_backend_vk_buffer_context *>(dst->context);
+    if (!buf_ctx || !buf_ctx->dev_buffer) { return nullptr; }
+    auto * ticket = new ggml_vk_upload_ticket;
+    ticket->device = buf_ctx->dev_buffer->device;
+    ticket->dst = buf_ctx->dev_buffer->buffer;
+    ticket->dst_offset = dst_offset;
+    ticket->bytes = bytes;
+    ticket->transfer_family = ticket->device->transfer_queue.queue_family_index;
+    ticket->compute_family = ticket->device->compute_queue.queue_family_index;
+    try {
+        ticket->staging = ggml_vk_create_buffer(ticket->device, bytes, {
+                vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent });
+        if (!ticket->staging || !ticket->staging->ptr) { delete ticket; return nullptr; }
+        std::memcpy(ticket->staging->ptr, src, bytes);
+        ticket->transfer_pool = ticket->device->device.createCommandPool(
+                { vk::CommandPoolCreateFlagBits::eTransient, ticket->transfer_family });
+        vk::CommandBuffer copy = ticket->device->device.allocateCommandBuffers(
+                { ticket->transfer_pool, vk::CommandBufferLevel::ePrimary, 1 })[0];
+        copy.begin({ vk::CommandBufferUsageFlagBits::eOneTimeSubmit });
+        vk::BufferCopy region{ 0, dst_offset, bytes };
+        copy.copyBuffer(ticket->staging->buffer, ticket->dst, region);
+        if (ticket->transfer_family != ticket->compute_family) {
+            vk::BufferMemoryBarrier release{ vk::AccessFlagBits::eTransferWrite, {},
+                    ticket->transfer_family, ticket->compute_family, ticket->dst, dst_offset, bytes };
+            copy.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer, vk::PipelineStageFlagBits::eBottomOfPipe,
+                    {}, nullptr, release, nullptr);
+        }
+        copy.end();
+        ticket->transfer_fence = ticket->device->device.createFence({});
+        std::lock_guard<std::mutex> guard(queue_mutex);
+        ticket->device->transfer_queue.queue.submit(vk::SubmitInfo{ {}, {}, copy }, ticket->transfer_fence);
+    } catch (const vk::SystemError & e) {
+        std::fprintf(stderr, "[kimi_vk_upload] begin failed: %s\n", e.what());
+        delete ticket;
+        return nullptr;
+    }
+    return ticket;
+}
+
+extern "C" void ggml_vk_upload_finish(void * raw) {
+    auto * ticket = static_cast<ggml_vk_upload_ticket *>(raw);
+    if (!ticket) { return; }
+    vk_device device = ticket->device;
+    vk::CommandPool acquire_pool;
+    vk::Fence acquire_fence;
+    try {
+        (void) device->device.waitForFences(ticket->transfer_fence, VK_TRUE, UINT64_MAX);
+        if (ticket->transfer_family != ticket->compute_family) {
+            acquire_pool = device->device.createCommandPool({ vk::CommandPoolCreateFlagBits::eTransient, ticket->compute_family });
+            vk::CommandBuffer acquire_cmd = device->device.allocateCommandBuffers({ acquire_pool, vk::CommandBufferLevel::ePrimary, 1 })[0];
+            acquire_cmd.begin({ vk::CommandBufferUsageFlagBits::eOneTimeSubmit });
+            vk::BufferMemoryBarrier acquire{ {}, vk::AccessFlagBits::eShaderRead,
+                    ticket->transfer_family, ticket->compute_family, ticket->dst, ticket->dst_offset, ticket->bytes };
+            acquire_cmd.pipelineBarrier(vk::PipelineStageFlagBits::eTopOfPipe, vk::PipelineStageFlagBits::eComputeShader,
+                    {}, nullptr, acquire, nullptr);
+            acquire_cmd.end();
+            acquire_fence = device->device.createFence({});
+            {
+                std::lock_guard<std::mutex> guard(queue_mutex);
+                device->compute_queue.queue.submit(vk::SubmitInfo{ {}, {}, acquire_cmd }, acquire_fence);
+            }
+            (void) device->device.waitForFences(acquire_fence, VK_TRUE, UINT64_MAX);
+            device->device.destroyFence(acquire_fence);
+            device->device.destroyCommandPool(acquire_pool);
+        }
+    } catch (const vk::SystemError & e) {
+        std::fprintf(stderr, "[kimi_vk_upload] finish failed: %s\n", e.what());
+    }
+    if (ticket->transfer_fence) { device->device.destroyFence(ticket->transfer_fence); }
+    if (ticket->transfer_pool) { device->device.destroyCommandPool(ticket->transfer_pool); }
+    delete ticket;
+}
+
 extern "C" bool ggml_vk_upload_acquired(ggml_backend_buffer_t dst, size_t dst_offset, const void * src, size_t bytes) {
     if (!dst || !src || bytes == 0) { return false; }
     auto * buf_ctx = static_cast<ggml_backend_vk_buffer_context *>(dst->context);

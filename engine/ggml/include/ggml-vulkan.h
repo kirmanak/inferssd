@@ -29,6 +29,9 @@ GGML_BACKEND_API bool ggml_vk_copy_tensors_fenced(const struct ggml_tensor ** te
 // One graphics-queue copy into an exclusive device buffer, then one acquire on
 // the compute queue. The caller runs the shader only after this returns.
 GGML_BACKEND_API bool ggml_vk_upload_acquired(ggml_backend_buffer_t dst, size_t dst_offset, const void * src, size_t bytes);
+// Submit the copy and return. Finish waits, acquires, and frees the ticket.
+GGML_BACKEND_API void * ggml_vk_upload_begin(ggml_backend_buffer_t dst, size_t dst_offset, const void * src, size_t bytes);
+GGML_BACKEND_API void ggml_vk_upload_finish(void * ticket);
 
 struct ggml_vk_copy_region { size_t src_offset; size_t dst_offset; size_t bytes; };
 // Same acquire, many regions, source already a Vulkan buffer. One fence.

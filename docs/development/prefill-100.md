@@ -142,3 +142,37 @@ the same: 124 ms to copy 472 MB, and the first GEMM was 30 ms. One
 contiguous copy is the usable shape. It is not faster than the current
 per-tensor set when done synchronously (both ~15 ms / 472 MB). It only
 pays if the copy runs during the next layer's attention.
+
+A copy whose source is an imported host mapping does not keep that GEMM.
+One region, 472 MB, from an imported pointer into the same exclusive
+buffer: copy 125 ms, GEMM 28.9 ms and 28.7 ms on the next run, sample
+still exact. The staging-buffer copy is the one that leaves the matmul
+at 6 ms. Do not DMA expert weights out of an imported mapping.
+
+The staging copy can run while another GEMM is in flight.
+`overlap_compute_us=6231` against `staged_compute_us=6433` for the same
+512-expert graph, with a 472 MB graphics-queue upload outstanding. The
+memcpy into the uncached staging buffer is the part that does not hide:
+58–103 ms, slower than the current per-tensor set (15 ms). Replacing
+that set with this upload is a loss unless the copy is already in flight
+during attention and the memcpy is not on the critical path.
+
+## Dense graph is not the 3 seconds
+
+`GGML_VK_PERF_LOGGER=1` on the warm 500-token prompt. The logger itself
+slows the prompt (7564 ms, 66.1 tok/s, versus 6829 ms without it). GPU
+timestamps for that pass, 2.20 s total:
+
+| | GPU time |
+| --- | --- |
+| prompt-sized matmul, n=496 | 0.31 s |
+| of which the largest is f32 m=4 n=496 k=10240 | 0.11 s |
+| FLASH_ATTN_EXT | 2.6 ms |
+| everything that is not MUL_MAT | 0.21 s |
+| quantized expert matmuls | 1.33 s |
+
+There is no 1.7 s inside the dense kernels. The 3 s beside the expert
+timer is CPU: recording, scheduling, and the upload that still waits
+inside the expert callback. Hiding that upload during attention is still
+the way to 100 tok/s, and only with a staging source, an exclusive
+buffer, and one acquire before the shader.
