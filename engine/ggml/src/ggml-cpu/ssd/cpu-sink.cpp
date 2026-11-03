@@ -787,6 +787,12 @@ struct kimi_cpu_sink {
     std::vector<float> activation;
     std::vector<float> activation_up; // SWIGLU: u, beside g in activation, until quantize_activation
     std::vector<uint8_t> quant_input, quant_hidden;
+    // One decode layer whose experts are already in the host cache: up/gate for every
+    // expert, then down, instead of a barrier pair per expert.
+    std::vector<const char *> resident_up, resident_gate, resident_down;
+    std::vector<float> resident_weight, resident_up_act, resident_gate_act;
+    std::vector<uint8_t> resident_quant;
+    uint64_t resident_layers = 0;
     const uint8_t * down_quant_data = nullptr;
     size_t quant_hidden_stride = 0;
     // Selected from the expert tensor types by prepare(); up and gate share one.
@@ -1649,6 +1655,9 @@ struct kimi_cpu_sink {
         scratch = sink_cache::add(scratch, quant_input.capacity());
         scratch = sink_cache::add(scratch, quant_hidden.capacity());
         scratch = sink_cache::add(scratch, staged_quant_hidden.capacity());
+        scratch = sink_cache::add(scratch, resident_quant.capacity());
+        scratch = sink_cache::add(scratch, sink_cache::multiply(
+            resident_up_act.capacity() + resident_gate_act.capacity() + resident_weight.capacity(), sizeof(float)));
         scratch = sink_cache::add(scratch, sink_cache::multiply(vram.prefill_policy_experts.capacity(),
             sizeof(ssd::place::prefill_expert)));
         return sink_add(sink_add(vram.host_bytes(), cache.stats.committed_bytes), sink_add(ring_bytes, scratch));
@@ -1940,6 +1949,140 @@ struct kimi_cpu_sink {
         std::fprintf(stderr, "[kimi_cpu_sink_threads] decode_participants=%d us_per_expert=%.1f (%d participants: %.1f)\n",
                 c.candidates[c.decided], c.decided ? mean1 : mean0, c.candidates[1 - c.decided], c.decided ? mean0 : mean1);
     }
+    // All selected experts are host-cache hits, so there is no read to overlap.
+    // One up/gate pass and one down pass share the quantized input across the layer.
+    // A hit that is still a prefetch of this run is waited out; a miss stays on the scheduler.
+    bool resident_layer_ready() {
+        if (timeline_active || !ready_first || post_exp_norm) { return false; }
+        if (activation_kind != KIMI_CPU_SINK_ACTIVATION_SWIGLU) { return false; }
+        if (vram.host_ready()) { return false; }
+        if (!dot_up || !dot_down || !quantize_hidden) { return false; }
+        const size_t n = requests.size();
+        if (n < 2 || n > 1024) { return false; }
+        if (expert_output.size() < n * size_t(latent)) { return false; }
+        for (const auto & request : requests) {
+            if (request.cache_hit < 0 || request.vram_slot >= 0) { return false; }
+        }
+        const auto wait_start = sink_clock::now();
+        {
+            std::unique_lock<std::mutex> lock(io_mutex);
+            io_cv.wait(lock, [&] {
+                if (!io_error.empty() || prefetch_hit_failed()) { return true; }
+                for (const auto & request : requests) {
+                    if (prefetch_hit_state(request.cache_hit) != 1) { return false; }
+                }
+                return true;
+            });
+            current.wait_io_us += elapsed_us(wait_start);
+            if (!io_error.empty()) { throw std::runtime_error(io_error); }
+            if (prefetch_hit_failed()) {
+                throw std::runtime_error("CPU sink prefetch read of a used expert failed");
+            }
+        }
+        return true;
+    }
+
+    static void resident_up_rows(void * userdata, int ith, int nth) {
+        auto & sink = *static_cast<kimi_cpu_sink *>(userdata);
+        const int rows = sink.hidden;
+        const int begin = rows * ith / nth;
+        const int end = rows * (ith + 1) / nth;
+        if (begin >= end) { return; }
+        const int n = int(sink.requests.size());
+        const size_t stride = sink.row_bytes_up;
+        const void * input = sink.quant_input.data();
+        const int k = sink.latent;
+        for (int expert = 0; expert < n; ++expert) {
+            const char * up = sink.resident_up[size_t(expert)];
+            const char * gate = sink.resident_gate[size_t(expert)];
+            float * u = sink.resident_up_act.data() + size_t(expert) * size_t(rows);
+            float * g = sink.resident_gate_act.data() + size_t(expert) * size_t(rows);
+            for (int row = begin; row < end; ++row) {
+                sink.dot_up(k, &u[row], 0, up + size_t(row) * stride, 0, input, 0, 1);
+                sink.dot_up(k, &g[row], 0, gate + size_t(row) * stride, 0, input, 0, 1);
+            }
+        }
+    }
+
+    static void resident_down_rows(void * userdata, int ith, int nth) {
+        auto & sink = *static_cast<kimi_cpu_sink *>(userdata);
+        const int rows = sink.latent;
+        const int begin = rows * ith / nth;
+        const int end = rows * (ith + 1) / nth;
+        if (begin >= end) { return; }
+        const int n = int(sink.requests.size());
+        const size_t stride = sink.row_bytes_down;
+        const int k = sink.hidden;
+        for (int expert = 0; expert < n; ++expert) {
+            const char * down = sink.resident_down[size_t(expert)];
+            const uint8_t * hidden_q = sink.resident_quant.data() + size_t(expert) * sink.quant_hidden_stride;
+            float * destination = sink.expert_output.data() + size_t(expert) * size_t(rows);
+            const float weight = sink.resident_weight[size_t(expert)];
+            for (int row = begin; row < end; ++row) {
+                float value;
+                sink.dot_down(k, &value, 0, down + size_t(row) * stride, 0, hidden_q, 0, 1);
+                // Same rounded multiply the per-expert path stores before the slot-order sum.
+                volatile float scaled = value * weight;
+                destination[row] = scaled;
+            }
+        }
+    }
+
+    void compute_resident_layer() {
+        const size_t n = requests.size();
+        resident_up.resize(n);
+        resident_gate.resize(n);
+        resident_down.resize(n);
+        resident_weight.resize(n);
+        if (n > std::numeric_limits<size_t>::max() / size_t(std::max(hidden, 1)) ||
+                quant_hidden_stride > std::numeric_limits<size_t>::max() / n) {
+            throw std::runtime_error("resident expert layer scratch overflow");
+        }
+        resident_up_act.resize(n * size_t(hidden));
+        resident_gate_act.resize(n * size_t(hidden));
+        resident_quant.resize(n * quant_hidden_stride);
+        for (size_t expert = 0; expert < n; ++expert) {
+            const auto & request = requests[expert];
+            const void * data[3];
+            for (int role = 0; role < 3; ++role) {
+                data[role] = static_cast<const char *>(cache.data(request.cache_hit, role)) + request.role[role].data_offset;
+            }
+            resident_up[expert] = static_cast<const char *>(data[0]);
+            resident_gate[expert] = static_cast<const char *>(data[1]);
+            resident_down[expert] = static_cast<const char *>(data[2]);
+            resident_weight[expert] = request.weight;
+            expert_computed[expert] = 1;
+        }
+        const auto compute_start = sink_clock::now();
+        const auto up_start = compute_start;
+        parallel_phase(resident_up_rows, this, false);
+        current.up_gate_us += elapsed_us(up_start);
+        const auto quant_start = sink_clock::now();
+        for (size_t expert = 0; expert < n; ++expert) {
+            float * gate = resident_gate_act.data() + expert * size_t(hidden);
+            const float * up = resident_up_act.data() + expert * size_t(hidden);
+            ggml_vec_swiglu_f32(hidden, gate, gate, up);
+            quantize_hidden(gate, resident_quant.data() + expert * quant_hidden_stride, hidden);
+        }
+        current.hidden_quantize_us += elapsed_us(quant_start);
+        const auto down_start = sink_clock::now();
+        parallel_phase(resident_down_rows, this, true);
+        current.down_reduce_us += elapsed_us(down_start);
+        const double layer_us = elapsed_us(compute_start);
+        current.compute_us += layer_us;
+        if (n) { observe_decode_threads(layer_us / double(n)); }
+        for (size_t expert = 0; expert < n; ++expert) {
+            const void * data[3] = { resident_up[expert], resident_gate[expert], resident_down[expert] };
+            vram.admit(expert, data, true);
+            cache.admit(requests[expert], current);
+        }
+        ++resident_layers;
+        if (resident_layers == 48 || resident_layers % 480 == 0) {
+            std::fprintf(stderr, "[kimi_cpu_sink] resident batch layers=%llu experts=%zu\n",
+                    (unsigned long long) resident_layers, n);
+        }
+    }
+
     // `last`: the run dispatches no phase after this one, so its participants next wait for the close.
     void compute_phase(bool is_down, bool last = false) {
         begin_dynamic_phase(is_down);
@@ -3720,10 +3863,13 @@ extern "C" bool kimi_cpu_sink_run_activation(
         sink->prefetch_schedule(up, !sink->io_requests.empty());
         // The plan reads nothing the reads change (its landing times start at plan.start): planned once they run.
         sink->plan_decode_layer();
-        if (sink->nonblocking_down_sched) {
+        const bool resident = sink->resident_layer_ready();
+        if (resident) {
+            sink->compute_resident_layer();
+        } else if (sink->nonblocking_down_sched) {
             sink->run_nonblocking_down_schedule();
         }
-        const size_t blocking_experts = sink->nonblocking_down_sched ? 0 :
+        const size_t blocking_experts = resident || sink->nonblocking_down_sched ? 0 :
             sink->requests.size() - size_t(sink->vram.hits);
         for (size_t ordinal = 0; ordinal < blocking_experts; ++ordinal) {
             size_t expert = ordinal;
