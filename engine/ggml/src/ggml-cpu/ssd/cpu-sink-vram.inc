@@ -84,6 +84,9 @@ struct sink_vram {
             const auto * budget = configuration.settings.vram_budget();
             if (!budget) { throw std::runtime_error("missing typed vram.budget"); }
             bytes = budget->tier_bytes(configuration.has_gpu);
+            // A Vulkan matmul budget is not the CUDA tier. Leave bytes at 0 so this
+            // adapter does not require a CUDA provider.
+            if (!configuration.has_gpu && configuration.vulkan_api) { bytes = 0; }
             async_upload = exclusive = deferred_upload = prefill_enabled = bytes != 0;
         }
         {

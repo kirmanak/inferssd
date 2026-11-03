@@ -24,5 +24,11 @@ struct runtime_services {
     const store::source_view * source = nullptr;
     void * gpu_transport = nullptr;
     size_t gpu_reserve_bytes = 0;
+    // Vulkan prompt experts (ggml_vk_expert_api_v1). Absent on CUDA and CPU.
+    // vulkan_free_bytes is device memory free after the dense model, so a budget
+    // cannot evict that buffer. Not a CUDA provider and not read by tier_bytes().
+    const void * vulkan_experts = nullptr;
+    void * vulkan_backend = nullptr;
+    uint64_t vulkan_free_bytes = 0;
 };
 }  // namespace ssd

@@ -3,6 +3,7 @@
 #include "llama-model.h"
 #include "ggml-ssd/gpu/provider.h"
 #include "ggml-ssd/gpu/transport.h"
+#include "ggml-ssd/gpu/vulkan-expert.h"
 #if defined(LLAMA_SSD_STORE)
 #include "ggml-ssd/store/index.h"
 #endif
@@ -178,9 +179,24 @@ void llama_ssd_context::attach_backend(ggml_backend_t backend) {
     const auto registry = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend));
     const auto get = reinterpret_cast<ssd::gpu::get_provider_v1>(
         ggml_backend_reg_get_proc_address(registry, "ggml_backend_cuda_ssd_api_v1"));
-    // A backend without the provider (the CPU, Metal) has no GPU tier: a GPU
-    // there runs the dense layers, and the CPU sink every routed expert.
-    if (!get) { return; }
+    // A backend without the CUDA provider still runs dense layers. Vulkan can
+    // compute the prompt experts that fit; every other expert stays on the CPU sink.
+    if (!get) {
+        if (services.vulkan_experts) { return; }
+        const auto vk_get = reinterpret_cast<ggml_vk_expert_api_getter>(
+            ggml_backend_reg_get_proc_address(registry, "ggml_backend_vk_expert_api_v1"));
+        const auto * api = vk_get ? vk_get() : nullptr;
+        if (!api || api->abi != 1 || api->size != sizeof(*api) || !api->supports || !api->mul_mat ||
+                !api->session_create || !api->session_destroy || !api->staging_bytes) {
+            return;
+        }
+        ggml_backend_dev_props props = {};
+        ggml_backend_dev_get_props(ggml_backend_get_device(backend), &props);
+        services.vulkan_experts = api;
+        services.vulkan_backend = backend;
+        services.vulkan_free_bytes = props.memory_free;
+        return;
+    }
     if (gpu_transport) { throw std::runtime_error("one configured CUDA executor per context is supported"); }
     const auto * provider = get();
     if (!provider || provider->version != 1 || provider->size != sizeof(*provider) ||

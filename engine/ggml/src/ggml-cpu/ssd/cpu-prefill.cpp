@@ -132,6 +132,16 @@ struct kimi_cpu_prefill {
     int active_mxfp4_gemm = 0;
     bool group_trace = false;
     kimi_cpu_prefill_stats current = {};
+    // Prompt experts that fit the Vulkan device budget. Overflow stays on the CPU path below.
+    const float * token_input = nullptr;
+    ggml_type vulkan_up_type = GGML_TYPE_F32;
+    ggml_type vulkan_down_type = GGML_TYPE_F32;
+    uint64_t vulkan_triplet = 0;
+    size_t vulkan_up_bytes = 0;
+    size_t vulkan_down_bytes = 0;
+    std::vector<uint8_t> vulkan_group;
+    std::vector<float> vulkan_input, vulkan_up, vulkan_gate, vulkan_down;
+    bool vulkan_error_logged = false;
 
     explicit kimi_cpu_prefill(kimi_cpu_sink * shared_sink) : sink(shared_sink) {
         group_trace = kimi_cpu_sink_debug(sink).trace;
@@ -239,6 +249,104 @@ struct kimi_cpu_prefill {
             for (const auto & column : group.columns) { workspace += column.slots.capacity() * sizeof(int); }
         }
         current.workspace_bytes = workspace;
+    }
+
+    // Greedy in first-touch order. A later smaller expert can still fit after an earlier one does not.
+    // One-token decode never reaches this with ntokens > 1; SiTU and clamped SwiGLU stay on the CPU sink.
+    void select_vulkan(const ggml_tensor * up, const ggml_tensor * gate, const ggml_tensor * down, const float * input) {
+        token_input = input;
+        vulkan_up_type = up->type;
+        vulkan_down_type = down->type;
+        vulkan_up_bytes = row_bytes_up * size_t(hidden);
+        vulkan_down_bytes = row_bytes_down * size_t(latent);
+        vulkan_triplet = uint64_t(up->nb[2]) + uint64_t(gate->nb[2]) + uint64_t(down->nb[2]);
+        vulkan_group.assign(groups.size(), 0);
+        vulkan_error_logged = false;
+        const uint64_t budget = kimi_cpu_sink_vulkan_budget(sink);
+        kimi_cpu_sink_vulkan_begin(sink, budget);
+        const auto * api = kimi_cpu_sink_vulkan_api(sink);
+        const bool swiglu = activation_config.kind == KIMI_CPU_SINK_ACTIVATION_SWIGLU;
+        if (ntokens <= 1 || !swiglu || !api || budget == 0 || vulkan_triplet == 0 || !token_input) { return; }
+        if (!api->supports(int32_t(vulkan_up_type)) || !api->supports(int32_t(vulkan_down_type))) { return; }
+        if (vulkan_up_bytes == 0 || vulkan_down_bytes == 0) { return; }
+        uint64_t remaining = budget;
+        for (size_t group = 0; group < groups.size(); ++group) {
+            if (vulkan_triplet > remaining) { continue; }
+            vulkan_group[group] = 1;
+            remaining -= vulkan_triplet;
+        }
+    }
+
+    bool vulkan_mul(void * session, const ggml_vk_expert_api_v1 * api, ggml_type type,
+            int64_t k, int64_t n, int n_tokens, const void * weight, size_t weight_bytes,
+            const float * input, float * output) {
+        char error[256] = {};
+        if (api->mul_mat(session, int32_t(type), k, n, n_tokens, weight, weight_bytes, input, output, error, sizeof(error))) {
+            return true;
+        }
+        if (!vulkan_error_logged) {
+            vulkan_error_logged = true;
+            std::fprintf(stderr, "[kimi_vulkan_expert] fallback expert=%d %s\n",
+                    active_group ? active_group->expert : -1, error[0] ? error : "matmul failed");
+        }
+        return false;
+    }
+
+    // Copies the expert weights into the reused Vulkan staging buffer before returning.
+    // On failure the caller computes the same expert on the CPU sink.
+    bool try_vulkan(size_t expert, const void * up, const void * gate, const void * down) {
+        if (expert >= vulkan_group.size() || !vulkan_group[expert] || !token_input || !active_group) { return false; }
+        const auto * api = kimi_cpu_sink_vulkan_api(sink);
+        void * session = kimi_cpu_sink_vulkan_session(sink);
+        if (!api || !session || !api->supports(int32_t(vulkan_up_type)) || !api->supports(int32_t(vulkan_down_type))) {
+            return false;
+        }
+        const auto & columns = active_group->columns;
+        const int n_tokens = int(columns.size());
+        if (n_tokens < 1) { return false; }
+        const auto started = prefill_clock::now();
+        vulkan_input.resize(size_t(n_tokens) * size_t(latent));
+        for (int column = 0; column < n_tokens; ++column) {
+            const float * src = token_input + size_t(columns[size_t(column)].token) * size_t(latent);
+            std::copy(src, src + latent, vulkan_input.begin() + size_t(column) * size_t(latent));
+        }
+        vulkan_up.resize(size_t(n_tokens) * size_t(hidden));
+        vulkan_gate.resize(size_t(n_tokens) * size_t(hidden));
+        if (!vulkan_mul(session, api, vulkan_up_type, latent, hidden, n_tokens, up, vulkan_up_bytes,
+                    vulkan_input.data(), vulkan_up.data()) ||
+            !vulkan_mul(session, api, vulkan_up_type, latent, hidden, n_tokens, gate, vulkan_up_bytes,
+                    vulkan_input.data(), vulkan_gate.data())) {
+            return false;
+        }
+        for (int column = 0; column < n_tokens; ++column) {
+            float * gate_col = vulkan_gate.data() + size_t(column) * size_t(hidden);
+            const float * up_col = vulkan_up.data() + size_t(column) * size_t(hidden);
+            ggml_vec_swiglu_f32(hidden, gate_col, gate_col, up_col);
+        }
+        vulkan_down.resize(size_t(n_tokens) * size_t(latent));
+        if (!vulkan_mul(session, api, vulkan_down_type, hidden, latent, n_tokens, down, vulkan_down_bytes,
+                    vulkan_gate.data(), vulkan_down.data())) {
+            return false;
+        }
+        uint64_t routes = 0;
+        for (int column = 0; column < n_tokens; ++column) {
+            float * values = vulkan_down.data() + size_t(column) * size_t(latent);
+            if (activation_config.post_exp_norm) {
+                kimi_cpu_sink_normalize_expert(values, latent, activation_config.post_exp_norm,
+                        activation_config.post_exp_norm_eps);
+            }
+            for (int route : columns[size_t(column)].slots) {
+                float * destination = routed_output.data() + size_t(route) * size_t(latent);
+                for (int row = 0; row < latent; ++row) {
+                    volatile float scaled = values[row] * weights[route];
+                    destination[row] = scaled;
+                }
+                ++routes;
+            }
+        }
+        consumed[expert] = 1;
+        kimi_cpu_sink_vulkan_result(sink, 1, active_group->expert, vulkan_triplet, elapsed_us(started), routes);
+        return true;
     }
 
     static void parallel_rows(void * userdata, int, int) {
@@ -369,6 +477,7 @@ struct kimi_cpu_prefill {
         self.up_data = static_cast<const char *>(up);
         self.gate_data = static_cast<const char *>(gate);
         self.down_data = static_cast<const char *>(down);
+        if (self.try_vulkan(expert, up, gate, down)) { return; }
         self.consumed[expert] = 1;
         auto start = prefill_clock::now();
         self.down_phase = false;
@@ -401,6 +510,7 @@ struct kimi_cpu_prefill {
             }
         }
         self.current.stream.down_reduce_us += elapsed_us(start);
+        kimi_cpu_sink_vulkan_result(self.sink, 0, self.active_group->expert, 0, 0, 0);
     }
 
     // Each token's CPU routes in slot order. The sum starts at the first one's
@@ -508,6 +618,7 @@ extern "C" bool kimi_cpu_prefill_run_activation(
         prefill->output = output;
         prefill->ntokens = ntokens;
         prefill->nslots = nslots;
+        prefill->select_vulkan(up, gate, down, input);
         std::fill(output, output + static_cast<size_t>(ntokens) * prefill->latent, 0.0f);
         auto phase_start = prefill_clock::now();
         for (int token = 0; token < ntokens; ++token) {

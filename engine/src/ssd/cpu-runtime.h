@@ -104,7 +104,27 @@ struct llama_kimi_cpu_sink_runtime {
         // fixed eight-expert read ring, no speculative cache-compute policy.
         cache_budget = std::numeric_limits<uint64_t>::max();
         cache_keep_across_requests = true;
-        vram_budget = settings.vram_budget()->tier_bytes(services.gpu != nullptr);
+        {
+            // Same clamp as the sink. tier_bytes() is unchanged: auto without a
+            // CUDA provider stays 0 there, and a Vulkan device uses the free room.
+            const auto * tier = settings.vram_budget();
+            const bool cuda = services.gpu != nullptr;
+            const bool vulkan = services.vulkan_experts && services.vulkan_backend;
+            if (cuda) {
+                vram_budget = tier->tier_bytes(true);
+            } else if (vulkan) {
+                const uint64_t room = services.vulkan_free_bytes;
+                if (tier->automatic) {
+                    constexpr uint64_t reserve = 128ull << 20;
+                    vram_budget = room > reserve ? room - reserve : room;
+                } else {
+                    vram_budget = tier->bytes;
+                    if (room && vram_budget > room) { vram_budget = room; }
+                }
+            } else {
+                vram_budget = tier->tier_bytes(false);
+            }
+        }
         cache_max_per_layer = int(std::min<int64_t>(n_expert, 896));
         for (int32_t layer : routed_layers) {
             if (layer >= 0 && layer < n_layers &&

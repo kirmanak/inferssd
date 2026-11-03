@@ -1,6 +1,7 @@
 #pragma once
 
 #include "cpu-sink.h"
+#include "ggml-ssd/gpu/vulkan-expert.h"
 #include <cmath>
 #include "ggml-ssd/telemetry/telemetry.h"
 
@@ -70,6 +71,13 @@ void kimi_cpu_sink_parallel(struct kimi_cpu_sink * sink,
         kimi_cpu_sink_parallel_fn function, void * userdata);
 void kimi_cpu_sink_parallel_last(struct kimi_cpu_sink * sink,
         kimi_cpu_sink_parallel_fn function, void * userdata);
+void kimi_cpu_sink_vulkan_begin(struct kimi_cpu_sink * sink, uint64_t budget);
+void kimi_cpu_sink_vulkan_result(struct kimi_cpu_sink * sink, int gpu, int32_t expert,
+        uint64_t bytes, double microseconds, uint64_t routes);
+const struct ggml_vk_expert_api_v1 * kimi_cpu_sink_vulkan_api(const struct kimi_cpu_sink * sink);
+void * kimi_cpu_sink_vulkan_session(struct kimi_cpu_sink * sink);
+uint64_t kimi_cpu_sink_vulkan_budget(const struct kimi_cpu_sink * sink);
+
 bool kimi_cpu_sink_stream_hybrid(struct kimi_cpu_sink * sink,
         const struct ggml_tensor * up, const struct ggml_tensor * gate,
         const struct ggml_tensor * down, const int32_t * ids, int nexperts,

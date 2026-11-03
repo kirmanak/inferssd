@@ -700,6 +700,11 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
         target_include_directories(test-completion-cache-phase PRIVATE ../src ../ggml/src)
         target_link_libraries(test-completion-cache-phase PRIVATE llama ggml-cpu)
         target_compile_features(test-completion-cache-phase PRIVATE cxx_std_17)
+        # Needs the Vulkan device and a btrfs fixture. Not an asset-free CTest entry.
+        add_executable(test-vulkan-expert ssd/test-vulkan-expert.cpp)
+        target_include_directories(test-vulkan-expert PRIVATE ../ggml/src ../ggml/src/ggml-cpu)
+        target_link_libraries(test-vulkan-expert PRIVATE ggml-cpu ggml ggml-ssd-host ggml-ssd-settings Threads::Threads)
+        target_compile_features(test-vulkan-expert PRIVATE cxx_std_17)
     endif()
     llama_build_and_test(ssd/test-kimi-deepseek2-guards.cpp)
     target_include_directories(test-kimi-deepseek2-guards PRIVATE

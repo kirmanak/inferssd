@@ -56,6 +56,7 @@ if (Vulkan_FOUND)
 
     ggml_add_backend_library(ggml-vulkan
                              ggml-vulkan.cpp
+                             vulkan-expert.cpp
                              ../../include/ggml-vulkan.h
                             )
 

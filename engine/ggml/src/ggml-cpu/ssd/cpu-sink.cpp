@@ -3,6 +3,7 @@
 #include "ssd/runtime.h"
 #include "ssd/testing.h"
 #include "ggml-ssd/gpu/provider.h"
+#include "ggml-ssd/gpu/vulkan-expert.h"
 #include "ggml-ssd/settings/settings.h"
 #include "ggml-ssd/gpu-tier-settings.h"
 #include "ggml-ssd/telemetry/telemetry.h"
@@ -179,6 +180,10 @@ struct sink_configuration {
     ssd::gpu::provider_v1 gpu{};
     ssd::gpu::cpu_kernels_v1 cpu{};
     bool has_gpu = false;
+    const ggml_vk_expert_api_v1 * vulkan_api = nullptr;
+    void * vulkan_backend = nullptr;
+    uint64_t vulkan_budget = 0;
+    uint64_t vulkan_free_bytes = 0;
     int gpu_device = 0;
     const ssd::store::source_view * source = nullptr;
     void * gpu_transport = nullptr;
@@ -307,6 +312,31 @@ static void sink_copy_services(sink_configuration & value, const ssd::runtime_se
         value.gpu_device = services->gpu_device;
         value.has_gpu = true;
     }
+    if (services->vulkan_experts || services->vulkan_backend) {
+        const auto * api = static_cast<const ggml_vk_expert_api_v1 *>(services->vulkan_experts);
+        if (!services->vulkan_backend || !api || api->abi != 1 || api->size != sizeof(*api) || !api->supports ||
+                !api->mul_mat || !api->session_create || !api->session_destroy || !api->staging_bytes) {
+            throw std::runtime_error("Vulkan expert API missing or incompatible");
+        }
+        value.vulkan_api = api;
+        value.vulkan_backend = services->vulkan_backend;
+        value.vulkan_free_bytes = services->vulkan_free_bytes;
+    }
+}
+
+// Vulkan prompt experts are not the CUDA tier. An explicit budget is clamped to
+// the memory still free after the dense model; auto uses that room minus a
+// small driver reserve. tier_bytes() itself is unchanged.
+static uint64_t sink_vulkan_budget(const ssd::settings::budget * budget, uint64_t free_bytes) {
+    if (!budget) { return 0; }
+    uint64_t room = free_bytes;
+    if (budget->automatic) {
+        constexpr uint64_t reserve = 128ull << 20;
+        return room > reserve ? room - reserve : room;
+    }
+    uint64_t bytes = budget->bytes;
+    if (room && bytes > room) { bytes = room; }
+    return bytes;
 }
 
 template<class T> static T sink_host_value(ssd::result<T> result) {
@@ -545,6 +575,22 @@ struct kimi_cpu_sink {
     std::vector<size_t> io_requests;
     sink_cache cache;
     sink_vram vram;
+    const ggml_vk_expert_api_v1 * vulkan_api = nullptr;
+    void * vulkan_backend = nullptr;
+    void * vulkan_session = nullptr;
+    bool vulkan_session_failed = false;
+    uint64_t vulkan_budget = 0;
+    struct {
+        bool used = false;
+        double us = 0;
+        uint64_t device_bytes = 0;
+        uint64_t assigned_bytes = 0;
+        uint64_t budget = 0;
+        uint64_t gpu_routes = 0;
+        int gpu = 0;
+        int cpu = 0;
+        std::string gpu_ids, cpu_ids;
+    } vulkan_note;
     uint64_t ledger_refusals = 0; // make_room answers that were no
     bool margin_boundary = false; // the last token boundary the margin saw was a decode token
     uint64_t margin_epoch = 0, margin_token = 0;
@@ -759,6 +805,9 @@ struct kimi_cpu_sink {
         profile_enabled(configuration.debug.profile), trace_enabled(configuration.debug.trace),
         timeline_enabled(configuration.debug.trace), mrc(configuration.debug.mrc), worker_profiles(1),
         fast_cpus(sink_fast_cpus()) {
+        vulkan_api = configuration.vulkan_api;
+        vulkan_backend = configuration.vulkan_backend;
+        vulkan_budget = configuration.vulkan_budget;
         if (poll_us < 0 || poll_us > 1000 || dynamic_chunk_rows < 16 || dynamic_chunk_rows > 16384 || dynamic_chunk_rows % 16 ||
                 configuration.policy.decode_participants < 0 || configuration.policy.decode_participants > sink_max_participants) {
             throw std::runtime_error("invalid explicit executor schedule");
@@ -1256,6 +1305,10 @@ struct kimi_cpu_sink {
         if (call_open) {
             std::fprintf(stderr, "[kimi_cpu_sink] destroyed inside an open call; aborting\n");
             std::abort();
+        }
+        if (vulkan_session && vulkan_api && vulkan_api->session_destroy) {
+            vulkan_api->session_destroy(vulkan_session);
+            vulkan_session = nullptr;
         }
         cache.ledger.client->clear_reclaimer(); // before anything a reclaim on another thread uses
         prefetch_stop();
@@ -2809,6 +2862,54 @@ struct kimi_cpu_sink {
     }
 };
 
+// Prompt-only Vulkan notes. Decode never calls these. A zero budget or a missing
+// API leaves the note unused, so the source log stays the CUDA/CPU line.
+void kimi_cpu_sink_vulkan_begin(struct kimi_cpu_sink * sink, uint64_t budget) {
+    if (!sink) { return; }
+    sink->vulkan_note = {};
+    sink->vulkan_note.budget = budget;
+    sink->vulkan_note.used = budget > 0 && sink->vulkan_api && sink->vulkan_backend;
+}
+
+void kimi_cpu_sink_vulkan_result(struct kimi_cpu_sink * sink, int gpu, int32_t expert,
+        uint64_t bytes, double microseconds, uint64_t routes) {
+    if (!sink || !sink->vulkan_note.used) { return; }
+    auto & note = sink->vulkan_note;
+    std::string & ids = gpu ? note.gpu_ids : note.cpu_ids;
+    if (!ids.empty()) { ids += ','; }
+    ids += std::to_string(expert);
+    if (gpu) {
+        note.gpu += 1;
+        note.assigned_bytes += bytes;
+        note.us += microseconds;
+        note.gpu_routes += routes;
+    } else {
+        note.cpu += 1;
+    }
+}
+
+const struct ggml_vk_expert_api_v1 * kimi_cpu_sink_vulkan_api(const struct kimi_cpu_sink * sink) {
+    return sink ? sink->vulkan_api : nullptr;
+}
+
+void * kimi_cpu_sink_vulkan_session(struct kimi_cpu_sink * sink) {
+    if (!sink || !sink->vulkan_api || !sink->vulkan_backend || sink->vulkan_session_failed) { return nullptr; }
+    if (!sink->vulkan_session) {
+        char error[256] = {};
+        sink->vulkan_session = sink->vulkan_api->session_create(
+                static_cast<ggml_backend_t>(sink->vulkan_backend), error, sizeof(error));
+        if (!sink->vulkan_session) {
+            sink->vulkan_session_failed = true;
+            std::fprintf(stderr, "[kimi_vulkan_expert] session_create failed: %s\n", error[0] ? error : "unknown");
+        }
+    }
+    return sink->vulkan_session;
+}
+
+uint64_t kimi_cpu_sink_vulkan_budget(const struct kimi_cpu_sink * sink) {
+    return sink ? sink->vulkan_budget : 0;
+}
+
 // A prefill consumer runs while the stream owns run_mutex, so its phases and
 // the role buffers cannot concurrently be used by decode. The phase runs on
 // every participant of the open call.
@@ -3161,6 +3262,29 @@ bool kimi_cpu_sink_stream_hybrid(struct kimi_cpu_sink * sink,
         // sources remain leased until finish drained H2D and compute.
         sink->cache.release_prefill_leases(sink->requests);
         batch->ssd_bytes = sink->current.read_bytes;
+        if (sink->vulkan_note.used) {
+            if (sink->vulkan_session && sink->vulkan_api && sink->vulkan_api->staging_bytes) {
+                sink->vulkan_note.device_bytes = sink->vulkan_api->staging_bytes(sink->vulkan_session);
+            }
+            // CUDA already published gpu_experts before this loop. Vulkan fills the
+            // same counters only when that tier did not, and only after finish_prefill
+            // so a borrowed Vulkan backend is not treated as a CUDA worker.
+            if (!batch->gpu_experts && sink->vulkan_note.gpu) {
+                batch->gpu_experts = uint64_t(sink->vulkan_note.gpu);
+                batch->gpu_routes = sink->vulkan_note.gpu_routes;
+                batch->gpu_expert_us = sink->vulkan_note.us;
+            }
+            std::fprintf(stderr,
+                "[kimi_vulkan_expert] gpu_experts=%d gpu_ids=%s cpu_experts=%d cpu_ids=%s gpu_expert_us=%.3f device_bytes=%llu assigned_bytes=%llu budget=%llu\n",
+                sink->vulkan_note.gpu,
+                sink->vulkan_note.gpu_ids.empty() ? "-" : sink->vulkan_note.gpu_ids.c_str(),
+                sink->vulkan_note.cpu,
+                sink->vulkan_note.cpu_ids.empty() ? "-" : sink->vulkan_note.cpu_ids.c_str(),
+                sink->vulkan_note.us,
+                (unsigned long long) sink->vulkan_note.device_bytes,
+                (unsigned long long) sink->vulkan_note.assigned_bytes,
+                (unsigned long long) sink->vulkan_note.budget);
+        }
         std::fprintf(stderr,
             "[kimi_cpu_prefill_sources] tensor=%s vram_experts=%llu vram_routes=%llu "
             "ram_gpu_experts=%llu ram_gpu_routes=%llu ram_gpu_upload_bytes=%llu ram_gpu_upload_us=%.3f "
@@ -3281,8 +3405,11 @@ sink_configuration configured(const settings::snapshot * input, const runtime_se
             integer("host.headroom_mib") > UINT32_MAX || integer("vram.reserve_mib") > 8192) {
         throw std::runtime_error("invalid typed SSD executor dependencies");
     }
-    if (!out.has_gpu && out.settings.vram_budget()->tier_bytes(false)) {
+    if (!out.has_gpu && out.settings.vram_budget()->tier_bytes(false) && !out.vulkan_api) {
         throw std::runtime_error("nonzero GPU tier budget requires an injected GPU provider");
+    }
+    if (out.vulkan_api && !out.has_gpu) {
+        out.vulkan_budget = sink_vulkan_budget(out.settings.vram_budget(), out.vulkan_free_bytes);
     }
     auto & p = out.policy;
     p.ready_first = p.early_up_gate = p.role_major = p.nonblocking_down_sched = p.dynamic_rows = true;
@@ -3323,7 +3450,10 @@ kimi_cpu_sink * create(int ring_experts, const execution_policy & policy,
         sink_configuration value;
         value.policy = policy;
         sink_copy_services(value, services);
-        if (policy.vram_budget && !value.has_gpu) { throw std::runtime_error("explicit GPU fixture requires an injected provider"); }
+        if (policy.vram_budget && !value.has_gpu && !value.vulkan_api) {
+            throw std::runtime_error("explicit GPU fixture requires an injected provider");
+        }
+        if (value.vulkan_api && !value.has_gpu) { value.vulkan_budget = policy.vram_budget; }
         return new kimi_cpu_sink(ring_experts, resolver, userdata, value);
     } catch (const std::exception & e) {
         sink_error(error, error_size, e.what());
