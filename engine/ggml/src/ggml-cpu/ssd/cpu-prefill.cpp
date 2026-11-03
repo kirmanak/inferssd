@@ -483,8 +483,10 @@ struct kimi_cpu_prefill {
         if (!api || !session || !api->mul_mat_batch || !api->supports(int32_t(self.vulkan_up_type)) ||
                 !api->supports(int32_t(self.vulkan_down_type))) { return false; }
         if (self.latent <= 0 || self.hidden <= 0 || self.vulkan_up_bytes == 0 || self.vulkan_down_bytes == 0) { return false; }
-        std::vector<int> ntok(size_t(nexperts));
-        std::vector<size_t> in_at(size_t(nexperts)), hid_at(size_t(nexperts));
+        const size_t n_experts = size_t(nexperts);
+        std::vector<int> ntok(n_experts);
+        std::vector<size_t> in_at(n_experts);
+        std::vector<size_t> hid_at(n_experts);
         size_t n_in = 0, n_hid = 0;
         for (int i = 0; i < nexperts; ++i) {
             ntok[size_t(i)] = int(self.groups[size_t(i)].columns.size());

@@ -221,7 +221,8 @@ bool expert_batch_chunk(expert_session * session, const ggml_vk_expert_matmul * 
         ggml_tensor * input = nullptr;
         ggml_tensor * output = nullptr;
     };
-    std::vector<item_tensors> built(size_t(count));
+    const size_t n_items = size_t(count);
+    std::vector<item_tensors> built(n_items);
     ggml_backend_buffer_type_t buft = ggml_backend_get_default_buffer_type(session->backend);
     const size_t alignment = std::max<size_t>(ggml_backend_buft_get_alignment(buft), 128);
     size_t cursor = 0;
