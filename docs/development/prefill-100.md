@@ -176,3 +176,31 @@ timer is CPU: recording, scheduling, and the upload that still waits
 inside the expert callback. Hiding that upload during attention is still
 the way to 100 tok/s, and only with a staging source, an exclusive
 buffer, and one acquire before the shader.
+
+## Ahead upload of the whole next layer lost
+
+At the end of layer N, pack every cached expert of layer N+1 and
+`memcpy` that into a staging buffer, then one graphics-queue copy.
+Not the per-tensor set. The packed copy is 60 ms / 472 MB; the set is
+15 ms for the same bytes. The pack also copied the whole cached layer,
+about 37 GB across the prompt, not the routed subset.
+
+| where the memcpy ran | warm wall | tok/s |
+| --- | --- | --- |
+| layer thread | 45437 ms | 11.00 |
+| background thread | 22601 ms | 22.12 |
+
+Keys matched (`used` 33666), so skipping `tensor_set` worked. On the
+background run the DMA hid (`finish_us` sum 0.03 s) and the memcpy sum
+was 2.85 s. Resident expert time grew to 5.01 s. The memcpy ran during
+the dense graph and the wall grew by more than the memcpy. That wiring
+is not in the tree. Reverted, rebuilt, same 500-token prompt:
+
+| | time | tok/s |
+| --- | --- | --- |
+| cold | 8563 ms | 58.4 |
+| warm | 6573 ms | 76.07 |
+
+That is the clean number. `/completion` with `n_predict` 32 stopped at
+`eos` (`predicted_n` 1, empty content), so decode is timed with
+`llama-completion -n 128`, not the HTTP server.
