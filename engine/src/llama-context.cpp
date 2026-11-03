@@ -454,14 +454,30 @@ llama_context::llama_context(
 
         // The expert caches' storage once the worst-case graph is reserved (the GPU tier's on unified memory, the RAM
         // cache's elsewhere when it can give room back; the sink decides): its page population then leaves every
-        // request's path. Any routed layer gives the experts' format.
+        // request's path. Size each role from the largest routed layer. The first layer can be smaller, and learning
+        // the real slot on the first decode token releases the populated arena and faults a new one inside generation.
         if (cpu_sink_runtime && (cpu_sink_runtime->vram_budget || cpu_sink_runtime->cache_budget) && backend_cpu) {
+            const ggml_tensor * up = nullptr;
+            const ggml_tensor * gate = nullptr;
+            const ggml_tensor * down = nullptr;
+            auto role_bytes = [](const ggml_tensor * tensor) -> size_t {
+                return (ggml_row_size(tensor->type, tensor->ne[0]) * tensor->ne[1] + 8190) / 4096 * 4096;
+            };
+            size_t up_bytes = 0, gate_bytes = 0, down_bytes = 0;
             for (const auto & layer : model.layers) {
-                if (layer.ffn_up_exps && layer.ffn_gate_exps && layer.ffn_down_exps) {
-                    cpu_sink_runtime->reserve_tier(ggml_backend_dev_backend_reg(ggml_backend_get_device(backend_cpu)),
-                        layer.ffn_up_exps, layer.ffn_gate_exps, layer.ffn_down_exps, int(model.hparams.n_expert_used));
-                    break;
+                if (!layer.ffn_up_exps || !layer.ffn_gate_exps || !layer.ffn_down_exps) {
+                    continue;
                 }
+                const size_t up_b = role_bytes(layer.ffn_up_exps);
+                const size_t gate_b = role_bytes(layer.ffn_gate_exps);
+                const size_t down_b = role_bytes(layer.ffn_down_exps);
+                if (!up || up_b > up_bytes) { up = layer.ffn_up_exps; up_bytes = up_b; }
+                if (!gate || gate_b > gate_bytes) { gate = layer.ffn_gate_exps; gate_bytes = gate_b; }
+                if (!down || down_b > down_bytes) { down = layer.ffn_down_exps; down_bytes = down_b; }
+            }
+            if (up && gate && down) {
+                cpu_sink_runtime->reserve_tier(ggml_backend_dev_backend_reg(ggml_backend_get_device(backend_cpu)),
+                    up, gate, down, int(model.hparams.n_expert_used));
             }
         }
 
