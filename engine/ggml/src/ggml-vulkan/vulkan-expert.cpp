@@ -51,8 +51,16 @@ struct expert_session {
     ggml_backend_buffer_t batch_buffer = nullptr;
     ggml_backend_buffer_type_t batch_buft = nullptr;
     uint64_t batch_staging = 0;
+    struct ahead_slot {
+        ggml_backend_buffer_t buffer = nullptr;
+        uint64_t cap = 0;
+        std::unordered_map<const void *, size_t> at;
+        std::unordered_map<const void *, size_t> bytes;
+    };
+    ahead_slot ahead_slots[2];
+    int ahead_shown = 0;
+    int ahead_filling = -1;
     ggml_backend_buffer_t ahead_buffer = nullptr;
-    uint64_t ahead_cap = 0;
     std::thread ahead_thread;
     std::unordered_map<const void *, size_t> ahead_at;
     std::unordered_map<const void *, size_t> ahead_bytes;
@@ -83,8 +91,15 @@ struct expert_session {
         if (!ahead_thread.joinable()) { return; }
         const auto t0 = std::chrono::steady_clock::now();
         ahead_thread.join();
-        std::fprintf(stderr, "[kimi_vk_ahead] join_us=%.0f\n",
-                std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count());
+        const double join_us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count();
+        std::fprintf(stderr, "[kimi_vk_ahead] join_us=%.0f\n", join_us);
+        if (ahead_filling >= 0) {
+            ahead_shown = ahead_filling;
+            ahead_filling = -1;
+            ahead_buffer = ahead_slots[ahead_shown].buffer;
+            ahead_at.swap(ahead_slots[ahead_shown].at);
+            ahead_bytes.swap(ahead_slots[ahead_shown].bytes);
+        }
     }
 
     ~expert_session() {
@@ -92,7 +107,9 @@ struct expert_session {
         drop_graph();
         if (buffer) { ggml_backend_buffer_free(buffer); }
         if (batch_buffer) { ggml_backend_buffer_free(batch_buffer); }
-        if (ahead_buffer) { ggml_backend_buffer_free(ahead_buffer); }
+        for (auto & slot : ahead_slots) {
+            if (slot.buffer) { ggml_backend_buffer_free(slot.buffer); }
+        }
     }
 };
 
@@ -389,10 +406,9 @@ bool expert_batch_chunk(expert_session * session, const ggml_vk_expert_matmul * 
 bool expert_mul_mat_batch(void * raw, const ggml_vk_expert_matmul * items, int count,
         char * error, size_t error_size) {
     auto * session = static_cast<expert_session *>(raw);
-    if (session) {
-        session->join_ahead();
-        session->ahead_used = 0;
-    }
+    // The sink already published the finished slot. Joining here would wait for
+    // the next layer's fill and then show that slot to this batch.
+    if (session) { session->ahead_used = 0; }
     if (!session || (count > 0 && !items)) {
         set_error(error, error_size, "vulkan expert batch is missing buffers");
         return false;
@@ -428,8 +444,15 @@ constexpr uint64_t k_ahead_cap = 1536ull << 20;
 bool expert_ahead(void * raw, const ggml_vk_expert_ahead * items, int count) {
     auto * session = static_cast<expert_session *>(raw);
     if (!session) { return false; }
-    session->join_ahead();
-    if (!items || count <= 0) { return true; }
+    if (!items || count <= 0) {
+        session->join_ahead();
+        return true;
+    }
+    // The batch is reading the shown slot. Fill the other one during this layer's
+    // GEMM and the next layer's attention, so the next join is not the copy.
+    if (session->ahead_thread.joinable()) { session->join_ahead(); }
+    const int dest = 1 - session->ahead_shown;
+    auto & slot = session->ahead_slots[dest];
     ggml_backend_buffer_type_t buft = ggml_backend_get_default_buffer_type(session->backend);
     const size_t align = std::max<size_t>(ggml_backend_buft_get_alignment(buft), 256);
     struct planned { const void * key; const void * data; size_t bytes; size_t offset; };
@@ -444,30 +467,33 @@ bool expert_ahead(void * raw, const ggml_vk_expert_ahead * items, int count) {
         cursor = off + items[i].bytes;
     }
     if (plan.empty()) { return false; }
-    if (!session->ahead_buffer || session->ahead_cap < cursor) {
-        if (session->ahead_buffer) { ggml_backend_buffer_free(session->ahead_buffer); }
-        session->ahead_buffer = ggml_backend_buft_alloc_buffer(buft, cursor);
-        session->ahead_cap = session->ahead_buffer ? ggml_backend_buffer_get_size(session->ahead_buffer) : 0;
-        if (!session->ahead_buffer) { return false; }
+    if (!slot.buffer || slot.cap < cursor) {
+        if (slot.buffer) { ggml_backend_buffer_free(slot.buffer); }
+        slot.buffer = ggml_backend_buft_alloc_buffer(buft, cursor);
+        slot.cap = slot.buffer ? ggml_backend_buffer_get_size(slot.buffer) : 0;
+        if (!slot.buffer) { return false; }
+        if (dest == session->ahead_shown) { session->ahead_buffer = slot.buffer; }
     }
-    session->ahead_at.clear();
-    session->ahead_bytes.clear();
-    session->ahead_thread = std::thread([session, plan = std::move(plan)]() {
+    slot.at.clear();
+    slot.bytes.clear();
+    session->ahead_filling = dest;
+    session->ahead_thread = std::thread([session, dest, plan = std::move(plan)]() {
+        auto & filled = session->ahead_slots[dest];
         const size_t mem = ggml_tensor_overhead() * plan.size() + 65536;
         ggml_context * ctx = ggml_init({ mem, nullptr, true });
-        if (!ctx || !session->ahead_buffer) { if (ctx) { ggml_free(ctx); } return; }
-        void * base = ggml_backend_buffer_get_base(session->ahead_buffer);
+        if (!ctx || !filled.buffer) { if (ctx) { ggml_free(ctx); } return; }
+        void * base = ggml_backend_buffer_get_base(filled.buffer);
         const auto t0 = std::chrono::steady_clock::now();
         size_t bytes = 0;
         int queued = 0;
         for (const auto & item : plan) {
             ggml_tensor * tensor = ggml_new_tensor_1d(ctx, GGML_TYPE_I8, int64_t(item.bytes));
             if (!tensor) { break; }
-            if (ggml_backend_tensor_alloc(session->ahead_buffer, tensor,
+            if (ggml_backend_tensor_alloc(filled.buffer, tensor,
                     static_cast<char *>(base) + item.offset) != GGML_STATUS_SUCCESS) { break; }
             ggml_backend_tensor_set(tensor, item.data, 0, item.bytes);
-            session->ahead_at[item.key] = item.offset;
-            session->ahead_bytes[item.key] = item.bytes;
+            filled.at[item.key] = item.offset;
+            filled.bytes[item.key] = item.bytes;
             bytes += item.bytes;
             ++queued;
         }

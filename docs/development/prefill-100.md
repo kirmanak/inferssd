@@ -254,3 +254,23 @@ from about 3.7 s to 2.25 s. No fallback.
 The clean binary's short run was 10.43. The 9.72 sample is noise; 10.77
 is above the 10.68 baseline. The thread does not run on that tool's
 decode path. Kept.
+
+The join was the copy that did not fit in the gap after the batch. The
+next layer's set now starts at the beginning of this layer, into the
+other of two buffers, while this layer's batch still reads the first.
+Those cache slots are pinned until the copy finishes. The batch must not
+join that in-flight fill: doing so waits for the next layer and then
+shows its slot to this batch (`used` fell to 30, wall 7337 ms).
+
+After that join was removed:
+
+```text
+prompt_ms=5803.14 prompt_per_second=86.16
+join sum 0.123 s, max 64 ms
+used 34059
+batch set 0.42 s, compute 0.85 s
+```
+
+`llama-completion -n 128` on that binary: 10.79 tok/s. Above 10.68.
+5803 ms is not 5000. The remaining batch set is mostly the first layer,
+which has no earlier window, plus the activation upload. Not 100 tok/s.

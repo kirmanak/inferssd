@@ -1035,6 +1035,14 @@ struct expert_cache {
         const void * data = nullptr;
         size_t bytes = 0;
     };
+    void protect_layer(int32_t layer_id, bool on) {
+        const auto found = std::find_if(layers.begin(), layers.end(), [&](const layer & l) { return l.id == layer_id; });
+        if (found == layers.end()) { return; }
+        const size_t layer_index = size_t(found - layers.begin());
+        for (size_t i = found->begin; i < found->begin + found->count && i < entries.size(); ++i) {
+            if (entries[i].layer_index == layer_index && entries[i].resident) { entries[i].protected_now = on; }
+        }
+    }
     void cached_weights(int32_t layer_id, std::vector<cached_weight> & out) const {
         out.clear();
         if (!arena || layers.empty()) { return; }
