@@ -306,3 +306,27 @@ eval time = 93193.46 ms / 1023 runs (91.10 ms per token, 10.98 tok/s)
 
 Above 10.68. Under 5000 ms. The matched upload is still skipped
 (`used` 34059 on the instrumented run). No fallback.
+
+## Greedy tokens after the workspace reuse
+
+`fc98ab9` against its parent `8f67306`, same 507-token prompt plus one
+continuation line, temperature 0, `n_predict` 24, second request in the
+process so the reused buffers are warm. The server is the path that
+calls `resident_vulkan`.
+
+| comparison | token ids | content | argmax logprob max abs |
+| --- | --- | --- | --- |
+| `fc98ab9` vs itself, second process | 24/24 | same | 0.134 |
+| `fc98ab9` vs `8f67306` | 24/24 | same | 0.296 |
+
+The 24 greedy tokens are `22791 440 799 11316 421 4874 279 8981 3817 13 198 22791 440 799 11316 421 4874 279 7948 6297 13 198 22791 440` on both commits. Text:
+
+```text
+Continue with one sentence that names the cold token.
+Continue with one sentence that names the warm cache.
+Continue with
+```
+
+Top-5 sets move between processes even on the same binary (9 of 24
+tokens). They are not a stable numeric oracle here. The greedy tokens
+match, so the workspace reuse stays.
