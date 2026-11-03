@@ -95,7 +95,20 @@ the copy is not removed, it moves. Scaled to 40 GB the save is about
 100 tok/s needs the 1.77 s upload to overlap the 3.02 s dense graph, or
 the dense graph to shrink by about 1.7 s. The router runs after attention
 in the same split, so the selected experts are not known in time to hide
-that layer's upload in that layer's attention. The remaining idea is to
-upload every expert of the layer on the transfer queue while attention
-runs, about 1.5 GB against a 63 ms layer. That only works if the transfer
-queue actually overlaps compute.
+that layer's upload in that layer's attention. Upload the cached experts
+of layer N+1 at the end of layer N, on a queue that overlaps attention.
+
+A 1.5 GB copy against a 44 ms compute shader on the RX 9070 XT:
+
+| queues | copy | compute | both | overlap |
+| --- | --- | --- | --- | --- |
+| two async-compute queues (ggml's fallback pair) | 165 ms, 9.8 GB/s | 32 ms | 169 ms | 14% |
+| graphics queue copy, async-compute shader | 55 ms, 29 GB/s | 47 ms | 54 ms | full |
+
+There is no transfer-only family. The graphics queue is the DMA engine,
+and it does overlap async compute. ggml already prefers that family for
+the transfer queue when the compute queue is the non-graphics one. The
+current upload still waits inside the expert callback, after attention
+has finished, so the DMA never gets that window. A CPU memcpy of the
+layer into a staging buffer before the DMA would put ~15 ms back on the
+critical path. The copy has to read the cache arena.
