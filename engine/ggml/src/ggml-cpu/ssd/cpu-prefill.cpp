@@ -471,6 +471,118 @@ struct kimi_cpu_prefill {
         }
     }
 
+    // Every expert of the layer is already in the host cache. One up/gate submission
+    // and one down submission replace a synchronized matmul per expert.
+    static bool resident_vulkan(void * userdata, const void * const * up, const void * const * gate,
+            const void * const * down, int nexperts) {
+        auto & self = *static_cast<kimi_cpu_prefill *>(userdata);
+        if (nexperts < 1 || nexperts != int(self.groups.size()) || !up || !gate || !down || !self.token_input) { return false; }
+        if (self.activation_config.kind != KIMI_CPU_SINK_ACTIVATION_SWIGLU) { return false; }
+        const auto * api = kimi_cpu_sink_vulkan_api(self.sink);
+        void * session = kimi_cpu_sink_vulkan_session(self.sink);
+        if (!api || !session || !api->mul_mat_batch || !api->supports(int32_t(self.vulkan_up_type)) ||
+                !api->supports(int32_t(self.vulkan_down_type))) { return false; }
+        if (self.latent <= 0 || self.hidden <= 0 || self.vulkan_up_bytes == 0 || self.vulkan_down_bytes == 0) { return false; }
+        std::vector<int> ntok(size_t(nexperts));
+        std::vector<size_t> in_at(size_t(nexperts)), hid_at(size_t(nexperts));
+        size_t n_in = 0, n_hid = 0;
+        for (int i = 0; i < nexperts; ++i) {
+            ntok[size_t(i)] = int(self.groups[size_t(i)].columns.size());
+            if (ntok[size_t(i)] < 1 || !up[i] || !gate[i] || !down[i]) { return false; }
+            in_at[size_t(i)] = n_in;
+            hid_at[size_t(i)] = n_hid;
+            n_in += size_t(ntok[size_t(i)]) * size_t(self.latent);
+            n_hid += size_t(ntok[size_t(i)]) * size_t(self.hidden);
+        }
+        std::vector<float> inputs(n_in);
+        std::vector<float> up_out(n_hid), gate_out(n_hid), down_out(n_in);
+        for (int i = 0; i < nexperts; ++i) {
+            float * dst = inputs.data() + in_at[size_t(i)];
+            for (int column = 0; column < ntok[size_t(i)]; ++column) {
+                const int token = self.groups[size_t(i)].columns[size_t(column)].token;
+                const float * src = self.token_input + size_t(token) * size_t(self.latent);
+                std::copy(src, src + self.latent, dst + size_t(column) * size_t(self.latent));
+            }
+        }
+        std::vector<ggml_vk_expert_matmul> items(size_t(nexperts) * 2);
+        for (int i = 0; i < nexperts; ++i) {
+            auto & up_item = items[size_t(i)];
+            auto & gate_item = items[size_t(nexperts + i)];
+            up_item = gate_item = {};
+            up_item.type = gate_item.type = int32_t(self.vulkan_up_type);
+            up_item.k = gate_item.k = self.latent;
+            up_item.n = gate_item.n = self.hidden;
+            up_item.n_tokens = gate_item.n_tokens = ntok[size_t(i)];
+            up_item.weight_bytes = gate_item.weight_bytes = self.vulkan_up_bytes;
+            up_item.input = gate_item.input = inputs.data() + in_at[size_t(i)];
+            up_item.weight = up[i];
+            gate_item.weight = gate[i];
+            up_item.output = up_out.data() + hid_at[size_t(i)];
+            gate_item.output = gate_out.data() + hid_at[size_t(i)];
+        }
+        const auto started = prefill_clock::now();
+        char error[256] = {};
+        if (!api->mul_mat_batch(session, items.data(), nexperts * 2, error, sizeof(error))) {
+            std::fprintf(stderr, "[kimi_vulkan_resident] fallback up/gate %s\n", error[0] ? error : "matmul failed");
+            return false;
+        }
+        for (int i = 0; i < nexperts; ++i) {
+            for (int column = 0; column < ntok[size_t(i)]; ++column) {
+                float * gate_col = gate_out.data() + hid_at[size_t(i)] + size_t(column) * size_t(self.hidden);
+                const float * up_col = up_out.data() + hid_at[size_t(i)] + size_t(column) * size_t(self.hidden);
+                ggml_vec_swiglu_f32(self.hidden, gate_col, gate_col, up_col);
+            }
+        }
+        items.resize(size_t(nexperts));
+        for (int i = 0; i < nexperts; ++i) {
+            auto & item = items[size_t(i)];
+            item = {};
+            item.type = int32_t(self.vulkan_down_type);
+            item.k = self.hidden;
+            item.n = self.latent;
+            item.n_tokens = ntok[size_t(i)];
+            item.weight = down[i];
+            item.weight_bytes = self.vulkan_down_bytes;
+            item.input = gate_out.data() + hid_at[size_t(i)];
+            item.output = down_out.data() + in_at[size_t(i)];
+        }
+        error[0] = '\0';
+        if (!api->mul_mat_batch(session, items.data(), nexperts, error, sizeof(error))) {
+            std::fprintf(stderr, "[kimi_vulkan_resident] fallback down %s\n", error[0] ? error : "matmul failed");
+            return false;
+        }
+        uint64_t routes = 0;
+        uint64_t bytes = 0;
+        for (int i = 0; i < nexperts; ++i) {
+            const auto & columns = self.groups[size_t(i)].columns;
+            for (int column = 0; column < ntok[size_t(i)]; ++column) {
+                float * values = down_out.data() + in_at[size_t(i)] + size_t(column) * size_t(self.latent);
+                if (self.activation_config.post_exp_norm) {
+                    kimi_cpu_sink_normalize_expert(values, self.latent, self.activation_config.post_exp_norm,
+                            self.activation_config.post_exp_norm_eps);
+                }
+                for (int route : columns[size_t(column)].slots) {
+                    float * destination = self.routed_output.data() + size_t(route) * size_t(self.latent);
+                    for (int row = 0; row < self.latent; ++row) {
+                        volatile float scaled = values[row] * self.weights[route];
+                        destination[row] = scaled;
+                    }
+                    ++routes;
+                }
+            }
+            self.consumed[size_t(i)] = 1;
+            bytes += self.vulkan_triplet;
+        }
+        const double us = elapsed_us(started);
+        for (int i = 0; i < nexperts; ++i) {
+            kimi_cpu_sink_vulkan_result(self.sink, 1, self.groups[size_t(i)].expert, self.vulkan_triplet,
+                    i == 0 ? us : 0, i == 0 ? routes : 0);
+        }
+        std::fprintf(stderr, "[kimi_vulkan_resident] experts=%d routes=%llu bytes=%llu us=%.1f\n",
+                nexperts, (unsigned long long) routes, (unsigned long long) bytes, us);
+        return true;
+    }
+
     static void consume(void * userdata, size_t expert, const void * up, const void * gate, const void * down) {
         auto & self = *static_cast<kimi_cpu_prefill *>(userdata);
         self.active_group = &self.groups[expert];
@@ -643,6 +755,11 @@ extern "C" bool kimi_cpu_prefill_run_activation(
         batch.ntokens = ntokens;
         batch.activation = *activation;
         batch.output = output;
+        if (const char * gpu = std::getenv("INFERSSD_PREFILL_GPU")) {
+            if (!(gpu[0] == '0' && gpu[1] == '\0')) { batch.resident_vulkan = kimi_cpu_prefill::resident_vulkan; }
+        } else {
+            batch.resident_vulkan = kimi_cpu_prefill::resident_vulkan;
+        }
         const bool ok = kimi_cpu_sink_stream_hybrid(prefill->sink, up, gate, down,
                 prefill->expert_ids.empty() ? &empty_id : prefill->expert_ids.data(),
                 static_cast<int>(prefill->expert_ids.size()), &batch, kimi_cpu_prefill::consume, prefill,

@@ -3175,9 +3175,10 @@ bool kimi_cpu_sink_stream_hybrid(struct kimi_cpu_sink * sink,
             }
         }
         // Source order is strict: retained VRAM, then a read-only leased
-        // RAM entry, then a direct read. This lookup does not train or admit the
-        // decode cache and an SSD miss never receives a duplicate RAM slot.
+        // RAM entry, then a direct read into a resident slot when one is free.
+        // The slot is published after the consumer, so the next prompt hits it.
         sink->cache.prepare_prefill_read(sink->requests, up, gate, down, sink->current);
+        sink->cache.prepare_prefill_admit(sink->requests, up, gate, down);
         // Streamed transients hold a ring slot and a device slot each (in place, a ring slot alone), whatever their
         // number, so only the optional cap limits them.
         const int streaming_cap = sink->vram.prefill_ssd_gpu_max_experts_per_layer;
@@ -3226,7 +3227,11 @@ bool kimi_cpu_sink_stream_hybrid(struct kimi_cpu_sink * sink,
         auto append_io_request = [&](size_t i) {
             auto & request = sink->requests[i];
             request.io_slot = sink->io_requests.size() % sink->slots.size();
-            if (!request.vram_ssd_transient || request.vram_ssd_streaming) {
+            if (request.cache_admit >= 0) {
+                for (int role = 0; role < 3; ++role) {
+                    request.read_target[role] = sink->cache.data(request.cache_admit, role);
+                }
+            } else if (!request.vram_ssd_transient || request.vram_ssd_streaming) {
                 for (int role = 0; role < 3; ++role) {
                     request.read_target[role] = sink->slots[request.io_slot].role[role].data;
                 }
@@ -3335,7 +3340,68 @@ bool kimi_cpu_sink_stream_hybrid(struct kimi_cpu_sink * sink,
                 batch->f32_input, batch->f32_stride, batch->route_request_index, batch->weights,
                 batch->nslots, batch->ntokens, batch->activation);
         }
-        for (size_t expert = 0; expert < sink->requests.size(); ++expert) {
+        bool resident_done = false;
+        if (batch->resident_vulkan && !sink->requests.empty()) {
+            bool any_hit = false, any_miss = false;
+            for (const auto & request : sink->requests) {
+                if (request.vram_slot >= 0 || request.vram_transient) { continue; }
+                if (request.cache_hit >= 0) { any_hit = true; }
+                else { any_miss = true; }
+            }
+            // A cold layer stays on the streaming consumer so compute overlaps the
+            // read. A layer with any retained expert waits out the misses, then
+            // one Vulkan batch covers the hits and the misses together.
+            if (any_hit) {
+                if (any_miss) {
+                    for (size_t expert = 0; expert < sink->requests.size(); ++expert) {
+                        auto & request = sink->requests[expert];
+                        if (request.cache_hit >= 0 || request.vram_slot >= 0 || request.vram_transient) { continue; }
+                        sink_slot & slot = sink->slots[request.io_slot];
+                        const auto wait_start = sink_clock::now();
+                        std::unique_lock<std::mutex> lock(sink->io_mutex);
+                        sink->io_cv.wait(lock, [&] {
+                            return (slot.state == sink_slot::ready && slot.request == expert) || !sink->io_error.empty();
+                        });
+                        sink->current.wait_io_us += elapsed_us(wait_start);
+                        if (!sink->io_error.empty()) { break; }
+                    }
+                }
+                if (sink->io_error.empty()) {
+                    std::vector<const void *> ups(sink->requests.size());
+                    std::vector<const void *> gates(sink->requests.size());
+                    std::vector<const void *> downs(sink->requests.size());
+                    for (size_t i = 0; i < sink->requests.size(); ++i) {
+                        const auto & request = sink->requests[i];
+                        const int slot = request.cache_hit >= 0 ? request.cache_hit : request.cache_admit;
+                        const void * base[3];
+                        for (int role = 0; role < 3; ++role) {
+                            base[role] = slot >= 0 ? sink->cache.data(slot, role) : request.read_target[role];
+                            base[role] = static_cast<const char *>(base[role]) + request.role[role].data_offset;
+                        }
+                        ups[i] = base[0];
+                        gates[i] = base[1];
+                        downs[i] = base[2];
+                    }
+                    const auto resident_start = sink_clock::now();
+                    resident_done = batch->resident_vulkan(userdata, ups.data(), gates.data(), downs.data(),
+                            int(sink->requests.size()));
+                    if (resident_done) {
+                        sink->current.compute_us += elapsed_us(resident_start);
+                        for (size_t i = 0; i < sink->requests.size(); ++i) {
+                            auto & request = sink->requests[i];
+                            if (request.cache_admit >= 0) { sink->cache.admit(request, sink->current); }
+                            if (request.cache_hit < 0 && request.vram_slot < 0 && !request.vram_transient) {
+                                sink_slot & slot = sink->slots[request.io_slot];
+                                std::lock_guard<std::mutex> lock(sink->io_mutex);
+                                if (slot.request == i && slot.state == sink_slot::ready) { slot.state = sink_slot::empty; }
+                            }
+                        }
+                        sink->io_cv.notify_all();
+                    }
+                }
+            }
+        }
+        for (size_t expert = 0; expert < sink->requests.size() && !resident_done; ++expert) {
             auto & request = sink->requests[expert];
             if (request.vram_slot >= 0 || request.vram_transient) { continue; }
             sink_slot * slot = nullptr;
@@ -3371,6 +3437,7 @@ bool kimi_cpu_sink_stream_hybrid(struct kimi_cpu_sink * sink,
                 sink->cache.release_lease(request.cache_hit);
                 request.cache_lease = false;
             }
+            if (request.cache_admit >= 0) { sink->cache.admit(request, sink->current); }
             const double compute_us = elapsed_us(compute_start);
             sink->current.compute_us += compute_us;
             // the grouped path's line, from the passes of the batched engine (a one-token pass is priced as decode)

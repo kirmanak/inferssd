@@ -7,6 +7,7 @@
 #include <cstdio>
 #include <cstring>
 #include <new>
+#include <vector>
 
 namespace {
 
@@ -42,6 +43,8 @@ struct expert_session {
     ggml_backend_t backend = nullptr;
     ggml_backend_buffer_t buffer = nullptr;
     uint64_t staging = 0;
+    ggml_backend_buffer_t batch_buffer = nullptr;
+    uint64_t batch_staging = 0;
     ggml_context * ctx = nullptr;
     ggml_tensor * weight = nullptr;
     ggml_tensor * input = nullptr;
@@ -67,6 +70,7 @@ struct expert_session {
     ~expert_session() {
         drop_graph();
         if (buffer) { ggml_backend_buffer_free(buffer); }
+        if (batch_buffer) { ggml_backend_buffer_free(batch_buffer); }
     }
 };
 
@@ -199,6 +203,152 @@ bool expert_mul_mat(void * raw, int32_t type, int64_t k, int64_t n, int n_tokens
     return true;
 }
 
+constexpr uint64_t k_batch_cap = 1536ull << 20;
+constexpr int k_batch_experts = 96;
+
+bool expert_batch_chunk(expert_session * session, const ggml_vk_expert_matmul * items, int begin, int count,
+        char * error, size_t error_size) {
+    if (count <= 0) { return true; }
+    const int graph_nodes = count * 8 + 64;
+    const size_t mem = ggml_tensor_overhead() * size_t(count) * 4 + ggml_graph_overhead_custom(graph_nodes, false) + 65536;
+    ggml_context * ctx = ggml_init({ mem, nullptr, true });
+    if (!ctx) {
+        set_error(error, error_size, "vulkan expert batch context failed");
+        return false;
+    }
+    struct item_tensors {
+        ggml_tensor * weight = nullptr;
+        ggml_tensor * input = nullptr;
+        ggml_tensor * output = nullptr;
+    };
+    std::vector<item_tensors> built(size_t(count));
+    ggml_backend_buffer_type_t buft = ggml_backend_get_default_buffer_type(session->backend);
+    const size_t alignment = std::max<size_t>(ggml_backend_buft_get_alignment(buft), 128);
+    size_t cursor = 0;
+    std::vector<size_t> offsets(size_t(count) * 3, 0);
+    for (int i = 0; i < count; ++i) {
+        const auto & item = items[begin + i];
+        if (!expert_supports(item.type) || item.k <= 0 || item.n <= 0 || item.n_tokens <= 0 ||
+                !item.weight || !item.input || !item.output) {
+            ggml_free(ctx);
+            set_error(error, error_size, "vulkan expert batch item is incomplete");
+            return false;
+        }
+        const int block = ggml_blck_size(ggml_type(item.type));
+        if (block <= 0 || item.k % block != 0) {
+            ggml_free(ctx);
+            set_error(error, error_size, "vulkan expert batch K is not a whole number of quant blocks");
+            return false;
+        }
+        built[size_t(i)].weight = ggml_new_tensor_2d(ctx, ggml_type(item.type), item.k, item.n);
+        built[size_t(i)].input = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, item.k, item.n_tokens);
+        built[size_t(i)].output = built[size_t(i)].weight && built[size_t(i)].input ?
+            ggml_mul_mat(ctx, built[size_t(i)].weight, built[size_t(i)].input) : nullptr;
+        if (!built[size_t(i)].output) {
+            ggml_free(ctx);
+            set_error(error, error_size, "vulkan expert batch graph build failed");
+            return false;
+        }
+        if (ggml_nbytes(built[size_t(i)].weight) != item.weight_bytes) {
+            ggml_free(ctx);
+            set_error(error, error_size, "vulkan expert batch weight byte count mismatch");
+            return false;
+        }
+        ggml_tensor * tensors[3] = { built[size_t(i)].weight, built[size_t(i)].input, built[size_t(i)].output };
+        for (int t = 0; t < 3; ++t) {
+            cursor = align_up(cursor, alignment);
+            offsets[size_t(i) * 3 + t] = cursor;
+            cursor += ggml_backend_buft_get_alloc_size(buft, tensors[t]);
+        }
+    }
+    if (cursor == 0 || cursor > k_batch_cap) {
+        ggml_free(ctx);
+        set_error(error, error_size, "vulkan expert batch exceeds the staging cap");
+        return false;
+    }
+    if (!session->batch_buffer || session->batch_staging < cursor) {
+        if (session->batch_buffer) {
+            ggml_backend_buffer_free(session->batch_buffer);
+            session->batch_buffer = nullptr;
+            session->batch_staging = 0;
+        }
+        session->batch_buffer = ggml_backend_buft_alloc_buffer(buft, cursor);
+        if (!session->batch_buffer) {
+            ggml_free(ctx);
+            set_error(error, error_size, "vulkan expert batch staging allocation failed");
+            return false;
+        }
+        session->batch_staging = ggml_backend_buffer_get_size(session->batch_buffer);
+    }
+    void * base = ggml_backend_buffer_get_base(session->batch_buffer);
+    for (int i = 0; i < count; ++i) {
+        ggml_tensor * tensors[3] = { built[size_t(i)].weight, built[size_t(i)].input, built[size_t(i)].output };
+        for (int t = 0; t < 3; ++t) {
+            if (ggml_backend_tensor_alloc(session->batch_buffer, tensors[t],
+                    static_cast<char *>(base) + offsets[size_t(i) * 3 + t]) != GGML_STATUS_SUCCESS) {
+                ggml_free(ctx);
+                set_error(error, error_size, "vulkan expert batch tensor placement failed");
+                return false;
+            }
+        }
+    }
+    ggml_cgraph * graph = ggml_new_graph_custom(ctx, graph_nodes, false);
+    if (!graph) {
+        ggml_free(ctx);
+        set_error(error, error_size, "vulkan expert batch graph allocation failed");
+        return false;
+    }
+    for (int i = 0; i < count; ++i) { ggml_build_forward_expand(graph, built[size_t(i)].output); }
+    for (int i = 0; i < count; ++i) {
+        const auto & item = items[begin + i];
+        ggml_backend_tensor_set(built[size_t(i)].weight, item.weight, 0, item.weight_bytes);
+        ggml_backend_tensor_set(built[size_t(i)].input, item.input, 0, size_t(item.k) * size_t(item.n_tokens) * sizeof(float));
+    }
+    const enum ggml_status status = ggml_backend_graph_compute(session->backend, graph);
+    if (status != GGML_STATUS_SUCCESS) {
+        ggml_free(ctx);
+        set_error(error, error_size, "vulkan expert batch graph compute failed");
+        return false;
+    }
+    ggml_backend_synchronize(session->backend);
+    for (int i = 0; i < count; ++i) {
+        const auto & item = items[begin + i];
+        ggml_backend_tensor_get(built[size_t(i)].output, item.output, 0, size_t(item.n) * size_t(item.n_tokens) * sizeof(float));
+    }
+    ggml_free(ctx);
+    return true;
+}
+
+bool expert_mul_mat_batch(void * raw, const ggml_vk_expert_matmul * items, int count,
+        char * error, size_t error_size) {
+    auto * session = static_cast<expert_session *>(raw);
+    if (!session || (count > 0 && !items)) {
+        set_error(error, error_size, "vulkan expert batch is missing buffers");
+        return false;
+    }
+    if (count < 0) {
+        set_error(error, error_size, "vulkan expert batch count is negative");
+        return false;
+    }
+    int begin = 0;
+    while (begin < count) {
+        uint64_t bytes = 0;
+        int n = 0;
+        while (begin + n < count && n < k_batch_experts) {
+            const auto & item = items[begin + n];
+            const uint64_t next = uint64_t(item.weight_bytes) +
+                uint64_t(item.k) * uint64_t(item.n_tokens) * sizeof(float) +
+                uint64_t(item.n) * uint64_t(item.n_tokens) * sizeof(float);
+            if (n && bytes + next > k_batch_cap) { break; }
+            bytes += next;
+            ++n;
+        }
+        if (!expert_batch_chunk(session, items, begin, n, error, error_size)) { return false; }
+        begin += n;
+    }
+    return true;
+}
+
 }  // namespace
 
 extern "C" const ggml_vk_expert_api_v1 * ggml_backend_vk_expert_api_v1(void) {
@@ -210,6 +360,7 @@ extern "C" const ggml_vk_expert_api_v1 * ggml_backend_vk_expert_api_v1(void) {
         reinterpret_cast<void (*)(void *)>(expert_session_destroy),
         reinterpret_cast<uint64_t (*)(void *)>(expert_staging_bytes),
         reinterpret_cast<bool (*)(void *, int32_t, int64_t, int64_t, int, const void *, size_t, const float *, float *, char *, size_t)>(expert_mul_mat),
+        reinterpret_cast<bool (*)(void *, const ggml_vk_expert_matmul *, int, char *, size_t)>(expert_mul_mat_batch),
     };
     return &api;
 }

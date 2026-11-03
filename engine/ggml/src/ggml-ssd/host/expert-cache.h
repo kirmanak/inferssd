@@ -1147,6 +1147,59 @@ struct expert_cache {
             }
         }
     }
+    // Prefill misses land in resident slots the load step already committed.
+    // The next prompt's prepare_prefill_read sees them as hits. No decode
+    // frequency update and no eviction: a full layer keeps the experts that
+    // fit and leaves the rest on the ring.
+    size_t prepare_prefill_admit(std::vector<expert_request> & requests,
+            const ggml_tensor * up, const ggml_tensor * gate, const ggml_tensor * down) {
+        if (!prefill_read || !arena || !stride || paused || requests.empty() || layers.empty()) { return 0; }
+        int layer_id = -1, consumed = 0;
+        if (std::sscanf(up->name, "blk.%d.ffn_up_exps.weight%n", &layer_id, &consumed) != 1 ||
+                !consumed || up->name[consumed]) { return 0; }
+        char name[GGML_MAX_NAME];
+        std::snprintf(name, sizeof(name), "blk.%d.ffn_gate_exps.weight", layer_id);
+        if (std::strcmp(name, gate->name)) { return 0; }
+        std::snprintf(name, sizeof(name), "blk.%d.ffn_down_exps.weight", layer_id);
+        if (std::strcmp(name, down->name)) { return 0; }
+        const auto found = std::find_if(layers.begin(), layers.end(),
+            [&](const layer & l) { return l.id == layer_id; });
+        if (found == layers.end() || !found->count) { return 0; }
+        const size_t layer_index = size_t(found - layers.begin());
+        size_t admitted = 0;
+        for (auto & request : requests) {
+            if (request.cache_hit >= 0 || request.cache_admit >= 0 || request.vram_slot >= 0) { continue; }
+            bool fits = true;
+            for (int role = 0; role < 3; ++role) {
+                if (request.role[role].nbytes > role_bytes[role]) { fits = false; }
+            }
+            if (!fits) { continue; }
+            auto free = entries.begin() + found->begin + found->count;
+            for (auto candidate = entries.begin() + found->begin; candidate != entries.begin() + found->begin + found->count; ++candidate) {
+                if (candidate->enabled && candidate->resident && !candidate->valid && !candidate->reserved &&
+                        !candidate->inflight && candidate->layer_index == layer_index) {
+                    free = candidate;
+                    break;
+                }
+            }
+            if (free == entries.begin() + found->begin + found->count) {
+                ++stats.admission_skips;
+                continue;
+            }
+            free->id = request.id;
+            free->layer_index = layer_index;
+            free->reserved = true;
+            free->last_touch = ++clock;
+            for (int role = 0; role < 3; ++role) { free->source[role] = key(request.role[role]); }
+            request.cache_admit = int(free - entries.begin());
+            ++admitted;
+        }
+        if (admitted) {
+            std::fprintf(stderr, "[kimi_cpu_sink_cache] prefill_admit layer=%d admitted=%zu skips=%llu\n",
+                    layer_id, admitted, (unsigned long long) stats.admission_skips);
+        }
+        return admitted;
+    }
     void release_prefill_leases(std::vector<expert_request> & requests) {
         for (auto & request : requests) {
             if (!request.cache_lease) { continue; }

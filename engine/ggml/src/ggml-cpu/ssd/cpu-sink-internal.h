@@ -22,9 +22,10 @@ inline void kimi_cpu_sink_normalize_expert(float * values, int rows, const float
 // and parallel_last only from the caller of a stream that returned, as the
 // open call's last phase; callbacks must not recursively enter either executor
 // or allocate/throw.
-// Streaming is a prefill operation: it disables decode cache (normally releases
-// it; optional cross-request retention checks the same memory guard) and
-// always uses ring targets. Cache admission requires a subsequent decode begin.
+// Streaming is a prefill operation: it disables decode training. A retained
+// arena may still be read, and a miss may be admitted into a resident slot so
+// the next prompt hits. resident_vulkan, when set, replaces the per-expert
+// consumer for a layer whose experts are all cache hits.
 using kimi_cpu_sink_parallel_fn = void (*)(void * userdata, int ith, int nth);
 using kimi_cpu_sink_consumer_fn = void (*)(void * userdata, size_t expert,
         const void * up, const void * gate, const void * down);
@@ -65,6 +66,10 @@ struct kimi_cpu_sink_prefill_batch {
     uint64_t ssd_experts;
     uint64_t ssd_routes;
     uint64_t ssd_bytes;
+    // Payload pointers, data_offset already applied, request order. Return false
+    // before writing outputs to fall back to the per-expert consumer.
+    bool (*resident_vulkan)(void * userdata, const void * const * up, const void * const * gate,
+            const void * const * down, int nexperts);
 };
 
 void kimi_cpu_sink_parallel(struct kimi_cpu_sink * sink,

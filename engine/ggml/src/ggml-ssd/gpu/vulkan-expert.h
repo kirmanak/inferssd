@@ -25,6 +25,22 @@ struct ggml_vk_expert_api_v1 {
     bool (*mul_mat)(void * session, int32_t type, int64_t k, int64_t n, int n_tokens,
             const void * weight, size_t weight_bytes, const float * input, float * output,
             char * error, size_t error_size);
+    // Many independent matmuls, one graph submission. Same layout as mul_mat.
+    // Null on an older build; a false return leaves outputs untouched.
+    bool (*mul_mat_batch)(void * session, const struct ggml_vk_expert_matmul * items, int count,
+            char * error, size_t error_size);
+};
+
+// One expert in a mul_mat_batch. output is caller storage, written only on success.
+struct ggml_vk_expert_matmul {
+    int32_t type;
+    int64_t k;
+    int64_t n;
+    int n_tokens;
+    const void * weight;
+    size_t weight_bytes;
+    const float * input;
+    float * output;
 };
 
 typedef const struct ggml_vk_expert_api_v1 * (*ggml_vk_expert_api_getter)(void);
