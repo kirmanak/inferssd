@@ -103,6 +103,7 @@ struct kimi_cpu_prefill {
     std::vector<uint8_t> consumed; // groups the CPU computed; the GPU tier added the others into output
     // activation_up: SWIGLU's u beside g in activation until the chunk is gated
     std::vector<float> activation, activation_up, routed_output, post_exp_output;
+    std::vector<float> batch_inputs, batch_up, batch_gate, batch_down;
     std::vector<uint8_t> quant_input, quant_hidden;
     ggml_vec_dot_t dot_up = nullptr, dot_down = nullptr;
     ggml_from_float_t quantize_input = nullptr, quantize_hidden = nullptr;
@@ -504,11 +505,17 @@ struct kimi_cpu_prefill {
             n_in += size_t(ntok[slot]) * size_t(self.latent);
             n_hid += size_t(ntok[slot]) * size_t(self.hidden);
         }
-        std::vector<float> inputs(n_in);
-        std::vector<float> up_out(n_hid), gate_out(n_hid), down_out(n_in);
+        if (self.batch_inputs.size() < n_in) { self.batch_inputs.resize(n_in); }
+        if (self.batch_up.size() < n_hid) { self.batch_up.resize(n_hid); }
+        if (self.batch_gate.size() < n_hid) { self.batch_gate.resize(n_hid); }
+        if (self.batch_down.size() < n_in) { self.batch_down.resize(n_in); }
+        float * inputs = self.batch_inputs.data();
+        float * up_out = self.batch_up.data();
+        float * gate_out = self.batch_gate.data();
+        float * down_out = self.batch_down.data();
         for (size_t slot = 0; slot < which.size(); ++slot) {
             const int i = which[slot];
-            float * dst = inputs.data() + in_at[slot];
+            float * dst = inputs + in_at[slot];
             for (int column = 0; column < ntok[slot]; ++column) {
                 const int token = self.groups[size_t(i)].columns[size_t(column)].token;
                 const float * src = self.token_input + size_t(token) * size_t(self.latent);
@@ -526,11 +533,11 @@ struct kimi_cpu_prefill {
             up_item.n = gate_item.n = self.hidden;
             up_item.n_tokens = gate_item.n_tokens = ntok[slot];
             up_item.weight_bytes = gate_item.weight_bytes = self.vulkan_up_bytes;
-            up_item.input = gate_item.input = inputs.data() + in_at[slot];
+            up_item.input = gate_item.input = inputs + in_at[slot];
             up_item.weight = up[i];
             gate_item.weight = gate[i];
-            up_item.output = up_out.data() + hid_at[slot];
-            gate_item.output = gate_out.data() + hid_at[slot];
+            up_item.output = up_out + hid_at[slot];
+            gate_item.output = gate_out + hid_at[slot];
         }
         const auto started = prefill_clock::now();
         char error[256] = {};
@@ -540,8 +547,8 @@ struct kimi_cpu_prefill {
         }
         for (size_t slot = 0; slot < which.size(); ++slot) {
             for (int column = 0; column < ntok[slot]; ++column) {
-                float * gate_col = gate_out.data() + hid_at[slot] + size_t(column) * size_t(self.hidden);
-                const float * up_col = up_out.data() + hid_at[slot] + size_t(column) * size_t(self.hidden);
+                float * gate_col = gate_out + hid_at[slot] + size_t(column) * size_t(self.hidden);
+                const float * up_col = up_out + hid_at[slot] + size_t(column) * size_t(self.hidden);
                 ggml_vec_swiglu_f32(self.hidden, gate_col, gate_col, up_col);
             }
         }
@@ -556,8 +563,8 @@ struct kimi_cpu_prefill {
             item.n_tokens = ntok[slot];
             item.weight = down[i];
             item.weight_bytes = self.vulkan_down_bytes;
-            item.input = gate_out.data() + hid_at[slot];
-            item.output = down_out.data() + in_at[slot];
+            item.input = gate_out + hid_at[slot];
+            item.output = down_out + in_at[slot];
         }
         error[0] = '\0';
         if (!api->mul_mat_batch(session, items.data(), int(which.size()), error, sizeof(error))) {
@@ -570,7 +577,7 @@ struct kimi_cpu_prefill {
             const int i = which[slot];
             const auto & columns = self.groups[size_t(i)].columns;
             for (int column = 0; column < ntok[slot]; ++column) {
-                float * values = down_out.data() + in_at[slot] + size_t(column) * size_t(self.latent);
+                float * values = down_out + in_at[slot] + size_t(column) * size_t(self.latent);
                 if (self.activation_config.post_exp_norm) {
                     kimi_cpu_sink_normalize_expert(values, self.latent, self.activation_config.post_exp_norm,
                             self.activation_config.post_exp_norm_eps);

@@ -273,4 +273,36 @@ batch set 0.42 s, compute 0.85 s
 
 `llama-completion -n 128` on that binary: 10.79 tok/s. Above 10.68.
 5803 ms is not 5000. The remaining batch set is mostly the first layer,
-which has no earlier window, plus the activation upload. Not 100 tok/s.
+which has no earlier window, plus the activation upload.
+
+## The other 1.7 s was a fresh allocation every layer
+
+Scheduler split of the warm 5753 ms prompt, before the workspace change:
+
+| | time |
+| --- | --- |
+| Vulkan graph compute, 49 splits | 15 ms |
+| CPU graph compute, 49 splits | 5.04 s |
+| `ffn_moe_cpu_sink_in` sync before the copy | 0.48 s |
+| that copy itself, 239 MB | 10 ms |
+| input quantize, 47 layers | 52 ms |
+
+The 0.48 s is waiting for the GPU, not the memcpy. Vulkan recording is
+not the gap. The CPU split was allocating and zeroing the expert
+workspace on every layer (inputs, up, gate, down). Those buffers now
+live on the prefill object and grow once.
+
+Clean warm prompt after that:
+
+```text
+pass 2 wall=4.200s prompt_ms=4192.49 prompt_per_second=119.26
+```
+
+`llama-completion -n 1024` on that binary:
+
+```text
+eval time = 93193.46 ms / 1023 runs (91.10 ms per token, 10.98 tok/s)
+```
+
+Above 10.68. Under 5000 ms. The matched upload is still skipped
+(`used` 34059 on the instrumented run). No fallback.
