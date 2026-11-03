@@ -112,3 +112,13 @@ current upload still waits inside the expert callback, after attention
 has finished, so the DMA never gets that window. A CPU memcpy of the
 layer into a staging buffer before the DMA would put ~15 ms back on the
 critical path. The copy has to read the cache arena.
+
+Tried that copy. At the end of layer N, import the next layer's cached
+slots and DMA them on the graphics queue into a device buffer. The next
+layer's matmul skipped the upload (`set_us` fell to 48). The GEMM then
+took 150–400 ms for ~70 experts instead of ~15 ms, and later chunks went
+past a second. A concurrently shared buffer, so the copy and the shader
+did not need a queue-family acquire, did not change that. The 500-token
+request did not finish in 7 minutes. The copy is not in the tree. A
+shader that reads a buffer just filled by the graphics queue is not a
+usable expert path on this RADV.
