@@ -384,6 +384,10 @@ private:
     uint32_t sched_reserve_n_outputs = 0; // prompt outputs covered by the current scheduler
     uint32_t reserve_horizon_min = 0; // smallest horizon: the configured ubatch
     bool cpu_sink_decode_active = false;
+    // Tokens in the largest successful multi-token batch. llama-completion never
+    // calls llama_ssd_prefill_phase; the next one-token batch is generation and
+    // must enter the decode cache phase on its own.
+    uint32_t cpu_sink_prompt_tokens = 0;
     bool cpu_sink_multi_token_reported = false;
     bool cpu_sink_cache_batch_decode = false;
     std::unique_ptr<llama_kimi_cpu_sink_runtime> cpu_sink_runtime;
@@ -487,6 +491,9 @@ private:
 
     mutable int64_t t_compute_start_us = 0;
     mutable int64_t n_queued_tokens    = 0;
+    // Set once process_ubatch has submitted the graph. Phase changes synchronize
+    // before that submit; they must not close this batch's timer.
+    mutable bool    perf_submitted     = false;
 
     mutable int32_t n_p_eval = 0; // number of tokens in eval calls for the prompt (with batch size > 1)
     mutable int32_t n_eval   = 0; // number of eval calls

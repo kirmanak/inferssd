@@ -695,6 +695,11 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
         target_link_libraries(test-kv-cache-iswa-state-at PRIVATE llama ggml-cpu)
         target_compile_features(test-kv-cache-iswa-state-at PRIVATE cxx_std_17)
         add_test(NAME kv_cache_iswa_state_at COMMAND test-kv-cache-iswa-state-at)
+        # Needs a tiny deferred-expert GGUF and its alias TSV. Not an asset-free CTest entry.
+        add_executable(test-completion-cache-phase ssd/test-completion-cache-phase.cpp)
+        target_include_directories(test-completion-cache-phase PRIVATE ../src ../ggml/src)
+        target_link_libraries(test-completion-cache-phase PRIVATE llama ggml-cpu)
+        target_compile_features(test-completion-cache-phase PRIVATE cxx_std_17)
     endif()
     llama_build_and_test(ssd/test-kimi-deepseek2-guards.cpp)
     target_include_directories(test-kimi-deepseek2-guards PRIVATE

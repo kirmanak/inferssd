@@ -905,6 +905,14 @@ void llama_context::synchronize() {
         if (!published) { LLAMA_LOG_ERROR("%s: context telemetry failed: %s\n", __func__, published.error.c_str()); }
     }
 
+    // A VRAM/cache phase change synchronizes before the graph is submitted.
+    // Accounting here would record an empty window and drop the real compute
+    // into "unaccounted time".
+    if (!perf_submitted) {
+        return;
+    }
+    perf_submitted = false;
+
     // FIXME: if multiple single tokens are evaluated without a synchronization,
     // the stats will be added to the prompt evaluation stats
     // this should only happen when using batch size 1 to evaluate a batch
@@ -1831,6 +1839,9 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             cache_decode, cache_decode ? ubatch.seq_id[0][0] : 0);
     }
     const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1, mctx);
+    if (status == GGML_STATUS_SUCCESS) {
+        perf_submitted = true;
+    }
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);
         ret = status;
@@ -2201,6 +2212,20 @@ int llama_context::decode(const llama_batch & batch_inp) {
                     return -1;
                 }
             }
+        }
+    }
+
+    // llama-completion does not call llama_ssd_prefill_phase. A one-token batch
+    // after a multi-token prompt is generation: enter the decode phase so the
+    // existing host cache can admit. The phase call resets the scheduler, and
+    // it synchronizes, so it runs before this batch is allocated and before
+    // this batch's timer starts. perf_submitted stays false until graph_compute.
+    if (cpu_sink_enabled && !cparams.warmup && !cpu_sink_decode_active &&
+            batch_inp.n_tokens == 1 && cpu_sink_prompt_tokens > 1) {
+        LLAMA_LOG_INFO("[kimi_completion_decode] prompt_tokens=%u\n", cpu_sink_prompt_tokens);
+        if (!moe_prefill_phase_workspace(false, 0, 0)) {
+            LLAMA_LOG_ERROR("%s: failed to enter the CPU sink decode phase\n", __func__);
+            return -1;
         }
     }
 
@@ -2619,6 +2644,10 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
     if (batch_inp.n_tokens > 1) {
         model.drop_expert_mmap_pages_after_prompt();
+    }
+    if (cpu_sink_enabled && !cparams.warmup && n_tokens_all > 1 &&
+            n_tokens_all > cpu_sink_prompt_tokens) {
+        cpu_sink_prompt_tokens = n_tokens_all;
     }
 
     return 0;
@@ -3780,6 +3809,7 @@ void llama_context::perf_reset() {
     t_eval_us   = n_eval = 0;
     t_p_eval_us = n_p_eval = 0;
     n_reused    = 0;
+    perf_submitted = false;
 }
 
 llama_memory_breakdown llama_context::memory_breakdown() const {
