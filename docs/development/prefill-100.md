@@ -202,5 +202,30 @@ is not in the tree. Reverted, rebuilt, same 500-token prompt:
 | warm | 6573 ms | 76.07 |
 
 That is the clean number. `/completion` with `n_predict` 32 stopped at
-`eos` (`predicted_n` 1, empty content), so decode is timed with
-`llama-completion -n 128`, not the HTTP server.
+`eos` (`predicted_n` 1, empty content). `llama-completion -n 128` on
+the reverted binary, same prompt and flags as `docs/qwen38-vulkan.md`:
+
+```text
+prompt eval time = 8923.50 ms / 507 tokens (56.82 tok/s)
+eval time = 12176.46 ms / 127 runs (95.88 ms per token, 10.43 tok/s)
+```
+
+The published decode figure is 10.68 tok/s over 1023 runs. This sample
+is 127 runs and still cold on many experts. It is not a broken decode
+path. The HTTP server is the wrong tool: it sampled `eos` immediately.
+
+Per-tensor staging copies, submitted once and acquired once, do not
+replace the set. 512 Q4_K experts, 472 MB, each region memcpy'd into
+its own slice of a cached staging buffer (`flags=0xe`), one submit, one
+acquire, then the existing matmul:
+
+| | time |
+| --- | --- |
+| per-tensor set | 15.0 ms |
+| slice memcpy | 54 ms |
+| acquire | 0.2 ms |
+| GEMM after acquire | 6.5 ms, then 6.1 ms, sample error 0 |
+
+The GEMM is fine. The copy is not. A 472 MB staging buffer write-allocates;
+the 15 ms set uses a small staging buffer that stays in cache. Submitting
+the slow copy without waiting does not make it the fast one. Not wired in.
