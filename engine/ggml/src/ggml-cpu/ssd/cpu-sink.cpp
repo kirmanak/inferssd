@@ -578,6 +578,7 @@ struct kimi_cpu_sink {
     const ggml_vk_expert_api_v1 * vulkan_api = nullptr;
     void * vulkan_backend = nullptr;
     void * vulkan_session = nullptr;
+    const ggml_tensor * device_input = nullptr;
     bool vulkan_session_failed = false;
     uint64_t vulkan_budget = 0;
     struct {
@@ -3033,6 +3034,14 @@ void kimi_cpu_sink_vulkan_result(struct kimi_cpu_sink * sink, int gpu, int32_t e
 
 const struct ggml_vk_expert_api_v1 * kimi_cpu_sink_vulkan_api(const struct kimi_cpu_sink * sink) {
     return sink ? sink->vulkan_api : nullptr;
+}
+
+void kimi_cpu_sink_set_device_input(struct kimi_cpu_sink * sink, const struct ggml_tensor * input) {
+    if (sink) { sink->device_input = input; }
+}
+
+const struct ggml_tensor * kimi_cpu_sink_device_input(const struct kimi_cpu_sink * sink) {
+    return sink ? sink->device_input : nullptr;
 }
 
 void * kimi_cpu_sink_vulkan_session(struct kimi_cpu_sink * sink) {

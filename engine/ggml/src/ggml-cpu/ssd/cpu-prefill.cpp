@@ -108,6 +108,8 @@ struct kimi_cpu_prefill {
     std::vector<int32_t> group_of_expert; // expert ID -> group, -1 while untouched
     std::vector<int32_t> route_request_index;
     std::vector<uint8_t> consumed; // groups the CPU computed; the GPU tier added the others into output
+    std::vector<uint8_t> device_experts; // hits already reduced into output by the device path
+    bool device_reduced = false;
     // activation_up: SWIGLU's u beside g in activation until the chunk is gated
     std::vector<float> activation, activation_up, routed_output, post_exp_output;
     std::vector<float> batch_inputs, batch_up, batch_gate, batch_down;
@@ -246,6 +248,8 @@ struct kimi_cpu_prefill {
         quant_input.resize(static_cast<size_t>(ntokens) * quant_bytes_input);
         routed_output.resize(static_cast<size_t>(ntokens) * nslots * latent);
         consumed.assign(groups.size(), 0);
+        device_experts.assign(groups.size(), 0);
+        device_reduced = false;
         size_t workspace = (activation.capacity() + activation_up.capacity()) * sizeof(float) +
                 quant_hidden.capacity() + quant_input.capacity() + routed_output.capacity() * sizeof(float) +
                 post_exp_output.capacity() * sizeof(float) +
@@ -512,6 +516,46 @@ struct kimi_cpu_prefill {
             n_in += size_t(ntok[slot]) * size_t(self.latent);
             n_hid += size_t(ntok[slot]) * size_t(self.hidden);
         }
+        const ggml_tensor * device_in = kimi_cpu_sink_device_input(self.sink);
+        if (device_in && api->device_layer && self.ntokens > 32 &&
+                self.activation_config.kind == KIMI_CPU_SINK_ACTIVATION_SWIGLU && !self.activation_config.post_exp_norm) {
+            std::vector<std::vector<int32_t>> token_store(which.size());
+            std::vector<ggml_vk_device_expert> dev_experts(which.size());
+            std::vector<ggml_vk_device_route> dev_routes;
+            for (size_t slot = 0; slot < which.size(); ++slot) {
+                const int i = which[slot];
+                const auto & columns = self.groups[size_t(i)].columns;
+                auto & tokens = token_store[slot];
+                tokens.reserve(columns.size());
+                for (int column = 0; column < ntok[slot]; ++column) {
+                    tokens.push_back(columns[size_t(column)].token);
+                    for (int route : columns[size_t(column)].slots) {
+                        dev_routes.push_back({ int(slot), column, columns[size_t(column)].token,
+                                self.nslots ? route % self.nslots : 0, self.weights[route] });
+                    }
+                }
+                dev_experts[slot] = { up[i], gate[i], down[i], tokens.data(), ntok[slot] };
+            }
+            char device_error[256] = {};
+            if (api->device_layer(session, device_in, int32_t(self.vulkan_up_type), int32_t(self.vulkan_down_type),
+                        self.latent, self.hidden, self.vulkan_up_bytes, self.vulkan_down_bytes,
+                        dev_experts.data(), int(dev_experts.size()), dev_routes.data(), int(dev_routes.size()),
+                        self.nslots, self.ntokens, self.output, device_error, sizeof(device_error))) {
+                for (size_t slot = 0; slot < which.size(); ++slot) {
+                    self.device_experts[size_t(which[slot])] = 1;
+                    kimi_cpu_sink_vulkan_result(self.sink, 1, self.groups[size_t(which[slot])].expert, self.vulkan_triplet,
+                            slot == 0 ? 1 : 0, slot == 0 ? uint64_t(dev_routes.size()) : 0);
+                }
+                self.device_reduced = true;
+                std::fprintf(stderr, "[kimi_vulkan_resident] device experts=%zu routes=%zu\n",
+                        which.size(), dev_routes.size());
+                return true;
+            }
+            if (!self.vulkan_error_logged) {
+                std::fprintf(stderr, "[kimi_vk_device] fallback %s\n", device_error[0] ? device_error : "failed");
+                self.vulkan_error_logged = true;
+            }
+        }
         if (self.batch_inputs.size() < n_in) { self.batch_inputs.resize(n_in); }
         if (self.batch_up.size() < n_hid) { self.batch_up.resize(n_hid); }
         if (self.batch_gate.size() < n_hid) { self.batch_gate.resize(n_hid); }
@@ -618,6 +662,7 @@ struct kimi_cpu_prefill {
 
     static void consume(void * userdata, size_t expert, const void * up, const void * gate, const void * down) {
         auto & self = *static_cast<kimi_cpu_prefill *>(userdata);
+        if (expert < self.device_experts.size() && self.device_experts[expert]) { return; }
         if (expert < self.consumed.size() && self.consumed[expert]) { return; }
         self.active_group = &self.groups[expert];
         self.up_data = static_cast<const char *>(up);
@@ -675,6 +720,16 @@ struct kimi_cpu_prefill {
             if (token >= ntokens) { break; }
             float * destination = self.output + static_cast<size_t>(token) * latent;
             const int first = token * nslots, last = first + nslots;
+            // Device hits are already summed into output. CPU misses add on top.
+            // A copy of the first product would wipe that sum.
+            if (self.device_reduced) {
+                for (int route = first; route < last; ++route) {
+                    if (group[route] < 0 || !consumed[group[route]]) { continue; }
+                    const float * value = routed + static_cast<size_t>(route) * latent;
+                    for (int row = 0; row < latent; ++row) { destination[row] += value[row]; }
+                }
+                continue;
+            }
             bool started = false;
             for (int route = first; route < last; ++route) { started |= group[route] >= 0 && !consumed[group[route]]; }
             for (int route = first; route < last; ++route) {

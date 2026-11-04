@@ -65,6 +65,8 @@ struct expert_session {
     std::unordered_map<const void *, size_t> ahead_at;
     std::unordered_map<const void *, size_t> ahead_bytes;
     int ahead_used = 0;
+    ggml_backend_buffer_t slot_buf[16] = {};
+    uint64_t slot_bytes = 0;
     ggml_context * ctx = nullptr;
     ggml_tensor * weight = nullptr;
     ggml_tensor * input = nullptr;
@@ -109,6 +111,9 @@ struct expert_session {
         if (batch_buffer) { ggml_backend_buffer_free(batch_buffer); }
         for (auto & slot : ahead_slots) {
             if (slot.buffer) { ggml_backend_buffer_free(slot.buffer); }
+        }
+        for (auto & buf : slot_buf) {
+            if (buf) { ggml_backend_buffer_free(buf); }
         }
     }
 };
@@ -506,6 +511,291 @@ bool expert_ahead(void * raw, const ggml_vk_expert_ahead * items, int count) {
     return true;
 }
 
+bool expert_device_layer(void * raw, const ggml_tensor * activation, int32_t up_type, int32_t down_type,
+        int64_t latent, int64_t hidden, size_t up_bytes, size_t down_bytes,
+        const ggml_vk_device_expert * experts, int n_experts, const ggml_vk_device_route * routes, int n_routes,
+        int nslots, int ntokens, float * output, char * error, size_t error_size) {
+    auto * session = static_cast<expert_session *>(raw);
+    if (!session || !activation || !experts || n_experts < 1 || !routes || n_routes < 1 || !output ||
+            nslots < 1 || nslots > 16 || ntokens < 1 || latent < 1 || hidden < 1) {
+        set_error(error, error_size, "vulkan device layer is missing buffers");
+        return false;
+    }
+    if (!ggml_vk_tensor_on_device(activation) || activation->ne[0] != latent || activation->ne[1] < ntokens) {
+        set_error(error, error_size, "vulkan device layer activation is not a device tensor");
+        return false;
+    }
+    const size_t row_bytes = size_t(latent) * sizeof(float);
+    const size_t slot_need = size_t(ntokens) * row_bytes;
+    ggml_backend_buffer_type_t buft = ggml_backend_get_default_buffer_type(session->backend);
+    if (session->slot_bytes < slot_need) {
+        for (auto & buf : session->slot_buf) {
+            if (buf) { ggml_backend_buffer_free(buf); buf = nullptr; }
+        }
+        session->slot_bytes = 0;
+        for (int s = 0; s < nslots; ++s) {
+            session->slot_buf[s] = ggml_backend_buft_alloc_buffer(buft, slot_need);
+            if (!session->slot_buf[s]) {
+                set_error(error, error_size, "vulkan device layer slot buffer failed");
+                return false;
+            }
+        }
+        session->slot_bytes = slot_need;
+    }
+    const auto t0 = std::chrono::steady_clock::now();
+    const int graph_nodes = n_experts * 32 + 256;
+    const size_t mem = ggml_tensor_overhead() * size_t(n_experts) * 12 + ggml_graph_overhead_custom(graph_nodes, false) + 65536;
+    ggml_context * ctx = ggml_init({ mem, nullptr, true });
+    if (!ctx) {
+        set_error(error, error_size, "vulkan device layer context failed");
+        return false;
+    }
+    const size_t alignment = std::max<size_t>(ggml_backend_buft_get_alignment(buft), 128);
+    struct placed { ggml_tensor * tensor = nullptr; size_t offset = 0; bool ahead = false; const void * host = nullptr; size_t bytes = 0; };
+    std::vector<placed> sets;
+    std::vector<ggml_tensor *> downs(size_t(n_experts), nullptr);
+    std::vector<int> down_cols(size_t(n_experts), 0);
+    std::vector<size_t> down_off(size_t(n_experts), 0);
+    std::vector<const void *> id_src;
+    std::vector<size_t> id_off;
+    std::vector<size_t> id_bytes;
+    ggml_tensor * act = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, activation->ne[0], activation->ne[1]);
+    if (!act) {
+        ggml_free(ctx);
+        set_error(error, error_size, "vulkan device layer activation view failed");
+        return false;
+    }
+    // Same bytes as the dense-graph tensor. Not a producer, so the expert graph
+    // does not record the layers above it.
+    act->buffer = activation->buffer;
+    act->data = activation->data;
+    size_t cursor = 0;
+    auto take = [&](ggml_tensor * tensor) -> bool {
+        if (!tensor) { return false; }
+        cursor = align_up(cursor, alignment);
+        const size_t bytes = ggml_backend_buft_get_alloc_size(buft, tensor);
+        if (cursor + bytes > k_batch_cap) { return false; }
+        sets.push_back({ tensor, cursor, false, nullptr, 0 });
+        cursor += bytes;
+        return true;
+    };
+    for (int e = 0; e < n_experts; ++e) {
+        const auto & item = experts[e];
+        if (!item.up || !item.gate || !item.down || !item.tokens || item.n_tokens < 1) {
+            ggml_free(ctx);
+            set_error(error, error_size, "vulkan device layer expert is incomplete");
+            return false;
+        }
+        ggml_tensor * ids = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, item.n_tokens);
+        ggml_tensor * rows = ids ? ggml_get_rows(ctx, act, ids) : nullptr;
+        ggml_tensor * up_w = ggml_new_tensor_2d(ctx, ggml_type(up_type), latent, hidden);
+        ggml_tensor * gate_w = ggml_new_tensor_2d(ctx, ggml_type(up_type), latent, hidden);
+        ggml_tensor * up_out = up_w && rows ? ggml_mul_mat(ctx, up_w, rows) : nullptr;
+        ggml_tensor * gate_out = gate_w && rows ? ggml_mul_mat(ctx, gate_w, rows) : nullptr;
+        ggml_tensor * hidden_out = up_out && gate_out ? ggml_swiglu_split(ctx, gate_out, up_out) : nullptr;
+        ggml_tensor * down_w = ggml_new_tensor_2d(ctx, ggml_type(down_type), hidden, latent);
+        ggml_tensor * down_out = down_w && hidden_out ? ggml_mul_mat(ctx, down_w, hidden_out) : nullptr;
+        if (!down_out || ggml_nbytes(up_w) != up_bytes || ggml_nbytes(down_w) != down_bytes) {
+            ggml_free(ctx);
+            set_error(error, error_size, "vulkan device layer graph build failed");
+            return false;
+        }
+        if (!take(ids)) { ggml_free(ctx); set_error(error, error_size, "vulkan device layer staging cap"); return false; }
+        id_src.push_back(item.tokens);
+        id_off.push_back(sets.back().offset);
+        id_bytes.push_back(size_t(item.n_tokens) * sizeof(int32_t));
+        auto place_weight = [&](ggml_tensor * weight, const void * data, size_t bytes) -> bool {
+            const auto ahead = session->ahead_at.find(data);
+            if (ahead != session->ahead_at.end() && session->ahead_buffer &&
+                    session->ahead_bytes[data] >= bytes &&
+                    ahead->second + bytes <= ggml_backend_buffer_get_size(session->ahead_buffer)) {
+                sets.push_back({ weight, ahead->second, true, nullptr, 0 });
+                return true;
+            }
+            if (!take(weight)) { return false; }
+            sets.back().host = data;
+            sets.back().bytes = bytes;
+            return true;
+        };
+        if (!place_weight(up_w, item.up, up_bytes) || !place_weight(gate_w, item.gate, up_bytes) ||
+                !place_weight(down_w, item.down, down_bytes) || !take(rows) || !take(up_out) ||
+                !take(gate_out) || !take(hidden_out) || !take(down_out)) {
+            ggml_free(ctx);
+            set_error(error, error_size, "vulkan device layer staging cap");
+            return false;
+        }
+        downs[size_t(e)] = down_out;
+        down_cols[size_t(e)] = item.n_tokens;
+        down_off[size_t(e)] = sets.back().offset;
+    }
+    if (!session->batch_buffer || session->batch_staging < cursor || session->batch_buft != buft) {
+        if (session->batch_buffer) { ggml_backend_buffer_free(session->batch_buffer); }
+        session->batch_buffer = ggml_backend_buft_alloc_buffer(buft, cursor);
+        session->batch_buft = buft;
+        session->batch_staging = session->batch_buffer ? ggml_backend_buffer_get_size(session->batch_buffer) : 0;
+        if (!session->batch_buffer) {
+            ggml_free(ctx);
+            set_error(error, error_size, "vulkan device layer staging allocation failed");
+            return false;
+        }
+    }
+    void * base = ggml_backend_buffer_get_base(session->batch_buffer);
+    void * ahead_base = session->ahead_buffer ? ggml_backend_buffer_get_base(session->ahead_buffer) : nullptr;
+    for (const auto & item : sets) {
+        ggml_backend_buffer_t buf = item.ahead ? session->ahead_buffer : session->batch_buffer;
+        void * at = item.ahead ? static_cast<char *>(ahead_base) + item.offset : static_cast<char *>(base) + item.offset;
+        if (ggml_backend_tensor_alloc(buf, item.tensor, at) != GGML_STATUS_SUCCESS) {
+            ggml_free(ctx);
+            set_error(error, error_size, "vulkan device layer placement failed");
+            return false;
+        }
+        if (item.host && item.bytes) { ggml_backend_tensor_set(item.tensor, item.host, 0, item.bytes); }
+    }
+    if (!id_src.empty() && !ggml_vk_write_ranges(session->batch_buffer, id_src.data(), id_off.data(), id_bytes.data(), int(id_src.size()))) {
+        ggml_free(ctx);
+        set_error(error, error_size, "vulkan device layer id upload failed");
+        return false;
+    }
+    ggml_cgraph * graph = ggml_new_graph_custom(ctx, graph_nodes, false);
+    if (!graph) {
+        ggml_free(ctx);
+        set_error(error, error_size, "vulkan device layer graph allocation failed");
+        return false;
+    }
+    for (auto * down : downs) { ggml_build_forward_expand(graph, down); }
+    if (ggml_backend_graph_compute(session->backend, graph) != GGML_STATUS_SUCCESS) {
+        ggml_free(ctx);
+        set_error(error, error_size, "vulkan device layer graph compute failed");
+        return false;
+    }
+    ggml_backend_synchronize(session->backend);
+    const auto compute_us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count();
+    ggml_free(ctx);
+
+    const auto t1 = std::chrono::steady_clock::now();
+    std::vector<size_t> src_off;
+    std::vector<int> dst_row;
+    std::vector<int> slot_n(size_t(nslots), 0);
+    src_off.reserve(size_t(n_routes));
+    dst_row.reserve(size_t(n_routes));
+    for (int s = 0; s < nslots; ++s) {
+        const int before = int(src_off.size());
+        for (int r = 0; r < n_routes; ++r) {
+            const auto & route = routes[r];
+            if (route.slot != s || route.expert < 0 || route.expert >= n_experts || route.token < 0 || route.token >= ntokens ||
+                    route.column < 0 || route.column >= down_cols[size_t(route.expert)]) {
+                continue;
+            }
+            src_off.push_back(down_off[size_t(route.expert)] + size_t(route.column) * row_bytes);
+            dst_row.push_back(route.token);
+        }
+        slot_n[size_t(s)] = int(src_off.size()) - before;
+    }
+    if (!ggml_vk_scatter_slots(session->slot_buf, nslots, slot_need, session->batch_buffer,
+                src_off.data(), dst_row.data(), slot_n.data(), row_bytes)) {
+        set_error(error, error_size, "vulkan device layer scatter failed");
+        return false;
+    }
+    const auto scatter_us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t1).count();
+
+    const auto t2 = std::chrono::steady_clock::now();
+    std::vector<std::vector<float>> slot_w(size_t(nslots), std::vector<float>(size_t(ntokens), 0.0f));
+    for (int r = 0; r < n_routes; ++r) {
+        if (routes[r].slot < 0 || routes[r].slot >= nslots || routes[r].token < 0 || routes[r].token >= ntokens) { continue; }
+        slot_w[size_t(routes[r].slot)][size_t(routes[r].token)] = routes[r].weight;
+    }
+    const int reduce_nodes = nslots * 8 + 32;
+    ggml_context * reduce = ggml_init({ ggml_tensor_overhead() * size_t(nslots) * 8 + ggml_graph_overhead_custom(reduce_nodes, false) + 65536, nullptr, true });
+    if (!reduce) {
+        set_error(error, error_size, "vulkan device layer reduce context failed");
+        return false;
+    }
+    ggml_tensor * sum = nullptr;
+    size_t reduce_cursor = 0;
+    std::vector<placed> reduce_sets;
+    std::vector<ggml_tensor *> slot_tensors(size_t(nslots), nullptr);
+    auto take_reduce = [&](ggml_tensor * tensor, const void * host, size_t bytes) -> bool {
+        if (!tensor) { return false; }
+        reduce_cursor = align_up(reduce_cursor, alignment);
+        const size_t need = ggml_backend_buft_get_alloc_size(buft, tensor);
+        if (reduce_cursor + need > k_batch_cap) { return false; }
+        reduce_sets.push_back({ tensor, reduce_cursor, false, host, bytes });
+        reduce_cursor += need;
+        return true;
+    };
+    for (int s = 0; s < nslots; ++s) {
+        ggml_tensor * slot = ggml_new_tensor_2d(reduce, GGML_TYPE_F32, latent, ntokens);
+        ggml_tensor * weights = ggml_new_tensor_2d(reduce, GGML_TYPE_F32, 1, ntokens);
+        ggml_tensor * repeated = slot && weights ? ggml_repeat(reduce, weights, slot) : nullptr;
+        ggml_tensor * scaled = slot && repeated ? ggml_mul(reduce, slot, repeated) : nullptr;
+        slot_tensors[size_t(s)] = slot;
+        if (!scaled || !take_reduce(weights, slot_w[size_t(s)].data(), slot_w[size_t(s)].size() * sizeof(float)) ||
+                !take_reduce(repeated, nullptr, 0) || !take_reduce(scaled, nullptr, 0)) {
+            ggml_free(reduce);
+            set_error(error, error_size, "vulkan device layer reduce build failed");
+            return false;
+        }
+        sum = sum ? ggml_add(reduce, sum, scaled) : scaled;
+        if (sum != scaled && !take_reduce(sum, nullptr, 0)) {
+            ggml_free(reduce);
+            set_error(error, error_size, "vulkan device layer reduce build failed");
+            return false;
+        }
+    }
+    if (!sum || reduce_cursor == 0) {
+        ggml_free(reduce);
+        set_error(error, error_size, "vulkan device layer reduce is empty");
+        return false;
+    }
+    if (!session->batch_buffer || session->batch_staging < reduce_cursor) {
+        if (session->batch_buffer) { ggml_backend_buffer_free(session->batch_buffer); }
+        session->batch_buffer = ggml_backend_buft_alloc_buffer(buft, reduce_cursor);
+        session->batch_staging = session->batch_buffer ? ggml_backend_buffer_get_size(session->batch_buffer) : 0;
+        if (!session->batch_buffer) {
+            ggml_free(reduce);
+            set_error(error, error_size, "vulkan device layer reduce allocation failed");
+            return false;
+        }
+    }
+    void * reduce_base = ggml_backend_buffer_get_base(session->batch_buffer);
+    for (int s = 0; s < nslots; ++s) {
+        if (ggml_backend_tensor_alloc(session->slot_buf[s], slot_tensors[size_t(s)],
+                    ggml_backend_buffer_get_base(session->slot_buf[s])) != GGML_STATUS_SUCCESS) {
+            ggml_free(reduce);
+            set_error(error, error_size, "vulkan device layer slot placement failed");
+            return false;
+        }
+    }
+    for (const auto & item : reduce_sets) {
+        if (ggml_backend_tensor_alloc(session->batch_buffer, item.tensor,
+                    static_cast<char *>(reduce_base) + item.offset) != GGML_STATUS_SUCCESS) {
+            ggml_free(reduce);
+            set_error(error, error_size, "vulkan device layer reduce placement failed");
+            return false;
+        }
+        if (item.host && item.bytes) { ggml_backend_tensor_set(item.tensor, item.host, 0, item.bytes); }
+    }
+    ggml_cgraph * reduce_graph = ggml_new_graph_custom(reduce, reduce_nodes, false);
+    if (!reduce_graph) {
+        ggml_free(reduce);
+        set_error(error, error_size, "vulkan device layer reduce graph failed");
+        return false;
+    }
+    ggml_build_forward_expand(reduce_graph, sum);
+    if (ggml_backend_graph_compute(session->backend, reduce_graph) != GGML_STATUS_SUCCESS) {
+        ggml_free(reduce);
+        set_error(error, error_size, "vulkan device layer reduce compute failed");
+        return false;
+    }
+    ggml_backend_synchronize(session->backend);
+    ggml_backend_tensor_get(sum, output, 0, slot_need);
+    const auto reduce_us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t2).count();
+    std::fprintf(stderr, "[kimi_vk_device] experts=%d routes=%d compute_us=%.0f scatter_us=%.0f reduce_us=%.0f\n",
+            n_experts, n_routes, compute_us, scatter_us, reduce_us);
+    ggml_free(reduce);
+    return true;
+}
+
 }  // namespace
 
 extern "C" const ggml_vk_expert_api_v1 * ggml_backend_vk_expert_api_v1(void) {
@@ -519,6 +809,7 @@ extern "C" const ggml_vk_expert_api_v1 * ggml_backend_vk_expert_api_v1(void) {
         reinterpret_cast<bool (*)(void *, int32_t, int64_t, int64_t, int, const void *, size_t, const float *, float *, char *, size_t)>(expert_mul_mat),
         reinterpret_cast<bool (*)(void *, const ggml_vk_expert_matmul *, int, char *, size_t)>(expert_mul_mat_batch),
         reinterpret_cast<bool (*)(void *, const ggml_vk_expert_ahead *, int)>(expert_ahead),
+        reinterpret_cast<bool (*)(void *, const ggml_tensor *, int32_t, int32_t, int64_t, int64_t, size_t, size_t, const ggml_vk_device_expert *, int, const ggml_vk_device_route *, int, int, int, float *, char *, size_t)>(expert_device_layer),
     };
     return &api;
 }

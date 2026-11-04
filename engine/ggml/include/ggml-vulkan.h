@@ -25,6 +25,20 @@ GGML_BACKEND_API ggml_backend_buffer_type_t ggml_backend_vk_host_buffer_type(voi
 // One fence for many device-to-host copies. Returns false if the tensors do not
 // share a Vulkan device buffer.
 GGML_BACKEND_API bool ggml_vk_copy_tensors_fenced(const struct ggml_tensor ** tensors, void ** dsts, const size_t * sizes, int n);
+GGML_BACKEND_API bool ggml_vk_tensor_on_device(const struct ggml_tensor * tensor);
+// Zero dst, then copy rows from src. dst_rows[i] is the destination row. One fence.
+GGML_BACKEND_API bool ggml_vk_scatter_rows(ggml_backend_buffer_t dst, size_t dst_bytes,
+        ggml_backend_buffer_t src, const size_t * src_offsets, const int * dst_rows,
+        int n, size_t row_bytes);
+// Same as scatter_rows for every slot, one submit. slot_n[s] is the route count
+// for dsts[s]; the route arrays are packed in slot order. A slot with no routes
+// is still zeroed.
+GGML_BACKEND_API bool ggml_vk_scatter_slots(ggml_backend_buffer_t * dsts, int nslots, size_t dst_bytes,
+        ggml_backend_buffer_t src, const size_t * src_offsets, const int * dst_rows,
+        const int * slot_n, size_t row_bytes);
+// Many small host ranges into one device buffer, one fence. False leaves the buffer unchanged.
+GGML_BACKEND_API bool ggml_vk_write_ranges(ggml_backend_buffer_t dst, const void ** srcs,
+        const size_t * dst_offsets, const size_t * sizes, int n);
 
 // One graphics-queue copy into an exclusive device buffer, then one acquire on
 // the compute queue. The caller runs the shader only after this returns.

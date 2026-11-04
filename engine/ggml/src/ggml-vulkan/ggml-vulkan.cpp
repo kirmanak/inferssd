@@ -13656,6 +13656,184 @@ extern "C" bool ggml_vk_copy_tensors_fenced(const ggml_tensor ** tensors, void *
     return true;
 }
 
+extern "C" bool ggml_vk_tensor_on_device(const ggml_tensor * tensor) {
+    return tensor && tensor->buffer && ggml_backend_buffer_is_vk(tensor->buffer) &&
+        tensor->type == GGML_TYPE_F32 && ggml_is_contiguous(tensor);
+}
+
+extern "C" bool ggml_vk_scatter_rows(ggml_backend_buffer_t dst, size_t dst_bytes,
+        ggml_backend_buffer_t src, const size_t * src_offsets, const int * dst_rows,
+        int n, size_t row_bytes) {
+    if (!dst || dst_bytes == 0 || (n > 0 && (!src || !src_offsets || !dst_rows || row_bytes == 0))) { return false; }
+    if (dst_bytes % 4 != 0 || row_bytes % 4 != 0) { return false; }
+    auto * dst_ctx = static_cast<ggml_backend_vk_buffer_context *>(dst->context);
+    auto * src_ctx = n > 0 ? static_cast<ggml_backend_vk_buffer_context *>(src->context) : nullptr;
+    if (!dst_ctx || !dst_ctx->dev_buffer || (n > 0 && (!src_ctx || !src_ctx->dev_buffer))) { return false; }
+    vk_device device = dst_ctx->dev_buffer->device;
+    if (n > 0 && src_ctx->dev_buffer->device != device) { return false; }
+    std::vector<vk::BufferCopy> copies;
+    copies.reserve(size_t(std::max(n, 0)));
+    for (int i = 0; i < n; ++i) {
+        if (dst_rows[i] < 0) { continue; }
+        const size_t dst_off = size_t(dst_rows[i]) * row_bytes;
+        if (dst_off + row_bytes > dst_bytes) { return false; }
+        copies.push_back({ src_offsets[i], dst_off, row_bytes });
+    }
+    std::lock_guard<std::recursive_mutex> guard(device->mutex);
+    vk::CommandPool pool;
+    vk::Fence fence;
+    try {
+        pool = device->device.createCommandPool({ vk::CommandPoolCreateFlagBits::eTransient, device->compute_queue.queue_family_index });
+        vk::CommandBuffer cmd = device->device.allocateCommandBuffers({ pool, vk::CommandBufferLevel::ePrimary, 1 })[0];
+        cmd.begin({ vk::CommandBufferUsageFlagBits::eOneTimeSubmit });
+        cmd.fillBuffer(dst_ctx->dev_buffer->buffer, 0, dst_bytes, 0);
+        if (!copies.empty()) {
+            vk::BufferMemoryBarrier to_copy{ vk::AccessFlagBits::eTransferWrite, vk::AccessFlagBits::eTransferRead,
+                    VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED, dst_ctx->dev_buffer->buffer, 0, dst_bytes };
+            cmd.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer, vk::PipelineStageFlagBits::eTransfer,
+                    {}, nullptr, to_copy, nullptr);
+            cmd.copyBuffer(src_ctx->dev_buffer->buffer, dst_ctx->dev_buffer->buffer, copies);
+        }
+        vk::BufferMemoryBarrier to_shader{ vk::AccessFlagBits::eTransferWrite, vk::AccessFlagBits::eShaderRead,
+                VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED, dst_ctx->dev_buffer->buffer, 0, dst_bytes };
+        cmd.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer, vk::PipelineStageFlagBits::eComputeShader,
+                {}, nullptr, to_shader, nullptr);
+        cmd.end();
+        fence = device->device.createFence({});
+        {
+            std::lock_guard<std::mutex> guard_q(queue_mutex);
+            device->compute_queue.queue.submit(vk::SubmitInfo{ {}, {}, cmd }, fence);
+        }
+        (void) device->device.waitForFences(fence, VK_TRUE, UINT64_MAX);
+    } catch (const vk::SystemError & e) {
+        std::fprintf(stderr, "[kimi_vk_scatter] failed: %s\n", e.what());
+        if (fence) { device->device.destroyFence(fence); }
+        if (pool) { device->device.destroyCommandPool(pool); }
+        return false;
+    }
+    device->device.destroyFence(fence);
+    device->device.destroyCommandPool(pool);
+    return true;
+}
+
+extern "C" bool ggml_vk_scatter_slots(ggml_backend_buffer_t * dsts, int nslots, size_t dst_bytes,
+        ggml_backend_buffer_t src, const size_t * src_offsets, const int * dst_rows,
+        const int * slot_n, size_t row_bytes) {
+    if (!dsts || nslots < 1 || dst_bytes == 0 || dst_bytes % 4 != 0 || row_bytes == 0 || row_bytes % 4 != 0 || !slot_n) {
+        return false;
+    }
+    int n = 0;
+    for (int s = 0; s < nslots; ++s) {
+        if (!dsts[s] || slot_n[s] < 0) { return false; }
+        n += slot_n[s];
+    }
+    if (n > 0 && (!src || !src_offsets || !dst_rows)) { return false; }
+    auto * src_ctx = n > 0 ? static_cast<ggml_backend_vk_buffer_context *>(src->context) : nullptr;
+    auto * dst0 = static_cast<ggml_backend_vk_buffer_context *>(dsts[0]->context);
+    if (!dst0 || !dst0->dev_buffer || (n > 0 && (!src_ctx || !src_ctx->dev_buffer))) { return false; }
+    vk_device device = dst0->dev_buffer->device;
+    if (n > 0 && src_ctx->dev_buffer->device != device) { return false; }
+    std::vector<std::vector<vk::BufferCopy>> copies{ size_t(nslots) };
+    int at = 0;
+    for (int s = 0; s < nslots; ++s) {
+        auto * dst_ctx = static_cast<ggml_backend_vk_buffer_context *>(dsts[s]->context);
+        if (!dst_ctx || !dst_ctx->dev_buffer || dst_ctx->dev_buffer->device != device) { return false; }
+        copies[size_t(s)].reserve(size_t(slot_n[s]));
+        for (int i = 0; i < slot_n[s]; ++i, ++at) {
+            if (dst_rows[at] < 0) { continue; }
+            const size_t dst_off = size_t(dst_rows[at]) * row_bytes;
+            if (dst_off + row_bytes > dst_bytes) { return false; }
+            copies[size_t(s)].push_back({ src_offsets[at], dst_off, row_bytes });
+        }
+    }
+    std::lock_guard<std::recursive_mutex> guard(device->mutex);
+    vk::CommandPool pool;
+    vk::Fence fence;
+    try {
+        pool = device->device.createCommandPool({ vk::CommandPoolCreateFlagBits::eTransient, device->compute_queue.queue_family_index });
+        vk::CommandBuffer cmd = device->device.allocateCommandBuffers({ pool, vk::CommandBufferLevel::ePrimary, 1 })[0];
+        cmd.begin({ vk::CommandBufferUsageFlagBits::eOneTimeSubmit });
+        std::vector<vk::BufferMemoryBarrier> filled;
+        filled.reserve(size_t(nslots));
+        for (int s = 0; s < nslots; ++s) {
+            auto * dst_ctx = static_cast<ggml_backend_vk_buffer_context *>(dsts[s]->context);
+            cmd.fillBuffer(dst_ctx->dev_buffer->buffer, 0, dst_bytes, 0);
+            filled.push_back({ vk::AccessFlagBits::eTransferWrite, vk::AccessFlagBits::eTransferWrite,
+                    VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED, dst_ctx->dev_buffer->buffer, 0, dst_bytes });
+        }
+        cmd.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer, vk::PipelineStageFlagBits::eTransfer,
+                {}, nullptr, filled, nullptr);
+        for (int s = 0; s < nslots; ++s) {
+            if (copies[size_t(s)].empty()) { continue; }
+            auto * dst_ctx = static_cast<ggml_backend_vk_buffer_context *>(dsts[s]->context);
+            cmd.copyBuffer(src_ctx->dev_buffer->buffer, dst_ctx->dev_buffer->buffer, copies[size_t(s)]);
+        }
+        for (auto & barrier : filled) {
+            barrier.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
+            barrier.dstAccessMask = vk::AccessFlagBits::eShaderRead;
+        }
+        cmd.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer, vk::PipelineStageFlagBits::eComputeShader,
+                {}, nullptr, filled, nullptr);
+        cmd.end();
+        fence = device->device.createFence({});
+        {
+            std::lock_guard<std::mutex> guard_q(queue_mutex);
+            device->compute_queue.queue.submit(vk::SubmitInfo{ {}, {}, cmd }, fence);
+        }
+        (void) device->device.waitForFences(fence, VK_TRUE, UINT64_MAX);
+    } catch (const vk::SystemError & e) {
+        std::fprintf(stderr, "[kimi_vk_scatter] slots failed: %s\n", e.what());
+        if (fence) { device->device.destroyFence(fence); }
+        if (pool) { device->device.destroyCommandPool(pool); }
+        return false;
+    }
+    device->device.destroyFence(fence);
+    device->device.destroyCommandPool(pool);
+    return true;
+}
+
+extern "C" bool ggml_vk_write_ranges(ggml_backend_buffer_t dst, const void ** srcs,
+        const size_t * dst_offsets, const size_t * sizes, int n) {
+    if (n <= 0) { return true; }
+    if (!dst || !srcs || !dst_offsets || !sizes) { return false; }
+    auto * buf_ctx = static_cast<ggml_backend_vk_buffer_context *>(dst->context);
+    if (!buf_ctx || !buf_ctx->dev_buffer) { return false; }
+    vk_buffer dst_buf = buf_ctx->dev_buffer;
+    vk_device device = dst_buf->device;
+    size_t total = 0;
+    for (int i = 0; i < n; ++i) {
+        if (!srcs[i] || sizes[i] == 0) { return false; }
+        total += sizes[i];
+    }
+    if (total == 0) { return true; }
+    std::lock_guard<std::recursive_mutex> guard(device->mutex);
+    try {
+        ggml_vk_ensure_sync_staging_buffer(device, total);
+    } catch (const vk::SystemError & e) {
+        std::fprintf(stderr, "[kimi_vk_write] staging failed: %s\n", e.what());
+        return false;
+    }
+    vk_buffer & staging = device->sync_staging;
+    if (!staging || !staging->ptr || staging->size < total) { return false; }
+    std::vector<VkBufferCopy> copies{ size_t(n) };
+    size_t cursor = 0;
+    for (int i = 0; i < n; ++i) {
+        std::memcpy(static_cast<char *>(staging->ptr) + cursor, srcs[i], sizes[i]);
+        copies[size_t(i)] = { cursor, dst_offsets[i], sizes[i] };
+        cursor += sizes[i];
+    }
+    vk_context subctx = ggml_vk_create_temporary_context(device->transfer_queue.cmd_pool);
+    ggml_vk_ctx_begin(device, subctx);
+    vkCmdCopyBuffer(subctx->s->buffer->buf, (VkBuffer) staging->buffer, (VkBuffer) dst_buf->buffer,
+            uint32_t(n), copies.data());
+    ggml_vk_ctx_end(subctx);
+    ggml_vk_submit(subctx, device->fence);
+    VK_CHECK(device->device.waitForFences({ device->fence }, true, UINT64_MAX), "ggml_vk_write_ranges");
+    device->device.resetFences({ device->fence });
+    ggml_vk_queue_command_pools_cleanup(device);
+    return true;
+}
+
 static bool upload_acquired_from(ggml_backend_vk_buffer_context * dst_ctx, vk_buffer src, const ggml_vk_copy_region * regions, int n) {
     vk_device device = dst_ctx->dev_buffer->device;
     const uint32_t transfer_family = device->transfer_queue.queue_family_index;

@@ -42,6 +42,8 @@ struct llama_kimi_cpu_sink_node {
     bool cache_compute = false;
     bool guarded = false;
     float routed_scale = 1.0f;
+    // Dense-graph activation, captured before the scheduler rewrites src to a CPU copy.
+    const ggml_tensor * device_input = nullptr;
 };
 
 struct llama_kimi_cpu_sink_runtime {
@@ -425,6 +427,7 @@ inline void llama_kimi_cpu_sink_compute(ggml_tensor * dst, int ith, int nth, voi
     GGML_ASSERT(situ || !node.cache_compute);
     if (node.prefill) {
         runtime.prefill.initialize(node.cpu_reg, runtime.sink);
+        kimi_cpu_sink_set_device_input(runtime.sink, node.device_input);
         ok = runtime.prefill.run_activation(runtime.prefill.context, &node.up, &node.gate, &node.down,
             static_cast<const float *>(input->data), static_cast<const int32_t *>(ids->data),
             static_cast<const float *>(weights->data), nslots, ntokens,

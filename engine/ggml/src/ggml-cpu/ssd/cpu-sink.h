@@ -181,6 +181,12 @@ GGML_BACKEND_API bool kimi_cpu_sink_run_activation(
 // Optional shared-location provider. nullptr detaches at a serialized boundary.
 // Default absent; the placement owner installs its adapter once, not per token.
 struct kimi_cache_location_api;
+// Dense-graph activation for the Vulkan resident path. Borrowed, not owned.
+// The scheduler later rewrites the custom op's src to a CPU copy; this keeps
+// the device tensor. Null clears it.
+GGML_BACKEND_API void kimi_cpu_sink_set_device_input(struct kimi_cpu_sink * sink, const struct ggml_tensor * input);
+GGML_BACKEND_API const struct ggml_tensor * kimi_cpu_sink_device_input(const struct kimi_cpu_sink * sink);
+
 GGML_BACKEND_API bool kimi_cpu_sink_set_cache_locations(
         struct kimi_cpu_sink *, const struct kimi_cache_location_api *, void *, char *, size_t);
 

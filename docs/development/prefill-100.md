@@ -388,3 +388,54 @@ previous result. They sum to the wall. Hiding another copy does not
 remove a link. The next cut has to keep the expert activations on the
 GPU, so the pack, the activation upload, the download, and the scatter
 are not on the chain.
+
+## Expert math on the device activation
+
+The dense graph already holds the FFN input on the GPU. The scheduler
+then copies it to the CPU custom op. The graph build keeps that device
+tensor (`device_input`, the CONT source) and the prefill path gathers
+its rows on the device, runs up, gate, SwiGLU, and down there, scatters
+each slot in one submit, scale-adds the slots, and downloads only the
+reduced `[latent, ntokens]` result.
+
+A few cache misses must not send the whole layer back to the host pack.
+The device sum covers the hits. The CPU sink still computes the misses,
+and the token reduce adds those products onto the device sum instead of
+copying over it. `consumed` is not set for the device hits, so that
+reduce does not add them twice. Decode does not enter this path
+(`ntokens` must be above 32).
+
+An ahead upload that dropped the device lock, and a one-fence activation
+upload, stayed out. Both lost on the earlier runs.
+
+Warm 500-token prompt, two processes, same binary:
+
+```text
+pass 2 wall=2.463s prompt_ms=2455.64 prompt_per_second=203.61
+pass 2 wall=2.488s prompt_ms=2480.77 prompt_per_second=201.55
+```
+
+Both runs put 47 of 48 layers on the device path, no fallback. Split of
+the 2480.77 ms run:
+
+| | time |
+| --- | --- |
+| scheduler, 100 splits | 2.433 s |
+| device compute / scatter / reduce | 1.119 / 0.149 / 0.069 s |
+| ahead join | 0.292 s |
+
+The layer of 10 experts stayed on the host pack (0.6 ms). Greedy tokens,
+temperature 0, `n_predict` 24, second request: 24/24 match
+`22791 440 799 11316 421 4874 279 8981 3817 13 198 22791 440 799 11316 421 4874 279 7948 6297 13 198 22791 440`.
+`fallback_count=0`.
+
+`llama-completion -n 1024` does not log the device path. Two runs:
+
+```text
+eval time = 72042.87 ms / 765 runs (94.17 ms per token, 10.62 tok/s)
+eval time = 77363.68 ms / 824 runs (93.89 ms per token, 10.65 tok/s)
+```
+
+Under the 10.68 baseline by 0.03–0.06 tok/s, and under the 10.86 measured
+on the parent. The runs stop at different lengths, so the expert mix is
+not the same. The prefill path is not on this eval.

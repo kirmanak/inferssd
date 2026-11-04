@@ -2099,6 +2099,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
             cb(args[4], "ffn_moe_cpu_sink_native_weights", il);
         }
         cb(args[0], "ffn_moe_cpu_sink_in", il);
+        descriptor->device_input = args[0] && args[0]->op == GGML_OP_CONT ? args[0]->src[0] : args[0];
         cb(args[1], "ffn_moe_cpu_sink_ids", il);
         cb(args[2], "ffn_moe_cpu_sink_weights", il);
         // every CPU thread of the graph is a compute participant of the node's call
