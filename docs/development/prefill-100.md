@@ -663,3 +663,35 @@ so a perfect overlapped copy cannot reach 800. The 120 ms 4-wide gemm
 is the only large inefficient dispatch, and speeding it changed the
 first token. The expert scale is the same bytes; fusing the dispatches
 did not shrink the queue. The kept result is unchanged.
+
+## 400 tok/s needs a copy this machine does not sustain
+
+400 tok/s on the 500-token prompt is 1250 ms. The GPU queue is 774 ms,
+so the copy is the blocker. 37.72 GB in 1250 ms is 30.2 GB/s, with the
+compute hidden behind it.
+
+A 256 MB host-visible to device copy, source already filled, measured:
+
+```text
+[kimi_vk_dma] bytes=268435456 regions=1 us=7115 gb_s=37.73
+[kimi_vk_dma] bytes=268435456 regions=256 us=7241 gb_s=37.07
+```
+
+That rate would be enough. The real weights are not in that memory.
+Pipelining the copy of the real pages was slower than one fence per
+weight (warm prompt 2805–3489 ms). zstd -1 on 64 MB of the weight file
+was 98.0% of the original size. Keeping a second copy in host-visible
+memory so the warm pass could DMA it reached 122 slabs, 31 GB, and the
+server died on the next request:
+
+```text
+[kimi_vk_hcache] n=789 bytes=807936000 misses=744 fill_us=2801910 dma_us=29271
+[kimi_vk_hcache] slabs=122 cap=268435456
+curl: (52) Empty reply from server
+pass 2 wall=32.818s
+```
+
+`dma_us=29271` for 808 MB is 27.6 GB/s, close to the probe, and the
+machine was already swapping to fill the cache. The kept warm prompt
+remains 2255 ms / 221.73 tok/s. A rerun of that path in this session,
+before the cache, was 2189 ms / 228.4 tok/s with content `</think>`.
