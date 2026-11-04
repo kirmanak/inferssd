@@ -738,3 +738,31 @@ chain, and it cannot be resident beside a command submission. CPU
 memcpy into a Vulkan host-visible buffer, steady state, is 15.1 GB/s
 (write-combined) and 14.9 GB/s (cached). The ahead thread already does
 20.6 GB/s. Replacing it with that memcpy is slower. Not kept.
+
+## Staging layer 0 cut the pack, not the prompt enough
+
+Copying layer 0 into the ahead slot after the graph, and pinning it,
+removed the first-layer host upload. Not kept: warm prompt stayed above
+1250 ms.
+
+```text
+pass 2 prompt_ms=2027.987 prompt_per_second=246.55 content=</think>
+[kimi_vk_prime] layer0=1014
+bucket misses=0 pack_s=0.306 first pack_us=6131
+join_us sum=0.447 s
+```
+
+Most ahead copies then ran at 28 GB/s. Four did not, every run, with the
+same minor-fault counts:
+
+```text
+909 MB 118 ms minflt=13889  7.7 GB/s
+1166 MB 154 ms minflt=17747  7.6 GB/s
+946 MB 122 ms minflt=14403  7.8 GB/s
+983 MB 130 ms minflt=14960  7.6 GB/s
+```
+
+Touching those pages from another thread first did not remove the faults
+or the joins. Setup outside the resident Vulkan call was 0.213 s, of
+which prepare was only 0.035 s. The expert split is still about 1.7 s
+and the attention drain is still in front of it. 400 tok/s was not reached.
