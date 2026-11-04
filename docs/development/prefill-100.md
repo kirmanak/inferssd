@@ -766,3 +766,41 @@ Touching those pages from another thread first did not remove the faults
 or the joins. Setup outside the resident Vulkan call was 0.213 s, of
 which prepare was only 0.035 s. The expert split is still about 1.7 s
 and the attention drain is still in front of it. 400 tok/s was not reached.
+
+## The slow copies fault the new host-visible slot
+
+The ahead buffer is host-visible device memory. `ggml_vk_buffer_write_2d`
+takes the direct memcpy, so the staging counters stay at zero. The four
+slow copies are the ones that reallocate the slot (`grew=1`). The memcpy
+then minor-faults the new mapping. A source touch before the copy faulted
+nothing.
+
+```text
+909 MB 169 ms grew=1 loop_faults=11890  5.4 GB/s
+1166 MB 156 ms grew=1 loop_faults=17770  7.5 GB/s
+946 MB 123 ms grew=1 loop_faults=14401  7.7 GB/s
+983 MB 132 ms grew=1 loop_faults=14964  7.5 GB/s
+setup/dest/memcpy/submit faults = 0, staging=0 pinned=0
+```
+
+Allocating both slots once at 1536 MB and storing one byte per page
+(`prefault` 151 ms and 150 ms, during pass 1) stopped the reallocations.
+Those copies then ran at 15–28 GB/s and the join sum fell to 0.09 s.
+Warm prompt 1904 ms, content `</think>`.
+
+Copying layer 0 into that slot after the graph, and joining it before the
+next request, removed the first-layer host pack as well:
+
+```text
+pass 2 prompt_ms=1673.573 prompt_per_second=298.76 content=</think>
+[kimi_vk_prime] layer0=1014
+bucket misses=0 first pack_us=7281
+[kimi_sched] splits=100 us=1594410 input_us=364410 sync_us=346215 split_us=1229653
+quant_us sum=56 ms, token reduce sum=9 ms
+```
+
+Still above 1250 ms. The 346 ms is the synchronize before the host copy
+of `ffn_moe_cpu_sink_in`. Skipping that copy so expert CPU work could
+overlap attention produced the wrong token (`Stop` instead of
+`</think>`) and a 4645 ms prompt. The device read of the activation is
+not ordered with attention unless that synchronize runs. Not kept.
