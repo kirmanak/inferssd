@@ -511,6 +511,221 @@ bool expert_ahead(void * raw, const ggml_vk_expert_ahead * items, int count) {
     return true;
 }
 
+// Experts with the same padded token count share one mul_mat. That is the
+// ordinary shader, one dispatch per bucket, not mul_mat_id. False leaves the
+// batch buffer reusable by the per-expert path and does not write output.
+bool expert_buckets_compute(expert_session * session, const ggml_tensor * activation,
+        int32_t up_type, int32_t down_type, int64_t latent, int64_t hidden,
+        size_t up_bytes, size_t down_bytes, const ggml_vk_device_expert * experts, int n_experts,
+        std::vector<size_t> & down_off, std::vector<int> & down_cols) {
+    if (n_experts < 32) { return false; }
+    static const int k_pads[] = { 8, 16, 32, 64, 128, 256, 512 };
+    struct bucket { int pad = 0; std::vector<int> which; };
+    std::vector<bucket> buckets;
+    for (int p : k_pads) {
+        bucket b{ p, {} };
+        for (int e = 0; e < n_experts; ++e) {
+            const int n = experts[e].n_tokens;
+            if (!experts[e].up || !experts[e].gate || !experts[e].down || !experts[e].tokens || n < 1) { return false; }
+            int pad = 0;
+            for (int q : k_pads) { if (n <= q) { pad = q; break; } }
+            if (!pad) { return false; }
+            if (pad == p) { b.which.push_back(e); }
+        }
+        if (!b.which.empty()) { buckets.push_back(std::move(b)); }
+    }
+    if (buckets.empty()) { return false; }
+    ggml_context * probe = ggml_init({ ggml_tensor_overhead() * 4 + 4096, nullptr, true });
+    if (!probe) { return false; }
+    ggml_tensor * up_probe = ggml_new_tensor_3d(probe, ggml_type(up_type), latent, hidden, 1);
+    ggml_tensor * down_probe = ggml_new_tensor_3d(probe, ggml_type(down_type), hidden, latent, 1);
+    const bool stride_ok = up_probe && down_probe && up_probe->nb[2] == up_bytes && down_probe->nb[2] == down_bytes;
+    ggml_free(probe);
+    if (!stride_ok) {
+        std::fprintf(stderr, "[kimi_vk_bucket] skip stride up=%zu down=%zu\n", up_bytes, down_bytes);
+        return false;
+    }
+    const size_t row_bytes = size_t(latent) * sizeof(float);
+    ggml_backend_buffer_type_t buft = ggml_backend_get_default_buffer_type(session->backend);
+    const size_t alignment = std::max<size_t>(ggml_backend_buft_get_alignment(buft), 256);
+    ggml_context * ctx = ggml_init({ ggml_tensor_overhead() * 160 + ggml_graph_overhead_custom(128, false) + 65536, nullptr, true });
+    if (!ctx) { return false; }
+    struct built {
+        int pad = 0;
+        std::vector<int> which;
+        ggml_tensor * up_w = nullptr;
+        ggml_tensor * gate_w = nullptr;
+        ggml_tensor * down_w = nullptr;
+        ggml_tensor * input = nullptr;
+        ggml_tensor * up_out = nullptr;
+        ggml_tensor * gate_out = nullptr;
+        ggml_tensor * hidden_out = nullptr;
+        ggml_tensor * down_out = nullptr;
+        size_t up_at = 0, gate_at = 0, down_at = 0, in_at = 0;
+        size_t up_out_at = 0, gate_out_at = 0, hidden_at = 0, down_out_at = 0;
+    };
+    std::vector<built> layers;
+    layers.reserve(buckets.size());
+    for (const auto & b : buckets) {
+        const int count = int(b.which.size());
+        built lay;
+        lay.pad = b.pad;
+        lay.which = b.which;
+        lay.up_w = ggml_new_tensor_3d(ctx, ggml_type(up_type), latent, hidden, count);
+        lay.gate_w = ggml_new_tensor_3d(ctx, ggml_type(up_type), latent, hidden, count);
+        lay.down_w = ggml_new_tensor_3d(ctx, ggml_type(down_type), hidden, latent, count);
+        lay.input = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, latent, b.pad, count);
+        if (!lay.up_w || !lay.gate_w || !lay.down_w || !lay.input ||
+                lay.up_w->nb[2] != up_bytes || lay.down_w->nb[2] != down_bytes ||
+                lay.input->nb[1] != row_bytes) {
+            ggml_free(ctx);
+            return false;
+        }
+        lay.up_out = ggml_mul_mat(ctx, lay.up_w, lay.input);
+        lay.gate_out = ggml_mul_mat(ctx, lay.gate_w, lay.input);
+        lay.hidden_out = lay.up_out && lay.gate_out ? ggml_swiglu_split(ctx, lay.gate_out, lay.up_out) : nullptr;
+        lay.down_out = lay.hidden_out ? ggml_mul_mat(ctx, lay.down_w, lay.hidden_out) : nullptr;
+        if (!lay.down_out || lay.down_out->nb[1] != row_bytes || lay.down_out->nb[2] != size_t(b.pad) * row_bytes) {
+            ggml_free(ctx);
+            return false;
+        }
+        layers.push_back(std::move(lay));
+    }
+    size_t cursor = 0;
+    auto take = [&](ggml_tensor * tensor) -> size_t {
+        cursor = align_up(cursor, alignment);
+        const size_t at = cursor;
+        cursor += ggml_backend_buft_get_alloc_size(buft, tensor);
+        return at;
+    };
+    for (auto & lay : layers) {
+        lay.up_at = take(lay.up_w);
+        lay.gate_at = take(lay.gate_w);
+        lay.down_at = take(lay.down_w);
+    }
+    const size_t input_at = align_up(cursor, alignment);
+    for (auto & lay : layers) {
+        lay.in_at = take(lay.input);
+    }
+    const size_t input_bytes = cursor - input_at;
+    for (auto & lay : layers) {
+        lay.up_out_at = take(lay.up_out);
+        lay.gate_out_at = take(lay.gate_out);
+        lay.hidden_at = take(lay.hidden_out);
+        lay.down_out_at = take(lay.down_out);
+    }
+    if (cursor == 0 || cursor > k_batch_cap || input_bytes == 0 || input_bytes % 4 != 0) {
+        std::fprintf(stderr, "[kimi_vk_bucket] skip experts=%d bytes=%zu cap=%zu\n",
+                n_experts, cursor, size_t(k_batch_cap));
+        ggml_free(ctx);
+        return false;
+    }
+    if (!session->batch_buffer || session->batch_staging < cursor || session->batch_buft != buft) {
+        if (session->batch_buffer) { ggml_backend_buffer_free(session->batch_buffer); }
+        session->batch_buffer = ggml_backend_buft_alloc_buffer(buft, cursor);
+        session->batch_buft = buft;
+        session->batch_staging = session->batch_buffer ? ggml_backend_buffer_get_size(session->batch_buffer) : 0;
+        if (!session->batch_buffer) {
+            ggml_free(ctx);
+            return false;
+        }
+    }
+    const size_t act_base = size_t(static_cast<char *>(activation->data) - static_cast<char *>(ggml_backend_buffer_get_base(activation->buffer)));
+    std::vector<size_t> act_src, act_dst, act_sz;
+    std::vector<size_t> w_src, w_dst, w_sz;
+    std::vector<const void *> host_src;
+    std::vector<size_t> host_dst, host_sz;
+    int misses = 0;
+    auto place_weight = [&](const void * data, size_t bytes, size_t dst) {
+        const auto ahead = session->ahead_at.find(data);
+        if (ahead != session->ahead_at.end() && session->ahead_buffer && session->ahead_bytes[data] >= bytes &&
+                ahead->second + bytes <= ggml_backend_buffer_get_size(session->ahead_buffer)) {
+            w_src.push_back(ahead->second);
+            w_dst.push_back(dst);
+            w_sz.push_back(bytes);
+            return;
+        }
+        host_src.push_back(data);
+        host_dst.push_back(dst);
+        host_sz.push_back(bytes);
+        ++misses;
+    };
+    for (const auto & lay : layers) {
+        for (size_t i = 0; i < lay.which.size(); ++i) {
+            const auto & item = experts[lay.which[i]];
+            for (int c = 0; c < item.n_tokens; ++c) {
+                const int token = item.tokens[c];
+                if (token < 0 || token >= activation->ne[1]) {
+                    ggml_free(ctx);
+                    return false;
+                }
+                act_src.push_back(act_base + size_t(token) * row_bytes);
+                act_dst.push_back(lay.in_at + (i * size_t(lay.pad) + size_t(c)) * row_bytes);
+                act_sz.push_back(row_bytes);
+            }
+            place_weight(item.up, up_bytes, lay.up_at + i * up_bytes);
+            place_weight(item.gate, up_bytes, lay.gate_at + i * up_bytes);
+            place_weight(item.down, down_bytes, lay.down_at + i * down_bytes);
+        }
+    }
+    const auto t_pack = std::chrono::steady_clock::now();
+    if (!ggml_vk_fill_and_copy(session->batch_buffer, input_at, input_bytes, activation->buffer,
+                act_src.data(), act_dst.data(), act_sz.data(), int(act_src.size()))) {
+        ggml_free(ctx);
+        return false;
+    }
+    if (!w_src.empty() && !ggml_vk_fill_and_copy(session->batch_buffer, 0, 0, session->ahead_buffer,
+                w_src.data(), w_dst.data(), w_sz.data(), int(w_src.size()))) {
+        ggml_free(ctx);
+        return false;
+    }
+    if (!host_src.empty() && !ggml_vk_write_ranges(session->batch_buffer, host_src.data(), host_dst.data(), host_sz.data(), int(host_src.size()))) {
+        ggml_free(ctx);
+        return false;
+    }
+    const double pack_us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t_pack).count();
+    void * base = ggml_backend_buffer_get_base(session->batch_buffer);
+    auto place = [&](ggml_tensor * tensor, size_t at) -> bool {
+        return tensor && ggml_backend_tensor_alloc(session->batch_buffer, tensor, static_cast<char *>(base) + at) == GGML_STATUS_SUCCESS;
+    };
+    ggml_cgraph * graph = ggml_new_graph_custom(ctx, 128, false);
+    if (!graph) {
+        ggml_free(ctx);
+        return false;
+    }
+    for (const auto & lay : layers) {
+        if (!place(lay.up_w, lay.up_at) || !place(lay.gate_w, lay.gate_at) || !place(lay.down_w, lay.down_at) ||
+                !place(lay.input, lay.in_at) || !place(lay.up_out, lay.up_out_at) || !place(lay.gate_out, lay.gate_out_at) ||
+                !place(lay.hidden_out, lay.hidden_at) || !place(lay.down_out, lay.down_out_at)) {
+            ggml_free(ctx);
+            return false;
+        }
+        for (size_t i = 0; i < lay.which.size(); ++i) {
+            const int e = lay.which[i];
+            down_off[size_t(e)] = lay.down_out_at + i * size_t(lay.pad) * row_bytes;
+            down_cols[size_t(e)] = experts[e].n_tokens;
+        }
+        ggml_build_forward_expand(graph, lay.down_out);
+    }
+    std::fprintf(stderr, "[kimi_vk_bucket] begin experts=%d buckets=%zu misses=%d bytes=%zu\n",
+            n_experts, layers.size(), misses, cursor);
+    std::fflush(stderr);
+    const auto t_compute = std::chrono::steady_clock::now();
+    if (ggml_backend_graph_compute(session->backend, graph) != GGML_STATUS_SUCCESS) {
+        std::fprintf(stderr, "[kimi_vk_bucket] compute failed\n");
+        std::fflush(stderr);
+        ggml_free(ctx);
+        return false;
+    }
+    ggml_backend_synchronize(session->backend);
+    const double compute_us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t_compute).count();
+    std::fprintf(stderr, "[kimi_vk_bucket] experts=%d buckets=%zu misses=%d pack_us=%.0f compute_us=%.0f\n",
+            n_experts, layers.size(), misses, pack_us, compute_us);
+    std::fflush(stderr);
+    ggml_free(ctx);
+    return true;
+}
+
 bool expert_device_layer(void * raw, const ggml_tensor * activation, int32_t up_type, int32_t down_type,
         int64_t latent, int64_t hidden, size_t up_bytes, size_t down_bytes,
         const ggml_vk_device_expert * experts, int n_experts, const ggml_vk_device_route * routes, int n_routes,
@@ -543,6 +758,15 @@ bool expert_device_layer(void * raw, const ggml_tensor * activation, int32_t up_
         session->slot_bytes = slot_need;
     }
     const auto t0 = std::chrono::steady_clock::now();
+    const size_t alignment = std::max<size_t>(ggml_backend_buft_get_alignment(buft), 128);
+    struct placed { ggml_tensor * tensor = nullptr; size_t offset = 0; bool ahead = false; const void * host = nullptr; size_t bytes = 0; };
+    std::vector<int> down_cols(size_t(n_experts), 0);
+    std::vector<size_t> down_off(size_t(n_experts), 0);
+    double compute_us = 0;
+    if (expert_buckets_compute(session, activation, up_type, down_type, latent, hidden,
+                up_bytes, down_bytes, experts, n_experts, down_off, down_cols)) {
+        compute_us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count();
+    } else {
     const int graph_nodes = n_experts * 32 + 256;
     const size_t mem = ggml_tensor_overhead() * size_t(n_experts) * 12 + ggml_graph_overhead_custom(graph_nodes, false) + 65536;
     ggml_context * ctx = ggml_init({ mem, nullptr, true });
@@ -550,12 +774,8 @@ bool expert_device_layer(void * raw, const ggml_tensor * activation, int32_t up_
         set_error(error, error_size, "vulkan device layer context failed");
         return false;
     }
-    const size_t alignment = std::max<size_t>(ggml_backend_buft_get_alignment(buft), 128);
-    struct placed { ggml_tensor * tensor = nullptr; size_t offset = 0; bool ahead = false; const void * host = nullptr; size_t bytes = 0; };
     std::vector<placed> sets;
     std::vector<ggml_tensor *> downs(size_t(n_experts), nullptr);
-    std::vector<int> down_cols(size_t(n_experts), 0);
-    std::vector<size_t> down_off(size_t(n_experts), 0);
     std::vector<const void *> id_src;
     std::vector<size_t> id_off;
     std::vector<size_t> id_bytes;
@@ -669,8 +889,9 @@ bool expert_device_layer(void * raw, const ggml_tensor * activation, int32_t up_
         return false;
     }
     ggml_backend_synchronize(session->backend);
-    const auto compute_us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count();
+    compute_us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count();
     ggml_free(ctx);
+    }
 
     const auto t1 = std::chrono::steady_clock::now();
     std::vector<size_t> src_off;

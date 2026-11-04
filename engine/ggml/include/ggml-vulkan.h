@@ -39,6 +39,9 @@ GGML_BACKEND_API bool ggml_vk_scatter_slots(ggml_backend_buffer_t * dsts, int ns
 // Many small host ranges into one device buffer, one fence. False leaves the buffer unchanged.
 GGML_BACKEND_API bool ggml_vk_write_ranges(ggml_backend_buffer_t dst, const void ** srcs,
         const size_t * dst_offsets, const size_t * sizes, int n);
+// Zero [offset, offset+bytes) then, if n > 0, copy ranges from src. Compute queue, one fence.
+GGML_BACKEND_API bool ggml_vk_fill_and_copy(ggml_backend_buffer_t dst, size_t zero_off, size_t zero_bytes,
+        ggml_backend_buffer_t src, const size_t * src_offsets, const size_t * dst_offsets, const size_t * sizes, int n);
 
 // One graphics-queue copy into an exclusive device buffer, then one acquire on
 // the compute queue. The caller runs the shader only after this returns.

@@ -13834,6 +13834,64 @@ extern "C" bool ggml_vk_write_ranges(ggml_backend_buffer_t dst, const void ** sr
     return true;
 }
 
+extern "C" bool ggml_vk_fill_and_copy(ggml_backend_buffer_t dst, size_t zero_off, size_t zero_bytes,
+        ggml_backend_buffer_t src, const size_t * src_offsets, const size_t * dst_offsets, const size_t * sizes, int n) {
+    if (!dst || (zero_bytes == 0 && n <= 0)) { return n <= 0 && zero_bytes == 0; }
+    if (zero_bytes % 4 != 0) { return false; }
+    if (n > 0 && (!src || !src_offsets || !dst_offsets || !sizes)) { return false; }
+    auto * dst_ctx = static_cast<ggml_backend_vk_buffer_context *>(dst->context);
+    auto * src_ctx = n > 0 ? static_cast<ggml_backend_vk_buffer_context *>(src->context) : nullptr;
+    if (!dst_ctx || !dst_ctx->dev_buffer || (n > 0 && (!src_ctx || !src_ctx->dev_buffer || src_ctx->dev_buffer->device != dst_ctx->dev_buffer->device))) {
+        return false;
+    }
+    vk_device device = dst_ctx->dev_buffer->device;
+    std::vector<vk::BufferCopy> copies;
+    copies.reserve(size_t(std::max(n, 0)));
+    for (int i = 0; i < n; ++i) {
+        if (sizes[i] == 0) { return false; }
+        copies.push_back({ src_offsets[i], dst_offsets[i], sizes[i] });
+    }
+    std::lock_guard<std::recursive_mutex> guard(device->mutex);
+    vk::CommandPool pool;
+    vk::Fence fence;
+    try {
+        pool = device->device.createCommandPool({ vk::CommandPoolCreateFlagBits::eTransient, device->compute_queue.queue_family_index });
+        vk::CommandBuffer cmd = device->device.allocateCommandBuffers({ pool, vk::CommandBufferLevel::ePrimary, 1 })[0];
+        cmd.begin({ vk::CommandBufferUsageFlagBits::eOneTimeSubmit });
+        if (zero_bytes) {
+            cmd.fillBuffer(dst_ctx->dev_buffer->buffer, zero_off, zero_bytes, 0);
+        }
+        if (!copies.empty()) {
+            if (zero_bytes) {
+                vk::BufferMemoryBarrier between{ vk::AccessFlagBits::eTransferWrite, vk::AccessFlagBits::eTransferWrite,
+                        VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED, dst_ctx->dev_buffer->buffer, 0, VK_WHOLE_SIZE };
+                cmd.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer, vk::PipelineStageFlagBits::eTransfer,
+                        {}, nullptr, between, nullptr);
+            }
+            cmd.copyBuffer(src_ctx->dev_buffer->buffer, dst_ctx->dev_buffer->buffer, copies);
+        }
+        vk::BufferMemoryBarrier to_shader{ vk::AccessFlagBits::eTransferWrite, vk::AccessFlagBits::eShaderRead,
+                VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED, dst_ctx->dev_buffer->buffer, 0, VK_WHOLE_SIZE };
+        cmd.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer, vk::PipelineStageFlagBits::eComputeShader,
+                {}, nullptr, to_shader, nullptr);
+        cmd.end();
+        fence = device->device.createFence({});
+        {
+            std::lock_guard<std::mutex> guard_q(queue_mutex);
+            device->compute_queue.queue.submit(vk::SubmitInfo{ {}, {}, cmd }, fence);
+        }
+        (void) device->device.waitForFences(fence, VK_TRUE, UINT64_MAX);
+    } catch (const vk::SystemError & e) {
+        std::fprintf(stderr, "[kimi_vk_pack] failed: %s\n", e.what());
+        if (fence) { device->device.destroyFence(fence); }
+        if (pool) { device->device.destroyCommandPool(pool); }
+        return false;
+    }
+    device->device.destroyFence(fence);
+    device->device.destroyCommandPool(pool);
+    return true;
+}
+
 static bool upload_acquired_from(ggml_backend_vk_buffer_context * dst_ctx, vk_buffer src, const ggml_vk_copy_region * regions, int n) {
     vk_device device = dst_ctx->dev_buffer->device;
     const uint32_t transfer_family = device->transfer_queue.queue_family_index;

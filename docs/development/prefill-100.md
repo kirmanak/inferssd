@@ -470,3 +470,43 @@ The expert math is 33,000 tiny dispatches. They already beat the stock
 the experts: the next layer's attention needs this layer's sum. 1857 ms
 of GPU work is the floor under the current kernels. 500 ms is below it.
 The packing attempt is not in the tree.
+
+## Same shader, one dispatch per token-count bucket
+
+The 1032 ms was launch cost, not math. Experts with the same padded
+token count (8, 16, 32, 64, 128, 256, 512) share one ordinary `mul_mat`.
+That shader already takes the batch in `gl_WorkGroupID.z`. It is not
+`mul_mat_id`. A layer that does not fit, or has fewer than 32 experts,
+keeps the per-expert graph. Scatter still reads `down_off` / `down_cols`.
+
+Warm 500-token prompt, two processes, same binary:
+
+```text
+pass 2 wall=2.275s prompt_ms=2267.05 prompt_per_second=220.55
+pass 2 wall=2.263s prompt_ms=2254.98 prompt_per_second=221.73
+```
+
+Second run, 47 of 48 layers, no fallback. The 10-expert layer stayed on
+the host pack.
+
+| | time |
+| --- | --- |
+| scheduler, 100 splits | 2.213 s |
+| device compute / scatter / reduce | 0.833 / 0.153 / 0.068 s |
+| bucket pack / GEMM | 0.531 / 0.292 s |
+
+The first layer's pack is the cold host upload (984 misses, about 200 ms).
+Later layers copy from the ahead buffer. Greedy tokens, temperature 0,
+`n_predict` 24, second request: 24/24 match
+`22791 440 799 11316 421 4874 279 8981 3817 13 198 22791 440 799 11316 421 4874 279 7948 6297 13 198 22791 440`.
+`fallback_count=0`.
+
+`llama-completion -n 1024` does not log the bucket path (`ntokens` must
+be above 32):
+
+```text
+eval time = 79307.33 ms / 856 runs (92.65 ms per token, 10.79 tok/s)
+```
+
+Above the 10.68 baseline. 500 ms is still below this run. The scheduler
+outside the expert device timer is about 1.4 s.
