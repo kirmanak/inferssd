@@ -630,3 +630,36 @@ Both passes then stopped on EOS. The kept path's first token is
 `</think>`. A wider split, including N under a tile, did the same on
 the warm pass. The partial sums are a different float association, and
 this projection feeds the gated delta net. Not kept.
+
+## The copy is not fixed by a different staging type
+
+The per-weight upload is 37.72 GB in 1.89 s, 20 GB/s. Replacing it with
+one uncached staging copy per layer made the CPU write the slow part:
+
+```text
+pass 2 memcpy_s=6.357 copy_s=1.299 bytes=37.72 GB
+pass 2 prompt_ms=11365.74 prompt_per_second=43.99
+pass 1 stop_type=eos
+```
+
+5.9 GB/s into uncached memory. The DMA half was 29 GB/s. Not kept.
+
+Importing the weight pages so the GPU reads them directly also failed.
+None of the pointers are 4096-aligned (`0x8a0` into the page; the size
+is). Importing the containing page worked, and the copy did not:
+
+```text
+n=888 bytes=909312000 fresh=840 us=98934
+pass 1 prompt_ms=222481
+```
+
+That is 9 MB/s. Not kept.
+
+## 800 tok/s is still behind both floors
+
+625 ms is the target. The kept warm prompt is 2255 ms, 221.73 tok/s.
+The GPU queue on that path is 774 ms, which is already more than 625 ms,
+so a perfect overlapped copy cannot reach 800. The 120 ms 4-wide gemm
+is the only large inefficient dispatch, and speeding it changed the
+first token. The expert scale is the same bytes; fusing the dispatches
+did not shrink the queue. The kept result is unchanged.
