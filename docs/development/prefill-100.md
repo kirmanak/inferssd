@@ -572,3 +572,28 @@ vram used_max=15.82 GB free_min=1.27 GB
 
 33.93 GB is still over 31.5 GB, and 5047 ms is worse than 2254.98 ms.
 Not kept. The bus floor stands.
+
+## 800 tok/s is under the GPU queue time
+
+800 tok/s on this 500-token prompt is 625 ms. `GGML_VK_PERF_LOGGER=1`
+on the kept bucket path, warm pass, sums the GPU timestamps to 774 ms.
+The wall on that run was still 2255 ms; the logger did not change it.
+The 774 ms is the compute-queue busy time, one dispatch after another:
+
+| | GPU time |
+| --- | --- |
+| expert Q4_K / Q5_1 GEMMs | 291 ms |
+| dense matmul, all of it | about 250 ms |
+| expert scale glue (mul, repeat, add) | 133 ms |
+| gated delta net | 16 ms |
+| the rest | about 84 ms |
+| total | 774 ms |
+
+774 ms of queued GPU work cannot finish in 625 ms. Collapsing the
+per-weight upload into one staged copy was slower, not faster, and was
+not kept:
+
+```text
+pass 2 prompt_ms=5855.30 prompt_per_second=85.39
+ahead set_us sum=4.321 s for the same 37.72 GB
+```
