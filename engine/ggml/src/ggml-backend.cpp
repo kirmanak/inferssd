@@ -1736,6 +1736,7 @@ void ggml_backend_sched_kimi_copy_stats_get(ggml_backend_sched_t sched,
 
 static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t sched) {
     GGML_ASSERT(sched);
+    const int64_t sched_t0 = ggml_time_us();
     struct ggml_backend_sched_split * splits = sched->splits;
     // A previous input may already lend its graph allocation to the seed
     // stream when a later input fails. Fence before graph reset on every exit.
@@ -1938,6 +1939,8 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
     }
 
     seeds.active = false;
+    std::fprintf(stderr, "[kimi_sched] splits=%d us=%.0f\n", sched->n_splits,
+            (double) (ggml_time_us() - sched_t0));
     return GGML_STATUS_SUCCESS;
 }
 

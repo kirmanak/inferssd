@@ -24,6 +24,13 @@ static double elapsed_us(prefill_clock::time_point start) {
     return std::chrono::duration<double, std::micro>(prefill_clock::now() - start).count();
 }
 
+// Not inlined into the token sum, so the multiply is stored as a float and not
+// contracted into a later add. The loop itself can vectorize.
+__attribute__((noinline))
+static void scale_into(float * dst, const float * src, float weight, int n) {
+    for (int i = 0; i < n; ++i) { dst[i] = src[i] * weight; }
+}
+
 static void prefill_error(char * dst, size_t size, const char * message) {
     if (dst && size) { std::snprintf(dst, size, "%s", message); }
 }
@@ -513,6 +520,7 @@ struct kimi_cpu_prefill {
         float * up_out = self.batch_up.data();
         float * gate_out = self.batch_gate.data();
         float * down_out = self.batch_down.data();
+        const auto pack_started = prefill_clock::now();
         for (size_t slot = 0; slot < which.size(); ++slot) {
             const int i = which[slot];
             float * dst = inputs + in_at[slot];
@@ -522,6 +530,7 @@ struct kimi_cpu_prefill {
                 std::copy(src, src + self.latent, dst + size_t(column) * size_t(self.latent));
             }
         }
+        const double pack_us = elapsed_us(pack_started);
         std::vector<ggml_vk_expert_matmul> items(which.size() * 2);
         for (size_t slot = 0; slot < which.size(); ++slot) {
             const int i = which[slot];
@@ -545,6 +554,7 @@ struct kimi_cpu_prefill {
             std::fprintf(stderr, "[kimi_vulkan_resident] fallback up/gate %s\n", error[0] ? error : "matmul failed");
             return false;
         }
+        const auto swiglu_started = prefill_clock::now();
         for (size_t slot = 0; slot < which.size(); ++slot) {
             for (int column = 0; column < ntok[slot]; ++column) {
                 float * gate_col = gate_out + hid_at[slot] + size_t(column) * size_t(self.hidden);
@@ -552,6 +562,7 @@ struct kimi_cpu_prefill {
                 ggml_vec_swiglu_f32(self.hidden, gate_col, gate_col, up_col);
             }
         }
+        const double swiglu_us = elapsed_us(swiglu_started);
         items.resize(which.size());
         for (size_t slot = 0; slot < which.size(); ++slot) {
             const int i = which[slot];
@@ -573,6 +584,7 @@ struct kimi_cpu_prefill {
         }
         uint64_t routes = 0;
         uint64_t bytes = 0;
+        const auto scatter_started = prefill_clock::now();
         for (size_t slot = 0; slot < which.size(); ++slot) {
             const int i = which[slot];
             const auto & columns = self.groups[size_t(i)].columns;
@@ -584,24 +596,23 @@ struct kimi_cpu_prefill {
                 }
                 for (int route : columns[size_t(column)].slots) {
                     float * destination = self.routed_output.data() + size_t(route) * size_t(self.latent);
-                    for (int row = 0; row < self.latent; ++row) {
-                        volatile float scaled = values[row] * self.weights[route];
-                        destination[row] = scaled;
-                    }
+                    // Separate from the later token sum so the multiply is stored, not contracted into it.
+                    scale_into(destination, values, self.weights[route], self.latent);
                     ++routes;
                 }
             }
             self.consumed[size_t(i)] = 1;
             bytes += self.vulkan_triplet;
         }
+        const double scatter_us = elapsed_us(scatter_started);
         const double us = elapsed_us(started);
         for (size_t slot = 0; slot < which.size(); ++slot) {
             const int i = which[slot];
             kimi_cpu_sink_vulkan_result(self.sink, 1, self.groups[size_t(i)].expert, self.vulkan_triplet,
                     slot == 0 ? us : 0, slot == 0 ? routes : 0);
         }
-        std::fprintf(stderr, "[kimi_vulkan_resident] experts=%zu routes=%llu bytes=%llu us=%.1f\n",
-                which.size(), (unsigned long long) routes, (unsigned long long) bytes, us);
+        std::fprintf(stderr, "[kimi_vulkan_resident] experts=%zu routes=%llu bytes=%llu us=%.1f pack_us=%.0f swiglu_us=%.0f scatter_us=%.0f\n",
+                which.size(), (unsigned long long) routes, (unsigned long long) bytes, us, pack_us, swiglu_us, scatter_us);
         return true;
     }
 

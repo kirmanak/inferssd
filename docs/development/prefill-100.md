@@ -330,3 +330,61 @@ Continue with
 Top-5 sets move between processes even on the same binary (9 of 24
 tokens). They are not a stable numeric oracle here. The greedy tokens
 match, so the workspace reuse stays.
+
+## One batch, and a vector scale
+
+Two pieces were still on the clock after 4192 ms, and neither was the
+upload. The ahead copy is already hidden: join is 0.26 s against 2.0 s
+of background set.
+
+The server stopped a 500-token prompt four tokens early so it could
+checkpoint (`n_ctx_checkpoints` defaults to 32, offset 4). That second
+graph ran every expert layer again, about 0.22 s of expert time plus a
+second dense graph. The rest of the prompt fits in the 512 batch, so
+the split is skipped. A prompt that does not fit still stops for the
+checkpoint.
+
+The route scale was a scalar volatile store, 4960 routes by 2560
+floats, 48 layers. A noinline multiply-store vectorizes without folding
+the multiply into the later token sum. Scatter is 0.25 s.
+
+A one-fence upload of the activations, through a 2 MB or 32 MB staging
+buffer, was slower than the per-tensor set (0.65–0.75 s versus 0.50 s).
+Not wired in. An ahead upload that did not hold the device lock copied
+37.6 GB at 9.7 GB/s and fought the download. The GEMM stayed fine. The
+wall went to 4711 ms. Not wired in.
+
+Clean warm prompt, one batch, vector scale, per-tensor set:
+
+```text
+pass 2 wall=3.592s prompt_ms=3584.72 prompt_per_second=139.48
+```
+
+| | time |
+| --- | --- |
+| scheduler, 100 splits | 3.545 s |
+| expert callback | 2.055 s |
+| set / compute / get | 0.498 / 0.777 / 0.452 s |
+| pack | 0.334 s |
+| scatter | 0.251 s |
+| ahead join | 0.256 s |
+
+Greedy tokens, temperature 0, `n_predict` 24, second request, same
+continuation as the workspace-reuse check: 24/24 match
+`22791 440 799 11316 421 4874 279 8981 3817 13 198 22791 440 799 11316 421 4874 279 7948 6297 13 198 22791 440`.
+No expert fallback (`fallback_count=0`). `llama-completion -n 1024`
+on these libraries stopped at 817 runs:
+
+```text
+eval time = 75248.98 ms / 817 runs (92.10 ms per token, 10.86 tok/s)
+```
+
+Above the 10.68 baseline. The decode path does not take the prefill
+scatter or the server checkpoint split.
+
+200 tok/s is 2.5 s. What is left does not overlap. Dense graph, pack,
+activation set, GEMM, download, and scatter are a chain: each needs the
+previous result. They sum to the wall. Hiding another copy does not
+remove a link. The next cut has to keep the expert activations on the
+GPU, so the pack, the activation upload, the download, and the scatter
+are not on the chain.

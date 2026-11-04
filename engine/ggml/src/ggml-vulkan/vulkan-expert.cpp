@@ -247,6 +247,7 @@ constexpr int k_batch_experts = 512;
 
 bool expert_batch_chunk(expert_session * session, const ggml_vk_expert_matmul * items, int begin, int count,
         char * error, size_t error_size) {
+    const auto t_enter = std::chrono::steady_clock::now();
     if (count <= 0) { return true; }
     const int graph_nodes = count * 8 + 64;
     const size_t mem = ggml_tensor_overhead() * size_t(count) * 4 + ggml_graph_overhead_custom(graph_nodes, false) + 65536;
@@ -359,6 +360,7 @@ bool expert_batch_chunk(expert_session * session, const ggml_vk_expert_matmul * 
     }
     for (int i = 0; i < count; ++i) { ggml_build_forward_expand(graph, built[size_t(i)].output); }
     const auto t0 = std::chrono::steady_clock::now();
+    const auto build_us = std::chrono::duration<double, std::micro>(t0 - t_enter).count();
     for (int i = 0; i < count; ++i) {
         const auto & item = items[begin + i];
         if (ahead_off[size_t(i)] == SIZE_MAX) {
@@ -396,8 +398,8 @@ bool expert_batch_chunk(expert_session * session, const ggml_vk_expert_matmul * 
     }
     const auto get_us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t1).count();
     if (count >= 64) {
-        std::fprintf(stderr, "[kimi_vulkan_batch] n=%d set_us=%.0f compute_us=%.0f get_us=%.0f\n",
-                count, set_us, compute_us, get_us);
+        std::fprintf(stderr, "[kimi_vulkan_batch] n=%d build_us=%.0f set_us=%.0f compute_us=%.0f get_us=%.0f\n",
+                count, build_us, set_us, compute_us, get_us);
     }
     ggml_free(ctx);
     return true;

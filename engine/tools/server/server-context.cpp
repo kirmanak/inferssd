@@ -3127,7 +3127,12 @@ private:
                         //  - 4 + n_ubatch
                         //  - 4
                         // ref: https://github.com/ggml-org/llama.cpp/pull/20288
-                        if (do_checkpoint) {
+                        // A second batch re-runs every streamed expert. If the rest of the prompt fits in this
+                        // batch, keep it here. The checkpoint is the one taken after the batch, not a reason
+                        // to split a prompt that already fits.
+                        const int room = n_batch - batch.n_tokens;
+                        const int remaining = slot.task->n_tokens() - slot.prompt.n_tokens();
+                        if (do_checkpoint && remaining > room) {
                             static const int checkpoint_offsets[] = {4 + n_ubatch, 4};
 
                             bool should_break = false;
