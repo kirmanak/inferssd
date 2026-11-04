@@ -1057,3 +1057,24 @@ device memory. Still EOS, still over 1250. Not the proven path. Not kept.
 
 A correct restore of 1566.917 ms plus removing the whole 103 ms inject
 matmul would still leave the warm prompt over 1250.
+
+## The small-M inject kernel ran, and the token moved
+
+The 40 GFLOPS matmul is `blk.*.hc_attn_inject` / `hc_ffn_inject`, f32
+`[10240, 4]` by 500 tokens. A column-per-workgroup kernel was given the
+real row strides, so the contiguous check that skipped it last time no
+longer applied. It dispatched:
+
+```text
+[kimi_vk_small_m] run m=4 n=500 k=10240 name=blk.0.hc_attn_inject.weight
+[kimi_vk_small_m] run m=4 n=500 k=10240 name=blk.0.hc_ffn_inject.weight
+```
+
+The warm prompt got slower, and the first token became EOS.
+
+```text
+pass 2 prompt_ms=2150.989 stop=eos content=
+```
+
+The reduction order is not the tiled shader's. Not 1250, and not
+`</think>`. Not kept.
