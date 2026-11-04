@@ -1002,3 +1002,35 @@ pass 2 prompt_ms=2616.825 content=</think> arm=46 hit=0
 
 A perfect hide of the 151 ms copy would still leave the warm prompt over
 1250. Not kept.
+
+## Attention and the expert GEMM are too small to close 1250
+
+High memory clocks, warm prompt, Vulkan op timestamps. The token is
+still `</think>`. The logger adds queries, so the wall clock is not a
+keep number.
+
+```text
+pass 2 prompt_ms=2082.996 content=</think>
+timestamped GPU ops = 645 ms
+```
+
+The attention drain is not the recurrent kernel. Gated delta net is
+12 ms and flash attention is 2 ms. The slow attention-path op is a
+4-row f32 matmul, 40 GFLOPS:
+
+```text
+MUL_MAT f32 m=4 n=500 k=10240   40–103 ms
+MUL_MAT q8_0 projections         99 ms
+GATED_DELTA_NET                   12 ms
+FLASH_ATTN_EXT                     2 ms
+```
+
+The expert GEMM is the q4_K matmul, about 80–160 ms at 4.5 TFLOPS
+(`m=640 n=8 k=2560 batch=136`, 4463 GFLOPS/s). That is already in the
+range this card delivers for quantized tiles. Halving it is the
+ceiling, not 800 ms.
+
+Those two chunks together are a few hundred milliseconds. The other
+~1400 ms is the host copies and the syncs that the overlap attempts
+already failed to hide. No cut of the attention drain or the expert
+GEMM can bring 2083 ms to 1250. Not kept.
