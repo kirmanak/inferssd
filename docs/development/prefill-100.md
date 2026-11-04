@@ -510,3 +510,34 @@ eval time = 79307.33 ms / 856 runs (92.65 ms per token, 10.79 tok/s)
 
 Above the 10.68 baseline. 500 ms is still below this run. The scheduler
 outside the expert device timer is about 1.4 s.
+
+## 1000 tok/s is under the PCIe transfer
+
+The warm prompt still copies the routed expert weights to the GPU. The
+ahead thread's own log, pass 2:
+
+```text
+47 uploads, 37719859200 bytes, set_us=1886633
+```
+
+That is 37.72 GB in 1.887 s, 20.0 GB/s, mostly overlapped with the
+compute. The join on that thread is 0.333 s. The wall is 2.255 s, so
+the compute pipeline is still a little longer than the copy. Cutting
+more kernel time cannot land under the copy.
+
+The card is PCIe 5.0 x16 (`current_link_speed` 32.0 GT/s, width 16,
+Navi 48). The encoding limit is
+
+```text
+32e9 * 16 * (128/130) / 8 = 63.015 GB/s
+37719859200 / 63.015e9 = 598 ms
+```
+
+500 ms on this prompt is 75.4 GB/s. That is above the encoding limit,
+before TLP overhead and before the GEMM. VRAM is 16 GB
+(`mem_info_vram_total` 17095983104 on card1). The working set does not
+fit, so the warm pass cannot skip the copy. A CPU GEMM would read the
+same bytes from RAM instead, and still has to do the math.
+
+1000 tok/s is not available on this link. The kept result is 221-222
+tok/s.
