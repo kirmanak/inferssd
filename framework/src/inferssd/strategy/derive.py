@@ -20,7 +20,7 @@ from typing import Optional, cast
 
 from inferssd.configuration.settings import PLATFORMS, Setting, Snapshot, parse, render, uncomment
 from inferssd.launch.types import Threads
-from inferssd.machine.characteristics import Characteristics, ComputeRow, dumps
+from inferssd.machine.characteristics import GPU, Characteristics, ComputeRow, dumps
 from inferssd.strategy.inputs import ModelFacts, RuntimeFacts
 
 # The engine's GB/s cost terms are 1e9 bytes per second: it prices a copy or a
@@ -91,6 +91,17 @@ def literal(item: Setting, platform: str) -> str:
     """ITEM's value as render() writes it, without key or receipt."""
     body, _ = uncomment(render(Snapshot((item,), platform)).split("\n")[1])
     return body.partition("=")[2].strip(" \t\r\n")
+
+
+def engine_gpu_backends(
+    known: Optional[Sequence[str]], characteristics: Optional[Characteristics]
+) -> frozenset[str]:
+    """The launch engine's GPU backends: KNOWN, else those of the machine's GPUs, else none."""
+    if known is not None:
+        return frozenset(known)
+    if characteristics is None:
+        return frozenset()
+    return frozenset(gpu["backend"] for gpu in characteristics["identity"]["hard"]["gpus"])
 
 
 def _validated(choices: Mapping[str, tuple[str, str]], platform: str) -> dict[str, Choice]:
@@ -370,8 +381,8 @@ def drive_rate(
     """The model drive's read rate in GB/s for the requests the engine issues.
 
     The engine reads each role of an expert as its own request, so the size
-    looked up is the largest expert's mean role read; the nearest measured size
-    is taken on a log scale. The engine keeps up to IN_FLIGHT of those reads
+    looked up is a third of the mean expert read; the nearest measured size is
+    taken on a log scale. The engine keeps up to IN_FLIGHT of those reads
     queued, so the rate is the best median between the size's knee and that
     depth (or the reader's own cap).
     """
@@ -381,7 +392,7 @@ def drive_rate(
     if entry is None:
         return None, f"no measurement of the drive {key}; run inferssd profile --model <model>"
     name = key if entry["model"] == "unknown" else entry["model"]
-    request = model.expert_read_bytes / 3
+    request = model.mean_expert_read_bytes / 3
     knee = min(entry["knee"], key=lambda row: (abs(math.log(row["bytes"] / request)), row["bytes"]))
     deepest = min(IN_FLIGHT, entry["qd_cap"] or IN_FLIGHT)
     points = [
@@ -438,44 +449,45 @@ def link_rates(
 def prefill_split(
     model: ModelFacts, line: tuple[float, float], drive_gbps: float, io_gbps: float
 ) -> tuple[Optional[int], str]:
-    """The longest prompt pass the CPU prefills no slower than the GPU graph, and why.
+    """The longest prompt pass the CPU prefills faster than the GPU graph, and why.
 
     A pass of n tokens touches U(n) = E (1 - (1 - k/E)^n) of a layer's E
     experts when each token routes to k of them uniformly. The CPU route reads
     those experts from the drive while it computes them, n k routes a layer on
     the CPU line, so it takes the longer of the two; the graph reads the same
     experts into the GPU at the slower of the drive and the link, and its
-    compute is taken as free. The CPU is faster for short passes, while U(n)
-    still grows with n, and slower past the crossing. None when the GPU never
-    wins within MAX_PASS tokens.
+    compute is taken as free. Only a link slower than the drive leaves the CPU
+    faster, for short passes while U(n) still grows with n, and slower past the
+    crossing. A tie goes to the graph: it leaves those experts in the VRAM tier,
+    which decode reads next. None when the GPU never wins within MAX_PASS tokens.
     """
     k = model.experts_used
-    E, L, B = model.experts, model.layers, model.expert_read_bytes
+    E, L, B = model.experts, model.layers, model.mean_expert_read_bytes
     fixed, route = line
     if not k:
         return None, "the GGUF header gives no experts per token"
 
-    def cpu_no_slower(n: int) -> bool:
+    def cpu_faster(n: int) -> bool:
         touched = L * E * (1 - (1 - k / E) ** n)
         read = touched * B / (drive_gbps * GB)
         cpu = (touched * fixed + n * k * L * route) * 1e-6
-        return max(read, cpu) <= touched * B / (io_gbps * GB)
+        return max(read, cpu) < touched * B / (io_gbps * GB)
 
     why = (
         f"{L} layers of {E} experts, {k} a token, {size(B)} read an expert; CPU {fixed:.1f} + "
         f"{route:.2f} us a route reading {drive_gbps:.2f} GB/s, "
         f"GPU graph reading {io_gbps:.2f} GB/s"
     )
-    if not cpu_no_slower(1):
+    if not cpu_faster(1):
         return 0, why
     lo, hi = 1, 2
-    while cpu_no_slower(hi):
+    while cpu_faster(hi):
         lo, hi = hi, hi * 2
         if hi > MAX_PASS:
-            return None, why + f": the CPU is no slower up to {MAX_PASS} tokens"
+            return None, why + f": the CPU is faster up to {MAX_PASS} tokens"
     while hi - lo > 1:
         mid = (lo + hi) // 2
-        if cpu_no_slower(mid):
+        if cpu_faster(mid):
             lo = mid
         else:
             hi = mid
@@ -487,6 +499,35 @@ def _costs(terms: Mapping[str, float], reasons: Sequence[str]) -> Optional[tuple
         return None
     value = ",".join(f"{term}={number:.17g}" for term, number in sorted(terms.items()))
     return value, "; ".join(reasons)
+
+
+def single_gpu(characteristics: Characteristics, runtime: RuntimeFacts) -> Optional[GPU]:
+    """The profiled GPU when it is the one CUDA GPU the launch can use."""
+    return next(
+        (
+            row
+            for row in characteristics["gpus"]
+            if runtime.gpus and len(runtime.gpus) == 1 and row["uuid"] == runtime.gpus[0].uuid
+        ),
+        None,
+    )
+
+
+def host_headroom_mib(
+    characteristics: Characteristics, runtime: RuntimeFacts, platform: str
+) -> Optional[int]:
+    """The host margin a launch sets as host.headroom_mib, or None to keep the engine's own.
+
+    On macOS it is a quarter of memory; on Linux with one usable GPU that shares host memory,
+    UNIFIED_HEADROOM_MIB.
+    """
+    if platform == "darwin":
+        return characteristics["memory"]["total_bytes"] // DARWIN_HEADROOM_SHARE >> 20
+    if platform == "linux":
+        device = single_gpu(characteristics, runtime)
+        if device is not None and device["integrated"]:
+            return UNIFIED_HEADROOM_MIB
+    return None
 
 
 def derive(
@@ -539,7 +580,9 @@ def derive(
 
     one_pass = False
     mixed = [role for role in model.roles if len(role.formats) > 1]
-    if platform == "linux":
+    # The CUDA tier's budget, where the engine has the tier. A GPU lane (Vulkan, Metal) takes
+    # the default.
+    if "CUDA" in engine_gpu_backends(runtime.gpu_backends, characteristics):
         listed = {
             gpu["uuid"]
             for gpu in characteristics["identity"]["hard"]["gpus"]
@@ -578,15 +621,9 @@ def derive(
                 why = ", ".join(busy) + f"; {SHARED_GPU_RESERVE_MIB} MiB stays free for them"
                 choices["vram.reserve_mib"] = (str(SHARED_GPU_RESERVE_MIB), why)
                 notes.append("vram.reserve_mib: " + why)
-        device = next(
-            (
-                row
-                for row in characteristics["gpus"]
-                if runtime.gpus and len(runtime.gpus) == 1 and row["uuid"] == runtime.gpus[0].uuid
-            ),
-            None,
-        )
-        if device is not None and device["integrated"]:
+        device = single_gpu(characteristics, runtime)
+        if host_headroom_mib(characteristics, runtime, platform) == UNIFIED_HEADROOM_MIB:
+            assert device is not None
             choices["host.headroom_mib"] = (
                 str(UNIFIED_HEADROOM_MIB),
                 f"{device['name']} shares host memory: the smallest host margin that held under "
@@ -613,7 +650,7 @@ def derive(
             else:
                 choices["prefill.cpu_max_tokens"] = (
                     str(split),
-                    f"the longest pass the CPU prefills no slower than the GPU graph: {why}",
+                    f"the longest pass the CPU prefills faster than the GPU graph: {why}",
                 )
                 notes.append(f"prefill.cpu_max_tokens: {split}; {why}")
             one_pass = True
@@ -622,7 +659,7 @@ def derive(
                 "every expert it routes to once"
             )
     if platform == "darwin":
-        mib = characteristics["memory"]["total_bytes"] // DARWIN_HEADROOM_SHARE >> 20
+        mib = cast(int, host_headroom_mib(characteristics, runtime, platform))
         choices["host.headroom_mib"] = (
             str(mib),
             f"a quarter of the {size(characteristics['memory']['total_bytes'])} of memory: macOS "

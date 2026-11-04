@@ -253,9 +253,14 @@ struct sink_phase {
     uint32_t call() const { return uint32_t(word >> 51 & 0xfffu); }
 };
 
-// The waits at a node's boundaries, for the open at its start and for the close after the run's last phase, spin
-// briefly before they park; 20 us measured best on macOS and Windows, where longer spins slowed the runs.
+// The waits at a node's boundaries, for the open at its start and for the close after the run's last phase, spin at
+// least this long before they park.
 constexpr int sink_node_spin_us = 20;
+// How long a participant of a production sink polls for the next phase before it parks. The gaps between phases are
+// a read or a GPU wait of a few milliseconds, and each park costs a wakeup the next phase waits for on every thread:
+// on 60 threads of a KVM guest that took decode from 152 to 272 ms a token, where 1 ms already reaches the plateau
+// and 10 ms gains nothing. Other machines gain a little more from 3 ms than from 1.
+constexpr int sink_production_poll_us = 3000;
 
 // The CPUs this process may run on; 1 when they cannot be read.
 static int sink_process_cpus() {
@@ -301,9 +306,9 @@ static void sink_copy_services(sink_configuration & value, const ssd::runtime_se
     }
     if (services->gpu) {
         const auto * gpu = services->gpu;
-        if (gpu->version != 1 || gpu->size != sizeof(*gpu) || !gpu->api || !gpu->residency ||
-                !gpu->location || !gpu->format || !gpu->prefill || !gpu->elastic || !gpu->deferred ||
-                !gpu->host || !gpu->policy || !gpu->settings || !gpu->testing || !gpu->transport || !gpu->stream ||
+        // The tables a tier needs are checked when it starts (sink_vram::initialize): a tier with no residency
+        // serves grouped prefill alone and has fewer of them.
+        if (gpu->version != 1 || gpu->size != sizeof(*gpu) || !gpu->api || !gpu->prefill || !gpu->settings || !gpu->stream ||
                 !gpu->device_is_unified || !gpu->device_ordinal || !gpu->attach_services || services->gpu_device < 0) {
             throw std::runtime_error("GPU provider ABI missing or incompatible");
         }
@@ -596,6 +601,21 @@ struct kimi_cpu_sink {
     bool margin_boundary = false; // the last token boundary the margin saw was a decode token
     uint64_t margin_epoch = 0, margin_token = 0;
 
+    // A resolved source carries its file's identity. One layer resolves dozens of roles and reading the identity takes
+    // system calls, enough on Windows to show in a token's time. So it is read once per descriptor and logical token.
+    // kimi_cpu_sink_cache_begin forgets it, which still catches a source replaced between tokens, at the same descriptor
+    // too. run_mutex guards the list: every caller of resolve and kimi_cpu_sink_cache_begin holds it.
+    std::vector<std::pair<int, ssd::platform::file_identity>> file_identities;
+    bool resolve(const char * tensor, int32_t expert, kimi_cpu_sink_source * source) {
+        if (!resolver(userdata, tensor, expert, source)) { return false; }
+        for (const auto & known : file_identities) {
+            if (known.first == source->fd_direct) { source->file = known.second; return true; }
+        }
+        if (!ssd::platform::identity(source->fd_direct, source->file)) { return false; }
+        file_identities.emplace_back(source->fd_direct, source->file);
+        return true;
+    }
+
     // Next-layer expert prefetch (typed prefetch.depth). The graph applies the next
     // layer's router to this layer's expert input and hands its experts over as a hint, best first; the first k
     // that are neither cached nor held by the GPU tier now (its residency ABI) are read into RAM cache slots of the
@@ -815,7 +835,7 @@ struct kimi_cpu_sink {
         vulkan_api = configuration.vulkan_api;
         vulkan_backend = configuration.vulkan_backend;
         vulkan_budget = configuration.vulkan_budget;
-        if (poll_us < 0 || poll_us > 1000 || dynamic_chunk_rows < 16 || dynamic_chunk_rows > 16384 || dynamic_chunk_rows % 16 ||
+        if (poll_us < 0 || poll_us > 10000 || dynamic_chunk_rows < 16 || dynamic_chunk_rows > 16384 || dynamic_chunk_rows % 16 ||
                 configuration.policy.decode_participants < 0 || configuration.policy.decode_participants > sink_max_participants) {
             throw std::runtime_error("invalid explicit executor schedule");
         }
@@ -900,7 +920,7 @@ struct kimi_cpu_sink {
     // arbiter admits at the full watermark boost, so the cache gives back until the room fits as measured there.
     ssd::host::actions reclaimer() {
         ssd::host::actions out;
-        out.collect_deferred = [this] { quiescent([this] { vram.collect_deferred(cache, -1); return true; }); };
+        out.collect_deferred = [this] { quiescent([this] { vram.collect_deferred(cache, KIMI_VRAM_COLLECT_IF_IDLE); return true; }); };
         out.reclaim_tier = [this](uint64_t bytes) { return quiescent([&] { return vram.reclaim_host(bytes); }); };
         out.reclaim_cache = [this](uint64_t bytes) {
             return quiescent([&] { return cache.arena && cache.reclaim_for_guard(bytes, "host_room", true); });
@@ -1277,7 +1297,7 @@ struct kimi_cpu_sink {
             job->layer = layer + 1; job->expert = expert; job->rank = i;
             bool resolved = true;
             for (int role = 0; role < 3 && resolved; ++role) {
-                resolved = resolver(userdata, names[role], expert, &job->role[role]) &&
+                resolved = resolve(names[role], expert, &job->role[role]) &&
                     job->role[role].offset % 4096 == 0 && job->role[role].nbytes % 4096 == 0;
             }
             if (!resolved) { ++prefetch.unresolved; continue; }
@@ -1730,7 +1750,7 @@ struct kimi_cpu_sink {
         if (vram.context && vram.host_api) { vram.host_api->costs2(vram.context, &c); }
         const ssd::place::lane_measurement measured = {
             c.resident_call_us, c.resident_expert_us, c.host_call_us, c.host_expert_us,
-            c.vector_tokens, c.copy_us_per_mb, c.pageable_us_per_mb, c.link_busy_us, c.in_place != 0 };
+            c.vector_tokens, c.copy_us_per_mb, c.pageable_us_per_mb, c.link_busy_us, c.in_place != 0, c.in_place_only != 0 };
         return ssd::place::make_table(vram.cost, vram.prior, learning, vram.learning, measured,
             vram.lane_geometry(), ntokens, route_bytes);
     }
@@ -1857,7 +1877,7 @@ struct kimi_cpu_sink {
                 !vram.prefill_api->transient_available(vram.context) || slots.empty()) { return; }
         kimi_vram_host_costs c = {};
         vram.host_api->costs2(vram.context, &c);
-        if (c.in_place) { return; }  // the GPU reads the ring in place: nothing to page-lock
+        if (c.in_place && !c.in_place_only) { return; }  // the GPU reads the ring in place: nothing to page-lock
         if (!ring_pages.lock_pages) {
             ring_pages.lock_pages = [this](const void * p, size_t bytes, std::string * why) { return vram.register_host(p, bytes, why); };
             ring_pages.unlock_pages = [this](const void * p) { return vram.unregister_host(p); };
@@ -2604,7 +2624,7 @@ struct kimi_cpu_sink {
             request.cache_only = cache_only && cache_only[slot];
             for (int role = 0; role < 3; ++role) {
                 auto & source = request.role[role];
-                if (!resolver(userdata, tensors[role]->name, ids[slot], &source)) {
+                if (!resolve(tensors[role]->name, ids[slot], &source)) {
                     throw std::runtime_error("CPU sink pack resolver failed for " + std::string(tensors[role]->name));
                 }
                 const size_t bytes = ggml_row_size(tensors[role]->type, tensors[role]->ne[0]) * tensors[role]->ne[1];
@@ -3615,6 +3635,7 @@ sink_configuration configured(const settings::snapshot * input, const runtime_se
     if (!input) { throw std::runtime_error("missing typed SSD settings"); }
     sink_configuration out;
     out.production = true;
+    out.policy.poll_us = sink_production_poll_us;
     if (!services || !services->host) { throw std::runtime_error("missing process host budget client"); }
     out.settings = *input;
     sink_copy_services(out, services);
@@ -3636,6 +3657,15 @@ sink_configuration configured(const settings::snapshot * input, const runtime_se
     if (out.vulkan_api && !out.has_gpu) {
         out.vulkan_budget = sink_vulkan_budget(out.settings.vram_budget(), out.vulkan_free_bytes);
     }
+    // A setting of a GPU backend's expert tier would do nothing without the tier: one set explicitly is refused.
+    const bool tier = out.has_gpu && out.gpu.residency;
+    for (const auto & d : settings::registry()) {
+        const auto * value = out.settings.find(d.key);
+        if (*d.backend && !tier && value && value->origin != "default") {
+            throw std::runtime_error(std::string(d.key) + " (" + value->location + ") configures the " + d.backend +
+                                     " expert tier, which this engine runs without");
+        }
+    }
     auto & p = out.policy;
     p.ready_first = p.early_up_gate = p.role_major = p.nonblocking_down_sched = p.dynamic_rows = true;
     p.dynamic_chunk_rows = 64;
@@ -3656,7 +3686,7 @@ kimi_cpu_sink * create_configured(const settings::snapshot * input, const runtim
     try {
         const auto value = configured(input, services);
         if (!resolver) { throw std::runtime_error("missing SSD expert resolver"); }
-        return new kimi_cpu_sink(8, resolver, userdata, value);
+        return new kimi_cpu_sink(ssd::io::expert_ring_depth, resolver, userdata, value);
     } catch (const std::exception & e) {
         sink_error(error, error_size, e.what());
         return nullptr;
@@ -3729,6 +3759,7 @@ extern "C" bool kimi_cpu_sink_cache_begin(struct kimi_cpu_sink * sink, uint64_t 
     try {
         sink->end_margin_interval(decode, epoch, token);
         sink->refresh_floor(decode ? "decode" : "prefill");
+        sink->file_identities.clear();
         sink->vram.begin(epoch, token, decode, sink->cache);
         sink->cache.begin(epoch, token, decode);
         sink->begin_margin_interval(decode);
@@ -3857,17 +3888,24 @@ result<host::allocation_ticket> take_room_configured(kimi_cpu_sink * sink, const
         if (!refresh) { return {{}, refresh.code, refresh.error}; }
         return value.host->take(host_bytes, device_bytes);
     } catch (const std::bad_alloc &) { return sink_host_failure(status::resource, "host admission allocation failed"); }
-      catch (const std::exception &) { return sink_host_failure(status::io, "host admission failed"); }
+      catch (const std::exception & e) {
+          // A refused setting is thrown from configured(): its text is the reason.
+          try { return sink_host_failure(status::io, (std::string("host admission failed: ") + e.what()).c_str()); }
+          catch (...) { return sink_host_failure(status::io, "host admission failed"); }
+      }
       catch (...) { return sink_host_failure(status::io, "host admission failed"); }
 }
 bool cache_make_room_configured(kimi_cpu_sink * sink, const settings::snapshot * input,
         const runtime_services * services, uint64_t host_bytes, uint64_t device_bytes) noexcept {
     auto ticket = take_room_configured(sink, input, services, host_bytes, device_bytes, UINT64_MAX);
+    // The caller sees only false: name why, a refused setting included.
+    if (!ticket) { std::fprintf(stderr, "[kimi_cpu_sink_cache] make_room failed: %s\n", ticket.error.c_str()); }
     return bool(ticket); // Compatibility observation only: destructor cancels the unmaterialized ticket.
 }
 bool cache_prefill_room_configured(kimi_cpu_sink * sink, const settings::snapshot * input,
         const runtime_services * services, uint64_t pages, uint64_t host_bytes, uint64_t device_bytes) noexcept {
     auto ticket = take_room_configured(sink, input, services, host_bytes, device_bytes, pages);
+    if (!ticket) { std::fprintf(stderr, "[kimi_cpu_sink_cache] prefill_room failed: %s\n", ticket.error.c_str()); }
     return bool(ticket); // Production allocations use take_room_configured and retain the ticket.
 }
 }  // namespace cpu

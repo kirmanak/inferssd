@@ -177,11 +177,8 @@ void llama_ssd_context::bind_cpu(ggml_backend_t backend) {
 void llama_ssd_context::attach_backend(ggml_backend_t backend) {
     if (!sources.resolve) { return; }
     const auto registry = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend));
-    const auto get = reinterpret_cast<ssd::gpu::get_provider_v1>(
-        ggml_backend_reg_get_proc_address(registry, "ggml_backend_cuda_ssd_api_v1"));
-    // A backend without the CUDA provider still runs dense layers. Vulkan can
-    // compute the prompt experts that fit; every other expert stays on the CPU sink.
-    if (!get) {
+    // Discrete Vulkan has no shared-memory lane. Prompt experts still run there.
+    auto attach_discrete = [&]() {
         if (services.vulkan_experts) { return; }
         const auto vk_get = reinterpret_cast<ggml_vk_expert_api_getter>(
             ggml_backend_reg_get_proc_address(registry, "ggml_backend_vk_expert_api_v1"));
@@ -195,33 +192,46 @@ void llama_ssd_context::attach_backend(ggml_backend_t backend) {
         services.vulkan_experts = api;
         services.vulkan_backend = backend;
         services.vulkan_free_bytes = props.memory_free;
+    };
+    const auto get = reinterpret_cast<ssd::gpu::get_provider_v1>(
+        ggml_backend_reg_get_proc_address(registry, "ggml_backend_ssd_provider_v1"));
+    // A backend without the provider (the CPU) has no GPU tier.
+    if (!get) {
+        attach_discrete();
         return;
     }
-    if (gpu_transport) { throw std::runtime_error("one configured CUDA executor per context is supported"); }
+    if (services.gpu) { throw std::runtime_error("one GPU expert executor per context is supported"); }
     const auto * provider = get();
     if (!provider || provider->version != 1 || provider->size != sizeof(*provider) ||
             !provider->device_is_unified || !provider->device_ordinal || !provider->attach_services || !provider->stream) {
-        throw std::runtime_error("CUDA backend has no compatible SSD provider table");
+        throw std::runtime_error("GPU backend has no compatible SSD provider table");
     }
     const auto * transport = provider->transport;
-    if (!transport || transport->version != 1 || transport->size != sizeof(*transport) ||
+    if (transport && (transport->version != 1 || transport->size != sizeof(*transport) ||
             transport->runtime_services_size != sizeof(services) || !transport->create ||
             !transport->quiesce || !transport->destroy || !transport->copy_ranges ||
             !transport->dense_has || !transport->dense_prepare || !transport->dense_read_ahead ||
             !transport->dense_copy || !transport->seed_register || !transport->seed_unregister ||
-            !transport->seed_offer || !transport->seed_fence) {
-        throw std::runtime_error("CUDA backend has no compatible context transport table");
+            !transport->seed_offer || !transport->seed_fence)) {
+        throw std::runtime_error("GPU backend has no compatible context transport table");
     }
     const int device = provider->device_ordinal(backend);
-    if (device < 0 || !services.cpu) { throw std::runtime_error("CUDA SSD device/CPU services are unavailable"); }
+    // The graph lane needs host memory it can read. A discrete card keeps its own expert path.
+    if (device < 0 && !transport) {
+        attach_discrete();
+        return;
+    }
+    if (device < 0 || !services.cpu) { throw std::runtime_error("SSD GPU device/CPU services are unavailable"); }
     services.gpu = provider;
     services.gpu_device = device;
     char error[512] {};
-    gpu_transport = std::unique_ptr<void, llama_ssd_source_delete>(
-        transport->create(&services, device, error, sizeof(error)),
-        llama_ssd_source_delete{transport->destroy});
-    if (!gpu_transport) { throw std::runtime_error(error[0] ? error : "cannot create context GPU transport"); }
-    services.gpu_transport = gpu_transport.get();
+    if (transport) {
+        gpu_transport = std::unique_ptr<void, llama_ssd_source_delete>(
+            transport->create(&services, device, error, sizeof(error)),
+            llama_ssd_source_delete{transport->destroy});
+        if (!gpu_transport) { throw std::runtime_error(error[0] ? error : "cannot create context GPU transport"); }
+        services.gpu_transport = gpu_transport.get();
+    }
     if (!provider->attach_services(backend, &services, error, sizeof(error))) {
         throw std::runtime_error(error[0] ? error : "cannot attach context GPU transport");
     }

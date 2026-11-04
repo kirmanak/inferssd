@@ -264,14 +264,21 @@ struct kimi_vram_prefill_api {
 // with ASYNC_UPLOAD=1). admit replaces ABI 2 admit for a borrowed RAM source, but the upload may outlive finish:
 // when *queued is 1 the caller keeps that source unchanged and leased until collect returns the request, and the
 // reserved GPU slot is never evicted meanwhile. collect runs outside prepare..finish and without a live residency
-// lease. It waits for the in-flight uploads of wait_layer (>= 0) or of every layer (-1; -2 waits for none), then
-// publishes completed uploads and copies their keys into completed (at most capacity; call again while
+// lease, except with KIMI_VRAM_COLLECT_IF_IDLE. It waits for the in-flight uploads of wait_layer (>= 0) or as named
+// below, then publishes completed uploads and copies their keys into completed (at most capacity; call again while
 // count == capacity). aborted[i] is 1 when that upload's slot went with a block the tier gave back (an OOM or host
 // reclaim, which waits for the copy first): nothing was published, but its RAM source is free again like the others.
 // wait blocks, in any phase, until no upload is in flight, without publishing; call it before the RAM owner unmaps
 // a source. begin for prefill, release, cancel and destroy wait as well.
+enum {
+    KIMI_VRAM_COLLECT_ALL = -1,     // wait for the uploads of every layer
+    KIMI_VRAM_COLLECT_NONE = -2,    // wait for none
+    // Wait for none, and inside a layer or a residency lease collect nothing and succeed, where the others fail: a
+    // host reclaimer may run at any point of a run.
+    KIMI_VRAM_COLLECT_IF_IDLE = -3,
+};
 struct kimi_vram_deferred_api {
-    uint32_t version, size;   // 2
+    uint32_t version, size;   // 3
     int (*admit)(void * context, const struct kimi_vram_request * request, const void * up, const void * gate,
                  const void * down, int * queued, char * error, size_t error_size);
     int (*collect)(void * context, int32_t wait_layer, struct kimi_vram_request * completed, int32_t * aborted,
@@ -332,6 +339,8 @@ struct kimi_vram_host_costs {
                                                   // measured): admissions, the start-up probe, prefill transients
     int32_t vector_tokens;                        // grouped prefill passes of at most this many tokens run the vector
                                                   // engine (one call of the layer's residents a token), as decode does
+    int32_t in_place_only;                        // in place and nothing else: no device memory to compare with, and
+                                                  // the device must be shown the read ring first (register_host)
 };
 struct kimi_vram_host_api {
     uint32_t version, size;   // 3

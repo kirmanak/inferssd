@@ -84,6 +84,22 @@ class ModelFacts:
         return self.gate, self.up, self.down
 
     @property
+    def routed_bytes(self) -> int:
+        """Every routed expert's bytes, of every type."""
+        return sum(size for _, size in self.format_bytes)
+
+    @property
+    def mean_expert_read_bytes(self) -> float:
+        """What the engine reads for one routed expert on average.
+
+        Layers may quantize their experts to different types, so the largest expert overstates
+        the rest: this is the mean expert's bytes, widened to whole pages as the largest one's
+        three role reads are. It equals expert_read_bytes when every layer has one type.
+        """
+        mean = self.routed_bytes / (self.layers * self.experts)
+        return mean + self.expert_read_bytes - self.expert_bytes
+
+    @property
     def dominant_format(self) -> str:
         """The ggml type that holds the most routed-expert bytes."""
         return self.format_bytes[0][0]
@@ -291,6 +307,10 @@ class RuntimeFacts:
     # read. The engine sizes its caches from its own reading at run time.
     available_bytes: Optional[int]
     memory_budget_bytes: Optional[int] = None  # the user's memory budget, when given
+    # The GPU backends of the engine the launch starts, as its build names them; None when
+    # unknown, and then taken to be the backends of the machine's GPUs (engine_gpu_backends).
+    # Set by the launch, not recorded with the facts above.
+    gpu_backends: Optional[tuple[str, ...]] = None
 
 
 class Host(identity.Host, Protocol):

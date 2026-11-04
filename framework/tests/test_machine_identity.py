@@ -3,23 +3,29 @@
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import os
 import plistlib
+import subprocess
 from pathlib import Path
 
 import pytest
 
+from inferssd.machine.backend import machine_backend
 from inferssd.machine.identity import (
     Command,
     Drive,
     GPUQueryFailed,
     NativeHost,
     UnsupportedPlatform,
+    build_backend,
     cpu_brand,
     drive_info,
     drive_key,
+    is_test_file,
     live_identity,
+    owner_of_test_file,
     same_hardware,
     with_saved_gpus,
 )
@@ -45,11 +51,15 @@ AGX_LISTING = """\
 class FakeHost(NativeHost):
     """System paths resolve under ROOT; commands and devices come from tables."""
 
-    def __init__(self, root, system="linux", arch="x86_64", commands=None, devices=None):
+    def __init__(
+        self, root, system="linux", arch="x86_64", commands=None, devices=None, free=1 << 40
+    ):
         self.root, self.system, self.arch = Path(root), system, arch
         self.commands = dict(commands or {})
         self.devices = dict(devices or {})
+        self.free = free
         self.calls = []
+        self.test_files = []  # (path, size, existed while in use)
 
     def inside(self, path):
         return path.startswith(SYSTEM) or path in ("/sys", "/proc")
@@ -94,6 +104,21 @@ class FakeHost(NativeHost):
 
     def page_bytes(self):
         return 16384 if self.system == "darwin" else 4096
+
+    def free_bytes(self, path):
+        return self.free
+
+    @contextlib.contextmanager
+    def test_file(self, directory, size):
+        # Sparse, so a test writes nothing; the real host fills it with random bytes.
+        path = os.path.join(directory, f".inferssd-drive-test-{os.getpid()}-fake")
+        with open(path, "wb") as stream:
+            stream.truncate(size)
+        try:
+            yield path
+        finally:
+            self.test_files.append((path, size, os.path.exists(path)))
+            os.unlink(path)
 
 
 def write(root, path, content):
@@ -229,6 +254,48 @@ def test_failing_nvidia_smi_is_not_an_absent_gpu(tmp_path):
     # A driver without devices is a machine without GPUs, not a failure.
     commands[SMI] = Command(6, "No devices were found\n")
     assert live_identity(FakeHost(tmp_path, commands=commands))["hard"]["gpus"] == []
+
+
+def pci(root, address, kind, vendor, device, vram=None):
+    base = f"/sys/bus/pci/devices/{address}/"
+    write(root, base + "class", kind + "\n")
+    write(root, base + "vendor", vendor + "\n")
+    write(root, base + "device", device + "\n")
+    if vram is not None:
+        write(root, base + "mem_info_vram_total", f"{vram}\n")
+
+
+def test_linux_lists_the_gpus_a_vulkan_build_can_use(tmp_path):
+    commands = linux_tree(tmp_path)
+    pci(tmp_path, "0000:00:02.0", "0x030000", "0x8086", "0x7d55")  # an Intel iGPU
+    pci(tmp_path, "0000:03:00.0", "0x030000", "0x1002", "0x744c", vram=24 << 30)  # an AMD card
+    pci(tmp_path, "0000:01:00.0", "0x030000", "0x10de", "0x2b85")  # nvidia-smi lists it
+    pci(tmp_path, "0000:05:00.0", "0x030000", "0x1a03", "0x2000")  # a server's BMC display
+    pci(tmp_path, "0000:00:1f.3", "0x040300", "0x8086", "0x51c8")  # Intel audio, not a display
+    gpus = live_identity(FakeHost(tmp_path, commands=commands))["hard"]["gpus"]
+    assert [(gpu["backend"], gpu["uuid"], gpu["name"], gpu["vram_bytes"]) for gpu in gpus] == [
+        ("CUDA", "GPU-1111", "NVIDIA GeForce RTX 5090", 32607 * 1048576),
+        ("Vulkan", "pci-0000:00:02.0", "PCI 8086:7d55", 0),
+        ("Vulkan", "pci-0000:03:00.0", "PCI 1002:744c", 24 << 30),
+    ]
+
+
+def test_the_engine_builds_for_the_machines_gpus(tmp_path):
+    assert build_backend([]) is None
+    vulkan = {"backend": "Vulkan", "uuid": "pci-0", "name": "PCI 8086:7d55", "vram_bytes": 0}
+    cuda = {"backend": "CUDA", "uuid": "GPU-1", "name": "NVIDIA", "vram_bytes": 1}
+    metal = {"backend": "Metal", "uuid": "M5:10", "name": "Apple M5", "vram_bytes": 0}
+    assert build_backend([vulkan]) == "Vulkan"
+    assert build_backend([vulkan, cuda]) == "CUDA" and build_backend([metal]) == "Metal"
+    commands = linux_tree(tmp_path)
+    assert machine_backend(FakeHost(tmp_path, commands=commands)) == "CUDA"
+    del commands[SMI]
+    assert machine_backend(FakeHost(tmp_path, commands=commands)) == "CPU"
+    pci(tmp_path, "0000:00:02.0", "0x030000", "0x8086", "0x7d55")
+    assert machine_backend(FakeHost(tmp_path, commands=commands)) == "Vulkan"
+    # A driver that cannot list its GPUs still has them.
+    commands[SMI] = Command(18, "Failed to initialize NVML: Driver/library version mismatch\n")
+    assert machine_backend(FakeHost(tmp_path, commands=commands)) == "CUDA"
 
 
 def test_arm_cpu_brand_lists_implementer_and_parts():
@@ -483,3 +550,33 @@ def test_darwin_drive_reports_unreadable_diskutil_output(tmp_path):
     }
     with pytest.raises(RuntimeError, match="printed no property list .*: Volume busy"):
         drive_info(FakeHost(tmp_path, "darwin", "arm64", commands), "/x")
+
+
+def ended_process():
+    child = subprocess.Popen(["true"])
+    child.wait()
+    return child.pid
+
+
+def test_native_test_file_is_random_uncompressible_and_removed(tmp_path):
+    (tmp_path / "model.gguf").write_bytes(b"kept")
+    with NativeHost().test_file(str(tmp_path), (3 << 20) + 5) as path:
+        data = Path(path).read_bytes()
+        assert len(data) == (3 << 20) + 5 and len(set(data[:65536])) == 256
+        assert os.path.basename(path).startswith(f".inferssd-drive-test-{os.getpid()}-")
+        assert owner_of_test_file(path) == os.getpid() and is_test_file(path)
+        assert sorted(os.listdir(tmp_path)) == sorted([os.path.basename(path), "model.gguf"])
+    assert os.listdir(tmp_path) == ["model.gguf"]
+
+
+def test_only_test_files_of_ended_runs_are_cleared(tmp_path):
+    names = [
+        f".inferssd-drive-test-{ended_process()}-a",  # a killed run's
+        ".inferssd-drive-test-left",  # from before names carried a process
+        f".inferssd-drive-test-{os.getpid()}-b",  # a live run's
+        "model.gguf",
+    ]
+    for name in names:
+        (tmp_path / name).write_bytes(b"x")
+    NativeHost().clear_test_files(str(tmp_path))
+    assert sorted(os.listdir(tmp_path)) == sorted(names[2:])

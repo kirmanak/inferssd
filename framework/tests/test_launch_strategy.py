@@ -22,7 +22,6 @@ from test_machine_profile import Clock, linux_machine
 from test_strategy_inputs import SMI_APPS, SMI_GPUS, RuntimeHost, deepseek_like, write_gguf
 from test_typed_launch import setup
 
-from inferssd.cli import main
 from inferssd.configuration.settings import parse
 from inferssd.contracts import ContractError
 from inferssd.engine import command as engine_command
@@ -34,6 +33,7 @@ from inferssd.launch.prepare import prepare
 from inferssd.launch.recorded import RecordedArtifacts
 from inferssd.launch.resources import EngineResources, probe_paths
 from inferssd.launch.typed import LaunchSpec, resolve_typed
+from inferssd.launch.typed_command import main
 from inferssd.launch.types import Fact, LaunchInput, Reply, Threads
 from inferssd.machine.characteristics import dumps, load
 from inferssd.machine.identity import Command
@@ -260,6 +260,8 @@ def render_golden(case, strategy):
         if name == "write_exclusive":
             written[arguments[0]] = arguments[1]
             return Reply()
+        if name == "engine_gpu_backends":
+            return Reply(case["host"].get(name))
         return Reply(case["host"][name])
 
     pools = case["threads"]
@@ -316,6 +318,16 @@ def test_goldens_without_a_strategy_ask_nothing_new(name):
 
 def recorded(host):
     return RecordedArtifacts(LaunchInput("", ()), host, run=None, replace=None, python="")
+
+
+def test_recorded_engine_gpu_backends():
+    fact = Fact("engine_gpu_backends", ("server",))
+    # Recordings made before the fact existed: the engine's backends are unknown.
+    assert recorded({})(fact).value is None
+    assert recorded({"engine_gpu_backends": ["Metal"]})(fact).value == ["Metal"]
+    for value in (["ROCm"], "CUDA", ["CUDA", "CUDA"]):
+        with pytest.raises(ValueError, match="engine_gpu_backends"):
+            recorded({"engine_gpu_backends": value})(fact)
 
 
 def test_recorded_machine_characteristics(tmp_path):
@@ -572,7 +584,7 @@ def launch_arguments(tmp_path, *extra):
     host.update(runtime_facts=runtime_record(), model_drive_key=X86_DRIVE)
     facts = tmp_path / "facts.json"
     facts.write_text(json.dumps(host))
-    words = ["launch", "--platform", "linux", "--repo", inputs.repo, "--model", spec.model]
+    words = ["--platform", "linux", "--repo", inputs.repo, "--model", spec.model]
     words += ["--profile", "muse"]
     words += ["--binary", spec.binary, "--settings", spec.settings_file]
     words += ["--runtime-policy", str(contract), "--output-dir", str(out)]
@@ -643,6 +655,6 @@ def test_execute_passes_the_machine_source_to_the_runtime(tmp_path, monkeypatch)
 
 def test_help_names_the_machine_options(capsys):
     with pytest.raises(SystemExit):
-        main(["launch", "--help"])
+        main(["--help"])
     text = capsys.readouterr().out
     assert "--reprofile" in text and "--machine PATH" in text

@@ -13,20 +13,30 @@ flowchart LR
     E --> R
     R --> C[CPU expert compute]
     R --> G[Linux CUDA expert tier]
+    R --> L[GPU lane: Vulkan or Metal]
     C --> O[Model output]
     G --> O
-    D[Dense compute: Metal or CUDA] --> O
+    L --> O
+    D[Dense compute: Metal, CUDA or Vulkan] --> O
 ```
 
 ## Expert sources and caching
 
 Source indexes locate expert byte ranges in the original GGUF files or a matching v1 expert pack. Indexing GGUF headers does not copy the model payload. Packs group expert slices by layer and expert with **4 KiB alignment**, preserving the existing quantized bytes. The v1 format has no checkpoint fingerprint, so keep each pack paired with its source checkpoint.
 
-The runtime owns immutable source metadata, readers, host-budget accounting and telemetry for each context. Executors borrow those services. Linux, macOS and Windows run configured experts on the same CPU sink, which reads through the OS read ring (`io_uring` on Linux, IoRing on Windows, persistent reader threads with `F_NOCACHE` on macOS) into its RAM cache; with CUDA, Linux adds the GPU cache tier. A GPU backend without that tier, such as Metal, runs the dense layers, and the sink computes every routed expert on the CPU. Device and source validation remains necessary for the selected configuration.
+The runtime owns immutable source metadata, readers, host-budget accounting and telemetry for each context. Executors borrow those services. Linux, macOS and Windows run configured experts on the same CPU sink, which reads through the OS read ring (`io_uring` on Linux, IoRing on Windows, persistent reader threads with `F_NOCACHE` on macOS) into its RAM cache; with CUDA, Linux adds the GPU cache tier. A GPU backend without that tier, such as Metal, runs the dense layers, and the sink computes the routed experts on the CPU, but for a prompt's heavy experts on a GPU that shares host memory ([the GPU lane](#the-gpu-lane)). Device and source validation remains necessary for the selected configuration.
+
+## The GPU lane
+
+A GPU that shares host memory and has no CUDA tier takes the heavy experts of a prompt pass through the graph lane (`ggml/src/ggml-ssd/gpu/graph-lane.cpp`), on Vulkan and Metal alike. The lane is written over the ordinary ggml backend interface: it reads the weights in place from the read ring, runs up, gate, the activation and down as one graph over the experts whose reads have landed, and adds the rows into the pass's output. An expert with many tokens costs the GPU far less than the CPU: one matrix is read once for all its rows.
+
+The sink's cost table chooses the experts, from the lines it measures while the pass runs, exactly as it does for the CUDA tier. The lane holds nothing across layers, so decode stays on the CPU, where one row per expert favours it, and the host budget is unchanged. A pass limited by the drive moves little: its compute is already hidden behind its reads.
+
+`vram.budget = 0` keeps every expert on the CPU. A pass whose working memory the host budget refuses stays on the CPU by itself. A CPU row and a lane row of one expert differ by about 1%, because the CPU quantizes its input and hidden rows to 8 bits and the lane multiplies floats, and the plan depends on measured times. So a reply can differ between two runs of one prompt where the lane is in use.
 
 ## Threads
 
-CPU compute runs on one pool, ggml's threadpool, for dense and expert work alike. A sink node is an ordinary multi-threaded ggml op: every CPU-backend thread of the graph enters it, thread 0 opens a call for the node's thread count and runs the layer, and the other threads join the call as its compute participants until it closes. Each compute phase splits its rows over the participants, by atomic row chunks or explicit row weights; a decode phase uses the first N of them, where N is all of them or the number that fits the fastest CPU cluster, whichever measures faster, or `cpu.decode_participants`. Grouped prefill and the cache executor dispatch through the same phases. The participants take no lock: thread 0 publishes each phase in one atomic word, and the others park on it through the OS's wait-on-address primitive between phases, so one wake reaches all of them.
+CPU compute runs on one pool, ggml's threadpool, for dense and expert work alike. A sink node is an ordinary multi-threaded ggml op: every CPU-backend thread of the graph enters it, thread 0 opens a call for the node's thread count and runs the layer, and the other threads join the call as its compute participants until it closes. Each compute phase splits its rows over the participants, by atomic row chunks or explicit row weights; a decode phase uses the first N of them, where N is all of them or the number that fits the fastest CPU cluster, whichever measures faster, or `cpu.decode_participants`. Grouped prefill and the cache executor dispatch through the same phases. The participants take no lock: thread 0 publishes each phase in one atomic word, and the others poll it for up to 3 ms after a phase, then park on it through the OS's wait-on-address primitive, so one wake reaches all of them.
 
 Placement is ggml's. `-t` and `-tb` set the decode and batch thread counts, `-C` and `-Cb` their CPU masks, and `--cpu-strict` and `--cpu-strict-batch` place thread i on the i-th CPU of its mask in increasing order; `--prio` and `--poll` set priority and polling. The sink keeps only its own I/O thread, its prefetch readers and, on unified memory, a watch thread, all placed by `cpu.io_cpus`.
 
@@ -34,9 +44,7 @@ The CUDA cache tier's worker and upload threads run with thread 0, which waits f
 
 ## Batching
 
-Prompt batching lets tokens share weight access. `inferssd launch --batch` and `--ubatch` set the native batch and micro-batch capacities. The Linux controller consumes native telemetry to inform placement and prefill decisions; see [controller observations](architecture/controller-observations.md).
-
-On macOS the launcher supports static settings only; it does not include an online adaptive controller. The settings used in the recorded Mac benchmark runs are listed in [benchmark methodology](benchmark.md#engine-configurations).
+Prompt batching lets tokens share weight access. The launch strategy sets the native batch and micro-batch capacities. Each launch's settings stay fixed while it runs; the engine itself sizes its caches and decode threads to the machine as it goes. A run's native events record placement and prefill; see [native observations](architecture/native-observations.md). The settings used in the recorded Mac benchmark runs are listed in [benchmark methodology](benchmark.md#engine-configurations).
 
 ## Modules
 

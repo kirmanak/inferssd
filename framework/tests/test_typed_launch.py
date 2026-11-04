@@ -4,22 +4,19 @@ import json
 from dataclasses import asdict, replace
 from functools import partial
 from pathlib import Path
-from types import SimpleNamespace
 
 import pytest
 from test_engine_runtime import Effects, Owner, policy
 from test_gguf_alias import fixture as gguf_fixture
 from test_strategy_inputs import Q8_0, deepseek_like, moe, muse_like, write_gguf
 
-from inferssd.cli import main
-from inferssd.configuration.derive import Selection, SelectionConflict, selection
 from inferssd.configuration.settings import parse
 from inferssd.engine import runtime
 from inferssd.launch.prepare import prepare
 from inferssd.launch.recorded import RecordedArtifacts
 from inferssd.launch.typed import LaunchSpec, reject_legacy_environment, resolve_typed
+from inferssd.launch.typed_command import main
 from inferssd.launch.types import LaunchInput, Threads
-from inferssd.loop.typed_controller import TypedController
 from inferssd.source import gguf_alias
 
 
@@ -53,6 +50,7 @@ def setup(tmp_path, platform="linux", automatic=False):
         "cgroup_v2": True,
         "gpu_available": True,
         "gpu_processes": "",
+        "engine_gpu_backends": ["CUDA"] if platform == "linux" else ["Metal"],
     }
     inputs = LaunchInput(str(root), (("PATH", "/bin"), ("PRIVATE_TOKEN", "never-persist")))
     out = tmp_path / "run"
@@ -261,89 +259,6 @@ def test_busy_port_refuses_before_claim_or_owner(tmp_path, monkeypatch):
     assert effects.events == [("busy", 8080)]
 
 
-def test_measured_selection_changes_actual_typed_values_without_env_bridge():
-    model = SimpleNamespace(
-        P={"split": {"pf_k": 3, "tier_slot_bytes": 1024, "tier_base_bytes": 8192}},
-        caps={"split": 8},
-        ref="split",
-        dev={
-            "default_threads": 4,
-            "coresets": {"g1": {"cpus": [0, 1, 2]}, "g2": {"cpus": [3, 4]}},
-            "lanes": {"cpu": {"fixed_us": 12, "per_route_us": 3}, "copy_gbps": 7},
-        },
-        PF={"memory": {}},
-    )
-    base = parse()
-    chosen = selection(model, 4, "split", base, lambda: pytest.fail("measured count exists"))
-    # Decode takes the first two ggml threads, strictly placed on the fast CPUs 0 and 1.
-    assert chosen.threads == Threads(3, 3, (0, 1, 3))
-    settings = chosen.settings
-    assert settings.at("cpu.io_cpus").value == (2,)
-    assert settings.at("cpu.decode_participants").value == 2
-    assert settings.at("vram.max_slots").value == 4
-    assert settings.at("vram.budget").value == 4096
-    assert settings.at("prefetch.depth").value == 3
-    assert "source=planner" in settings.at("cpu.io_cpus").receipt
-    assert base.at("cpu.io_cpus").value == ()
-
-
-@pytest.mark.parametrize(
-    "placement,threads,io,participants",
-    [
-        ("all", Threads(3, 3), (), 0),
-        ("pin", Threads(2, 2, (0, 1)), (2,), 2),
-        ("split", Threads(3, 3, (0, 1, 3)), (2,), 2),
-    ],
-)
-def test_placements_choose_ggml_threadpools_beside_the_io_cpu(placement, threads, io, participants):
-    model = SimpleNamespace(
-        P={placement: {}},
-        caps={placement: 8},
-        ref=placement,
-        dev={"default_threads": 4, "coresets": {"g1": {"cpus": [0, 1, 2]}, "g2": {"cpus": [3, 4]}}},
-        PF={"memory": {}},
-    )
-    chosen = selection(model, 0, placement, parse(), lambda: 4)
-    assert chosen.threads == threads
-    assert chosen.settings.at("cpu.io_cpus").value == io
-    assert chosen.settings.at("cpu.decode_participants").value == participants
-
-
-def test_split_refuses_a_fast_group_above_the_lowest_compute_cpus():
-    model = SimpleNamespace(
-        P={"split": {}},
-        caps={"split": 8},
-        ref="split",
-        dev={"default_threads": 5, "coresets": {"g1": {"cpus": [2, 3, 4]}, "g2": {"cpus": [0, 1]}}},
-        PF={"memory": {}},
-    )
-    with pytest.raises(ValueError, match="lowest compute CPU IDs"):
-        selection(model, 0, "split", parse(), lambda: 5)
-
-
-def test_typed_controller_never_calls_machine_env():
-    snapshot = Selection(parse(), Threads(3, 3, (0, 1, 2)))
-    model = SimpleNamespace(env=lambda *_: pytest.fail("historical env path"))
-    controller = object.__new__(TypedController)
-    captured = {}
-    controller.m, controller.out, controller.port = model, "/run", 8080
-    controller.insts, controller.args = [], []
-    controller._configuration = lambda *_: snapshot
-    controller._typed_engine = lambda *args: (
-        captured.update(args=args) or SimpleNamespace(ok=True, start_s=0)
-    )
-    controller.note = lambda record: captured.update(record=record)
-    controller._start(4, "all")
-    assert captured["args"][-1] is snapshot and "settings" in captured["record"]
-    assert captured["record"]["threads"] == {
-        "decode": 3,
-        "batch": 3,
-        "cpus": (0, 1, 2),
-        "decode_cpus": (),
-    }
-    assert "env" not in captured["record"]
-
-
 def test_typed_command_prepares_native_file_without_executing_or_recording_secrets(
     tmp_path, monkeypatch
 ):
@@ -357,7 +272,6 @@ def test_typed_command_prepares_native_file_without_executing_or_recording_secre
     assert (
         main(
             [
-                "launch",
                 "--dry-run",
                 "--platform",
                 "linux",
@@ -410,7 +324,6 @@ def test_omitted_output_directory_creates_a_new_run_directory(tmp_path, monkeypa
     monkeypatch.chdir(work)
     monkeypatch.setattr("os.environ", dict(inputs.environment))
     command = [
-        "launch",
         "--dry-run",
         "--platform",
         "linux",
@@ -427,112 +340,11 @@ def test_omitted_output_directory_creates_a_new_run_directory(tmp_path, monkeypa
     assert str(runs[0]) in capsys.readouterr().err
 
 
-def test_historical_entry_cannot_execute(tmp_path):
-    with pytest.raises(SystemExit) as error:
-        main(["launch-recorded", "--execute", "--platform", "linux", "--repo", str(tmp_path)])
-    assert error.value.code == 2 and not list(tmp_path.iterdir())
-
-
-def test_measured_selection_respects_explicit_cli_and_preserves_matching_receipt():
-    model = SimpleNamespace(
-        P={"all": {}},
-        caps={"all": 8},
-        ref="all",
-        dev={"default_threads": 4},
-        PF={"memory": {}},
-    )
-    matching = parse(overrides=[("cpu.decode_participants", "0")])
-    chosen = selection(model, 4, "all", matching, lambda: 4, threads=Threads(3, 12))
-    key = "cpu.decode_participants"
-    assert chosen.settings.at(key) is matching.at(key)
-    assert chosen.threads == Threads(3, 12)  # an explicit batch count is kept
-    conflicting = parse(overrides=[("cpu.decode_participants", "1")])
-    with pytest.raises(SelectionConflict, match="cpu.decode_participants"):
-        selection(model, 4, "all", conflicting, lambda: 4)
-    for threads in (Threads(2), Threads(cpus=(0, 1, 2))):
-        with pytest.raises(SelectionConflict, match="explicit launch threads"):
-            selection(model, 4, "all", matching, lambda: 4, threads=threads)
-
-
-def test_explicit_strict_cpus_select_only_the_matching_pinned_placement():
-    model = SimpleNamespace(
-        P={"pin": {}},
-        caps={"pin": 8},
-        ref="pin",
-        dev={"coresets": {"g1": {"cpus": [0, 1, 2]}, "g2": {"cpus": [3, 4]}}},
-        PF={"memory": {}},
-    )
-    chosen = selection(model, 0, "pin", parse(), lambda: 4, threads=Threads(cpus=(1, 0)))
-    assert chosen.threads == Threads(2, 2, (0, 1))
-    for threads in (Threads(cpus=(0, 3)), Threads(batch=3)):
-        with pytest.raises(SelectionConflict, match="explicit launch threads"):
-            selection(model, 0, "pin", parse(), lambda: 4, threads=threads)
-
-
-def test_controller_filters_conflicting_measurements_before_start(tmp_path, monkeypatch):
-    captured = {}
-    model = SimpleNamespace(
-        P={"all": {}, "pin": {}},
-        caps={"all": 8, "pin": 8},
-        ref="all",
-        configs=[(4, "all"), (4, "pin")],
-        dev={"default_threads": 4, "coresets": {"g1": {"cpus": [0, 1, 2]}, "g2": {"cpus": [3, 4]}}},
-        PF={"memory": {}},
-    )
-
-    def load(self, *a, **kw):
-        self.__dict__.update(model.__dict__)
-
-    monkeypatch.setattr("inferssd.model.machine.Machine.__init__", load)
-    monkeypatch.setattr(runtime, "TypedController", lambda *a, **kw: captured.update(kw) or kw)
-    value = runtime.Runtime(
-        LaunchInput("/fixture/repo", ()),
-        policy(tmp_path, "linux"),
-        host=object(),
-        emit=lambda _: None,
-        configuration=LaunchSpec("/fixture/model.gguf", 8080, threads=Threads(3)),
-    )
-    value.controller(
-        "/recorded", "/output", 8080, (4, "all"), [], host_threads=lambda: 4, stdout=None
-    )
-    selected = captured["machine_factory"]("/recorded")
-    assert selected.configs == [(4, "all")]
-    assert selected.selected(4, "all").threads == Threads(3, 3)
-    assert selected.ubatch("all") == 512
-    assert selected.route("all") is None
-    value.controller(
-        "/recorded", "/output", 8080, (4, "pin"), [], host_threads=lambda: 4, stdout=None
-    )
-    with pytest.raises(ValueError, match="start configuration"):
-        captured["machine_factory"]("/recorded")
-
-
 def test_owned_snapshot_does_not_reread_mutated_settings_file(tmp_path):
     inputs, spec, _, adapter, out, _ = setup(tmp_path)
     configured = parse(Path(spec.settings_file).read_text(), spec.settings_file)
     Path(spec.settings_file).unlink()
     assert resolve(inputs, spec, adapter, out, configured=configured).code == 0
-
-
-def test_controller_rejects_unconfigured_history_persistence(tmp_path):
-    value = runtime.Runtime(
-        LaunchInput("/unused", ()),
-        policy(tmp_path, "linux"),
-        host=object(),
-        emit=lambda _: None,
-        configuration=LaunchSpec("/unused", 8080),
-    )
-    with pytest.raises(ValueError, match="prompt persistence"):
-        value.controller(
-            "/unused",
-            "/unused",
-            8080,
-            (4, "all"),
-            [],
-            host_threads=lambda: 4,
-            stdout=None,
-            keeps_history=True,
-        )
 
 
 @pytest.mark.parametrize("threads", [4, 8])
@@ -690,9 +502,10 @@ def test_deepseek_profile_materializes_model_policy_and_preserves_explicit_value
     assert argv.index("--chat-template-kwargs") == argv.index("--chat-template-file") + 2
 
 
-def test_qwen4exp_launches_with_the_template_in_its_gguf(tmp_path):
+@pytest.mark.parametrize("profile", ["qwen4exp", "qwen35moe"])
+def test_qwen_profiles_launch_with_the_template_in_their_gguf(tmp_path, profile):
     inputs, spec, _, adapter, out, _ = setup(tmp_path)
-    inputs = replace(inputs, profile="qwen4exp")
+    inputs = replace(inputs, profile=profile)
     result = resolve(inputs, spec, adapter, out)
     assert result.code == 0 and "--chat-template-file" not in result.argv
     explicit = tmp_path / "chosen.jinja"
@@ -705,14 +518,14 @@ def test_qwen4exp_launches_with_the_template_in_its_gguf(tmp_path):
 
 def test_unknown_profile_refused_before_native_file(tmp_path):
     inputs, spec, _, adapter, out, _ = setup(tmp_path)
-    with pytest.raises(ValueError, match="dsv, muse, qwen4exp"):
+    with pytest.raises(ValueError, match="dsv, muse, qwen4exp, qwen35moe"):
         resolve(replace(inputs, profile="qwen"), spec, adapter, out)
     assert not (out / "settings.ssd").exists()
 
 
-def qwen_like():
+def qwen_like(arch="qwen4exp"):
     return moe(
-        "qwen4exp",
+        arch,
         layers=2,
         experts=8,
         used=2,
@@ -726,7 +539,12 @@ def qwen_like():
 
 @pytest.mark.parametrize(
     "layout, profile",
-    [(deepseek_like, "dsv"), (muse_like, "muse"), (qwen_like, "qwen4exp")],
+    [
+        (deepseek_like, "dsv"),
+        (muse_like, "muse"),
+        (qwen_like, "qwen4exp"),
+        (partial(qwen_like, "qwen35moe"), "qwen35moe"),
+    ],
 )
 def test_the_profile_follows_the_gguf_architecture(tmp_path, layout, profile):
     inputs, spec, _, adapter, out, _ = setup(tmp_path)
