@@ -894,3 +894,31 @@ pass 2 prompt_ms=1632.954 prompt_per_second=306.19 content=</think>
 
 1633 ms is the same warm prompt as the copy path. 383 ms still separate
 it from 1250. Not kept.
+
+## Scatter misses were the power-of-two align
+
+The 37 misses were not a fit check and not `write_ranges`. `align_up`
+masks with `alignment - 1`. That is valid for the 256-byte buffer
+alignment and wrong for a row of 10240 bytes. `zero_row_at` was a
+multiple of 256 and not of the row, so the shader refused the layer.
+The pass-1 skip counter never logged it. A modulo align puts every
+down-output row on a row boundary. Padding rows are zeroed after
+`get_rows`, or the matmul sees token 0 there.
+
+```text
+pass 2 prompt_ms=1566.917 prompt_per_second=319.10 content=</think>
+[kimi_vk_scatter] shader=1 on 47/47 scatter_s=0.021
+[kimi_vk_gather] shader=1 on 47/47 gather_s=0.069
+pack wait_s=0.137 setup_s=0.017 bytes=36.8 GB
+device compute/scatter/reduce = 0.529 / 0.021 / 0.064 s
+prep 0.034 quant 0.055 stream 0.944
+ahead join sum=0.172 s
+[kimi_sched] copy_us=419223 compute_us=1087421
+```
+
+The shader path is 0.43 ms. The copy fallback was 3.3 ms. 317 ms still
+separate 1567 from 1250. The weight reorder is 137 ms of device copy at
+269 GB/s, not command overhead. The ahead join is 172 ms because a 30 ms
+fill does not finish inside one layer's experts plus the next attention.
+The attention drain is still 419 ms. A per-request cache scan was not
+that time. Not kept.
