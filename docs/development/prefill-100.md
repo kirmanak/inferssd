@@ -1101,3 +1101,23 @@ token before. The 16 ms copy is 231 MB. The 2408 ms is inside
 5.7–7.7 GB/s, the rest at 25 GB/s) and the device GEMM, scatter, and
 reduce are 868 + 150 + 67 ms. A scheduler sync cannot close 2875 ms
 to 1250. Not kept.
+
+## Prefault of both ahead slots did not reach 1250
+
+The four slow fills reallocate a host-visible slot and minor-fault the
+new mapping. Both slots were allocated once at 1536 MB and one byte per
+page was stored before the first fill. That ran during pass 1. The warm
+pass did not reallocate. The token stayed `</think>`.
+
+```text
+[kimi_vk_ahead] prefault slot=0 bytes=1610612736 us=150841 ok=1
+[kimi_vk_ahead] prefault slot=1 bytes=1610612736 us=151038 ok=1
+pass 2 prompt_ms=1980.814 prompt_per_second=252.42 content=</think>
+909 MB 60 ms 15.1 GB/s
+1166 MB 42 ms 28.0 GB/s
+983 MB 37 ms 26.8 GB/s
+946 MB 34 ms 27.4 GB/s
+join sum=0.013 s
+```
+
+1981 ms is still 731 ms over 1250. Not kept.
