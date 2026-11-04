@@ -1034,3 +1034,26 @@ Those two chunks together are a few hundred milliseconds. The other
 ~1400 ms is the host copies and the syncs that the overlap attempts
 already failed to hide. No cut of the attention drain or the expert
 GEMM can bring 2083 ms to 1250. Not kept.
+
+## Restoring the scatter path changed the token
+
+The 1566.917 ms scatter path was never committed. Putting it back meant
+a modulo align for the 10240-byte row, a gather shader (one dispatch per
+bucket, padding rows written as zero), and a scatter shader (one
+dispatch per slot) in place of the 10 KB copies. The 40 GFLOPS
+`MUL_MAT f32 m=4 n=500 k=10240` is the hyper-connection inject
+(`hc_*_inject`, weight `[10240, 4]`). A small-M kernel was added for
+that shape. It never dispatched.
+
+The shaders engaged. The first token became EOS.
+
+```text
+pass 2 prompt_ms=2067.591 stop=eos gather=47/47 scatter=47/47
+pass 2 prompt_ms=2013.240 stop=eos gather=47/47 scatter=47/47
+```
+
+The second number is the same path after the index buffer was copied to
+device memory. Still EOS, still over 1250. Not the proven path. Not kept.
+
+A correct restore of 1566.917 ms plus removing the whole 103 ms inject
+matmul would still leave the warm prompt over 1250.
