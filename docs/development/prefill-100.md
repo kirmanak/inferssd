@@ -876,3 +876,21 @@ view=1 on 47/47 layers pack_s=0.139 matched_mb=37276/37276
 ```
 
 1566 ms is still 316 ms over 1250, and the token is wrong. Not kept.
+
+## Row gather did not move the warm prompt
+
+The activation gather and the scatter are thousands of 10 KB copies.
+Replacing the gather with the existing `get_rows` shader, one dispatch
+per bucket, kept `</think>`. The scatter shader is the same op, one
+dispatch per slot. It engaged on 10 of 47 layers (about 0.5 ms) and
+fell back on the rest. Prefault and the layer-0 prime were in place.
+
+```text
+pass 2 prompt_ms=1632.954 prompt_per_second=306.19 content=</think>
+[kimi_vk_gather] 47 layers shader=1 gather_s=0.055
+[kimi_vk_scatter] shader=1 on 10/47 scatter_s=0.128
+[kimi_sched] splits=100 us=1555415
+```
+
+1633 ms is the same warm prompt as the copy path. 383 ms still separate
+it from 1250. Not kept.
