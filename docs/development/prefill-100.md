@@ -978,3 +978,27 @@ still `</think>`). The warm prompt went from 2041 ms to 1985 ms. Not
 1250. The join cannot move onto the GPU without stalling it, and the
 quantize skip did not move the wall clock. The scatter copies and the
 weight reorder are the GPU chunks already measured. Not kept.
+
+## The weight reorder cannot hide behind attention
+
+The 151 ms device weight copy starts only after attention has drained.
+Starting it on the transfer queue at the end of the previous layer needs
+a saved batch layout. The cold pass never enters the bucket planner
+(`n_experts < 32` on the RAM-resident subset), so the first arm found no
+plan and submitted nothing.
+
+```text
+pass 2 prompt_ms=2262.341 content=</think> arm=0 hit=0
+```
+
+Recording the layout from the full expert set at the end of the cold
+stream saved 47 plans. The warm pass then armed 46 layers. Every one
+missed the live layout (`hit=0`), so the synchronous copy still ran, and
+the extra queue-family handoff made the prompt slower.
+
+```text
+pass 2 prompt_ms=2616.825 content=</think> arm=46 hit=0
+```
+
+A perfect hide of the 151 ms copy would still leave the warm prompt over
+1250. Not kept.
