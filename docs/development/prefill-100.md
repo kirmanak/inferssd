@@ -823,3 +823,21 @@ prompt (1660 ms). The 346 ms is attention GPU time on the critical path,
 not the 5 MB copy. Expert GPU of the same layer cannot start until it
 finishes, and the CPU work before that wait is too small to hide it.
 402 ms still separate 1652 ms from 1250 ms. Not kept.
+
+## Indexed mul_mat_id dropped the reorder and the token
+
+Prefault both 1536 MB slots again, and place the ahead copy in expert
+order (up, then gate, then down) so `mul_mat_id` can view it. The bucket
+reorder and the scatter copy do not run. The host activation copy stays.
+Warm pass:
+
+```text
+pass 2 prompt_ms=1516.776 prompt_per_second=329.65 stop=eos content=
+[kimi_vk_prime] layer0=1014
+[kimi_vk_id] experts=328 as=338 us=10479 abs=1.79e+04 lo=-0.326 hi=0.301 bad=0
+[kimi_sched] splits=100 us=1415076
+```
+
+47 layers, about 8.5 ms each. The output is finite and small, not NaN,
+but the first token is EOS instead of `</think>`. 1517 ms is still 267 ms
+over 1250. Not kept.
