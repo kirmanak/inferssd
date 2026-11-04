@@ -695,3 +695,46 @@ pass 2 wall=32.818s
 machine was already swapping to fill the cache. The kept warm prompt
 remains 2255 ms / 221.73 tok/s. A rerun of that path in this session,
 before the cache, was 2189 ms / 228.4 tok/s with content `</think>`.
+
+Dropping already-copied arena pages before the next slab did not make a
+warm all-hit pass. The GTT heap is 33152593920 bytes, half of RAM.
+Host-visible slabs consume that heap (`mem_info_gtt_used`), and a command
+submission needs room in it. The second request was still filling
+(pass 1 only admitted 2.47 GB through the ahead path, because the next
+layer is not resident yet). At slab 122 the device was lost:
+
+```text
+[kimi_vk_hcache] slabs=122 cap=268435456
+radv/amdgpu: Not enough memory for command submission.
+[kimi_vk_scatter] slots failed: vk::Queue::submit: ErrorDeviceLost
+pass 2 wall=22.154s
+curl: (52) Empty reply from server
+```
+
+A standalone allocator can hold 40 GB of host-visible memory, but
+`gtt_used` stops at 30.75 GB and further pages are ordinary RAM. GPU
+command submission dies once the heap is full. The 37.72 GB working set
+cannot sit in that heap and still be submitted. Not kept.
+
+After the device reset itself, the kept path came back. Warm pass:
+
+```text
+pass 2 prompt_ms=2214.969 prompt_per_second=225.74 content=</think>
+[kimi_sched] splits=100 us=2174215 copy_us=416268 wait_us=974
+  fence_us=100 compute_us=1757738 gpu_us=18403 cpu_us=1739335
+plain copies: n=144 bytes=242530320 plain_us=15792 plain_sync_us=398713
+ahead set_us sum=1.834 s (37.72 GB, 20.6 GB/s), join_us sum=0.325 s
+device compute/scatter/reduce = 0.850 / 0.151 / 0.067 s
+bucket pack/gemm = 0.545 / 0.296 s, first layer misses=984 pack=230 ms
+```
+
+The 416 ms "copy" is a backend synchronize before a 5 MB
+`ffn_moe_cpu_sink_in` copy (the copy itself is 16 ms). That wait is the
+GPU attention drain. The expert pipeline then runs on the CPU split and
+waits for its own GPU work. Those two are sequential: attention must
+finish before the experts, and the expert output feeds the next
+attention. A host-visible cache of the weights does not shorten that
+chain, and it cannot be resident beside a command submission. CPU
+memcpy into a Vulkan host-visible buffer, steady state, is 15.1 GB/s
+(write-combined) and 14.9 GB/s (cached). The ahead thread already does
+20.6 GB/s. Replacing it with that memcpy is slower. Not kept.
