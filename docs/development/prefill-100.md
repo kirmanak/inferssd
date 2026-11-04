@@ -922,3 +922,33 @@ separate 1567 from 1250. The weight reorder is 137 ms of device copy at
 fill does not finish inside one layer's experts plus the next attention.
 The attention drain is still 419 ms. A per-request cache scan was not
 that time. Not kept.
+
+## Hiding the join and the reorder did not move the prompt
+
+The modulo scatter path was put back (47/47, token still `</think>`).
+Two overlaps were tried on top of it.
+
+Starting the layer-after-next fill when the shown slot is free cuts the
+join from 172 ms to 79 ms. The fill is a memcpy into host-visible
+memory, and it runs while the next attention is on the GPU. The prompt
+stays at 1570 ms. The join left the wall clock and the GPU stall took
+its place.
+
+Pipelining the weight reorder onto the transfer queue, one buffer per
+bucket, with the next copy in flight during the current GEMM, engaged
+on 47/47 and kept `</think>`. Device time went from 0.526 s to 0.601 s
+and the prompt to 1628 ms. The copy and the matmul share device
+bandwidth, and five submits cost more than the 3 ms copy they hide.
+
+Skipping the host quantize when the device layer owns every expert is
+token-safe (`</think>`, 47 layers deferred) and does not move the
+prompt either. 1583 ms. The 55 ms was not the wall clock.
+
+```text
+scatter only, proven:     prompt_ms=1566.917 content=</think>
+plus early fill:          prompt_ms=1570.307 content=</think> join_s=0.079
+plus reorder pipeline:    prompt_ms=1627.695 content=</think> device_s=0.601
+plus quantize deferred:   prompt_ms=1582.944 content=</think>
+```
+
+None of these is 1250. Not kept.
