@@ -1121,3 +1121,20 @@ join sum=0.013 s
 ```
 
 1981 ms is still 731 ms over 1250. Not kept.
+
+## Skipping the warm ahead memcpy made the prompt slower
+
+On the second pass the next layer's experts are already in the host cache,
+and the device path reads those pointers. The ahead fill is a second copy
+of the same bytes. Skipping it on that pass kept the layer protected and
+did not start the memcpy. The token stayed `</think>`.
+
+```text
+[kimi_vk_ahead] skip cached layer=1 n=888 bytes=909312000
+skip layers=47 bytes=37.72 GB fills=0
+pass 2 prompt_ms=5726.034 prompt_per_second=87.32 content=</think>
+```
+
+The overlapped copy was hiding the upload. Without it, the device path
+uploads those weights during the layer. 5726 ms is farther from 1250.
+Not kept.
