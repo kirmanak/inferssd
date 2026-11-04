@@ -439,3 +439,34 @@ eval time = 77363.68 ms / 824 runs (93.89 ms per token, 10.65 tok/s)
 Under the 10.68 baseline by 0.03–0.06 tok/s, and under the 10.86 measured
 on the parent. The runs stop at different lengths, so the expert mix is
 not the same. The prefill path is not on this eval.
+
+## 1000 tok/s does not fit in the GPU time
+
+1000 tok/s on this 500-token prompt is 500 ms. The 201 tok/s run is 2481 ms.
+A `mul_mat_id` packing of the routed experts, one kernel per projection,
+was slower than the per-expert graph:
+
+```text
+pass 2 wall=3.764s prompt_ms=3756.15 prompt_per_second=133.11
+[kimi_sched] splits=100 us=3710756 vk_us=17305 cpu_us=3693379
+```
+
+47 layers, pack 0.396 s, compute 2.065 s. Not kept.
+
+`GGML_VK_PERF_LOGGER=1` on the per-expert path (the logger itself adds
+syncs, so the 3031 ms wall is not a speed number) sums the GPU timestamps
+for the warm prompt to 1857 ms:
+
+| | GPU time | dispatches |
+| --- | --- | --- |
+| expert Q4_K GEMM, m=640 k=2560, n≈10 | 1032 ms | 23020 |
+| expert Q5_1 GEMM | 212 ms | 10766 |
+| expert glue (get_rows, glu, mul, repeat, add) | 219 ms | |
+| dense matmul, all of it | about 300 ms | |
+| gated delta net | 16 ms | 36 |
+
+The expert math is 33,000 tiny dispatches. They already beat the stock
+`mul_mat_id` kernel. The dense graph is about 300 ms and cannot overlap
+the experts: the next layer's attention needs this layer's sum. 1857 ms
+of GPU work is the floor under the current kernels. 500 ms is below it.
+The packing attempt is not in the tree.
