@@ -541,3 +541,34 @@ same bytes from RAM instead, and still has to do the math.
 
 1000 tok/s is not available on this link. The kept result is 221-222
 tok/s.
+
+## Free VRAM is not enough to skip the copy
+
+Sampled `card1` `mem_info_vram_used` every 50 ms through the same two
+requests. Total is 17095983104 bytes.
+
+| | used | free |
+| --- | --- | --- |
+| model resident, first prompt | 7.94 GB | 9.16 GB |
+| warm prompt, minimum free | 12.09 GB | 5.01 GB |
+
+5 GB free is not 6.22 GB. That is the amount that would have to stay on
+the device to push 37.72 GB under 31.5 GB, the encoding-limit budget for
+500 ms. A single 4 GB buffer is also rejected:
+
+```text
+Device memory allocation of size 4294967296 failed.
+Requested buffer size exceeds device buffer size limit
+```
+
+Three 1.5 GB slabs, the size the ahead buffer already allocates, did
+fit. Pass 1 retained 4.83 GB. Pass 2 then uploaded less, and ran slower:
+
+```text
+h2d bytes=33927884800 keep_skip bytes=3791974400
+pass 2 prompt_ms=5046.57 prompt_per_second=99.08
+vram used_max=15.82 GB free_min=1.27 GB
+```
+
+33.93 GB is still over 31.5 GB, and 5047 ms is worse than 2254.98 ms.
+Not kept. The bus floor stands.
