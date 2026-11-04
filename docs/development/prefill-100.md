@@ -804,3 +804,22 @@ of `ffn_moe_cpu_sink_in`. Skipping that copy so expert CPU work could
 overlap attention produced the wrong token (`Stop` instead of
 `</think>`) and a 4645 ms prompt. The device read of the activation is
 not ordered with attention unless that synchronize runs. Not kept.
+
+## Prefault plus layer 0, then the attention drain
+
+Re-applied both. One fused pack submit did not move the pack. Warm pass,
+host copy left in place:
+
+```text
+pass 2 prompt_ms=1652.261 prompt_per_second=302.62 content=</think>
+[kimi_vk_prime] layer0=1014
+bucket misses=0 pack_s=0.321 first pack_us=6839
+[kimi_sched] splits=100 us=1574451
+```
+
+Starting that same host copy with `get_tensor_async` and synchronizing
+only after the expert split kept `</think>` and did not shorten the
+prompt (1660 ms). The 346 ms is attention GPU time on the critical path,
+not the 5 MB copy. Expert GPU of the same layer cannot start until it
+finishes, and the CPU work before that wait is too small to hide it.
+402 ms still separate 1652 ms from 1250 ms. Not kept.
