@@ -597,3 +597,23 @@ not kept:
 pass 2 prompt_ms=5855.30 prompt_per_second=85.39
 ahead set_us sum=4.321 s for the same 37.72 GB
 ```
+
+## Fusing the expert scale did not move the queue
+
+The 133 ms of mul, repeat, and add is the same bytes moved, not 133 ms of
+dispatch overhead. Scattering every slot into one stack and doing one
+repeat plus one mul, then adding the live slices, was not kept:
+
+```text
+pass 2 prompt_ms=2929.208 prompt_per_second=170.69
+GPU timestamp sum = 776 ms
+scatter_us sum = 145 ms, reduce_us sum = 68 ms, 47 layers, live slots <= 10
+fallback_count = 0
+```
+
+MUL dispatches fell from 914 to 491 and the MUL time stayed 66 ms. The
+one wide mul costs what the per-slot muls cost. The GPU sum is still
+776 ms, not under 625. A permute-then-sum_rows version of the same
+reduce faulted on pass 1 (`tensor->buffer` null on the view). Reading
+the slots back through host-visible memory took about 3.5 s per layer.
+Neither of those was kept. The kept path is still 2255 ms / 221.73 tok/s.
