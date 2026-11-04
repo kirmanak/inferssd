@@ -617,3 +617,16 @@ one wide mul costs what the per-slot muls cost. The GPU sum is still
 reduce faulted on pass 1 (`tensor->buffer` null on the view). Reading
 the slots back through host-visible memory took about 3.5 s per layer.
 Neither of those was kept. The kept path is still 2255 ms / 221.73 tok/s.
+
+## split_k on the 4-wide gemm changed the token
+
+`MUL_MAT f32 m=4 n=500 k=10240` is 95 calls and 120 ms, about 31
+GFLOPS. The split_k guard required a full tile in M, so those 4 rows
+never split. Allowing split_k when M is under a tile and N still covers
+one cut that line to 31 ms. GPU timestamps fell from 776 ms to 671 ms.
+Warm wall was 2172 ms / 230 tok/s.
+
+Both passes then stopped on EOS. The kept path's first token is
+`</think>`. A wider split, including N under a tile, did the same on
+the warm pass. The partial sums are a different float association, and
+this projection feeds the gated delta net. Not kept.
