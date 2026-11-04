@@ -841,3 +841,38 @@ pass 2 prompt_ms=1516.776 prompt_per_second=329.65 stop=eos content=
 47 layers, about 8.5 ms each. The output is finite and small, not NaN,
 but the first token is EOS instead of `</think>`. 1517 ms is still 267 ms
 over 1250. Not kept.
+
+## Viewing the ahead slot needs the warm routing
+
+The pack is a reorder of weights that are already on the GPU. Recording
+the bucket offsets from CPU routing and writing the ahead fill in that
+order lets the ordinary `mul_mat` view the slot. Same shader, not
+`mul_mat_id`. The host activation copy stays.
+
+Layer 0 matches across passes, because its routing does not depend on
+expert outputs. Its weight copy drops out and the token stays
+`</think>`:
+
+```text
+pass 2 prompt_ms=1635.484 content=</think>
+[kimi_vk_bucket] experts=328 view=1 pack_us=2883
+```
+
+Later layers do not. The cold pass computes those experts on the CPU, so
+the next layer's router disagrees with the warm GPU pass. Only 16% of
+the weight bytes are already at the offset the matmul computes. The
+other 46 layers still copy. Not enough.
+
+Draining each cold read into the cache, freeing the ring slot, then
+running one Vulkan batch makes the two passes agree. All 47 layers view
+the slot. The weight copy drops out of the pack (278 ms to 139 ms, the
+rest is the activation gather). The first token becomes EOS either way,
+including with the view forced off:
+
+```text
+pass 2 prompt_ms=1566.465 stop=eos content=
+view=1 on 47/47 layers pack_s=0.139 matched_mb=37276/37276
+[kimi_vk_gpu_after_read] experts=328 ok=1
+```
+
+1566 ms is still 316 ms over 1250, and the token is wrong. Not kept.
