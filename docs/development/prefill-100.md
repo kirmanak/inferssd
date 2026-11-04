@@ -1078,3 +1078,26 @@ pass 2 prompt_ms=2150.989 stop=eos content=
 
 The reduction order is not the tiled shader's. Not 1250, and not
 `</think>`. Not kept.
+
+## The second destination sync was already done
+
+The sync-copy fallback synchronized the destination backend, then
+synchronized it again after the async copy failed. The failed attempt
+submits nothing, so the second wait cannot observe new work. Dropping
+it kept `</think>`. It did not move the prompt.
+
+```text
+pass 2 prompt_ms=2875.260 content=</think>
+[kimi_sched] splits=100 us=2830360 dst_sync_us=1950 n_dst=207
+  src_sync_us=404104 n_src=144 copy_us=15841 n_copy=156 copy_mb=231.4
+  compute_us=2407793 fence_us=100
+  slow_src=ffn_moe_cpu_sink_in-1 slow_src_us=14408
+```
+
+Destination waits are 2 ms. The 404 ms source wait is the attention
+drain before `ffn_moe_cpu_sink_in`; skipping that copy changed the
+token before. The 16 ms copy is 231 MB. The 2408 ms is inside
+`graph_compute`: the ahead weight fill is 1793 ms (four layers at
+5.7–7.7 GB/s, the rest at 25 GB/s) and the device GEMM, scatter, and
+reduce are 868 + 150 + 67 ms. A scheduler sync cannot close 2875 ms
+to 1250. Not kept.
