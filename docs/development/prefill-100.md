@@ -952,3 +952,29 @@ plus quantize deferred:   prompt_ms=1582.944 content=</think>
 ```
 
 None of these is 1250. Not kept.
+
+## The gaps between GPU chunks are the chunks
+
+The warm prompt was timed as scheduler gaps, then inside the expert
+layer. Auto clocks had the GPU memory at 96 MHz; forcing the high
+performance level raised it to 1258 MHz and cut about 100 ms, not the
+prompt. At high clocks:
+
+```text
+pass 2 prompt_ms=2040.797 content=</think>
+[kimi_gap] ffn_moe n=48 pre_us=303604 compute_us=1672195
+act gather 0.137 s   weight device copy 0.151 s
+layer 0 host upload 0.199 s (984 ahead misses, one layer)
+gemm 0.215 s   scatter 0.139 s   reduce gpu 0.050 s
+ahead join 0.387 s (one layer 130 ms)   quant 0.056 s
+```
+
+`ffn_moe` pre is the attention drain. It is GPU time, and skipping the
+host activation copy changes the token. The idle pieces after that drain
+are the layer-0 host upload, the ahead join, and the quantize.
+
+Priming layer 0 after the graph removed the host upload (0 misses, token
+still `</think>`). The warm prompt went from 2041 ms to 1985 ms. Not
+1250. The join cannot move onto the GPU without stalling it, and the
+quantize skip did not move the wall clock. The scatter copies and the
+weight reorder are the GPU chunks already measured. Not kept.
