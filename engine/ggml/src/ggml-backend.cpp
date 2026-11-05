@@ -1775,6 +1775,20 @@ static bool ggml_backend_sched_decode_one(const ggml_cgraph * graph) {
     return any && max_m > 0;
 }
 
+static bool ggml_backend_sched_single_token_input(const ggml_cgraph & graph) {
+    // Small matrix widths also occur in multi-token prefill (including the
+    // server's two-token startup probe). Require the actual token input before
+    // using the decode-only copy and early-recording paths.
+    for (int i = 0; i < graph.n_leafs; ++i) {
+        const ggml_tensor * leaf = graph.leafs[i];
+        if (leaf && (leaf->flags & GGML_TENSOR_FLAG_INPUT) &&
+                strcmp(leaf->name, "inp_tokens") == 0) {
+            return ggml_nelements(leaf) == 1;
+        }
+    }
+    return false;
+}
+
 static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t sched) {
     GGML_ASSERT(sched);
     const int64_t sched_t0 = ggml_time_us();
@@ -1811,7 +1825,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
     ggml_backend_t parked_backend = nullptr;
     bool (*read_batch)(const ggml_tensor * const *, void **, const size_t *, int) = nullptr;
     auto lookup_park = [&](ggml_backend_t backend) {
-        if (park.looked || !backend) { return; }
+        if (park.looked || !backend || !ggml_backend_sched_single_token_input(sched->graph)) { return; }
         // The CPU backend has no Vulkan park hooks. Latching here left every
         // later lookup as a no-op and the dense record fell back into gpu_us.
         if (ggml_backend_dev_type(ggml_backend_get_device(backend)) != GGML_BACKEND_DEVICE_TYPE_GPU) {

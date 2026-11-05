@@ -38,7 +38,6 @@
 #include <limits>
 #include <map>
 #include <memory>
-#include <unordered_map>
 #include <mutex>
 #include <new>
 #include <stdexcept>
@@ -148,32 +147,11 @@ struct sink_buffer {
 };
 
 // Whether a descriptor reads directly at the granule the ranges are padded to.
-// is_direct is an fcntl. A token resolves about 1400 roles, and asking every
-// time was the gap outside the expert walk. The flag does not change for an
-// open descriptor, so one answer per fd is kept for the life of the sink.
+// The alignment is a device query on Windows: ask once per descriptor in a run.
 struct sink_direct_check {
     int aligned = -1;
-    int known_fd[8] = { -1, -1, -1, -1, -1, -1, -1, -1 };
-    bool known_ok[8] = {};
-    int nknown = 0;
     bool operator()(int fd) {
-        bool ok = false;
-        bool seen = false;
-        for (int i = 0; i < nknown; ++i) {
-            if (known_fd[i] != fd) { continue; }
-            ok = known_ok[i];
-            seen = true;
-            break;
-        }
-        if (!seen) {
-            ok = ssd::platform::is_direct(fd);
-            if (nknown < 8) {
-                known_fd[nknown] = fd;
-                known_ok[nknown] = ok;
-                ++nknown;
-            }
-        }
-        if (!ok) { return false; }
+        if (!ssd::platform::is_direct(fd)) { return false; }
         if (fd != aligned) {
             if (sink_direct_granule % ssd::platform::direct_alignment(fd) != 0) { return false; }
             aligned = fd;
@@ -628,68 +606,18 @@ struct kimi_cpu_sink {
     // kimi_cpu_sink_cache_begin forgets it, which still catches a source replaced between tokens, at the same descriptor
     // too. run_mutex guards the list: every caller of resolve and kimi_cpu_sink_cache_begin holds it.
     std::vector<std::pair<int, ssd::platform::file_identity>> file_identities;
-    sink_direct_check direct_fds;
-    // The index lookup and its fcntl are the same answer for a layer, role and
-    // expert for the life of the open files. Graph tensor pointers are not: a
-    // rebuilt graph made a pointer key miss every token.
-    struct resolve_memo {
-        int fd = -1;
-        uint64_t offset = 0;
-        size_t nbytes = 0;
-        size_t data_offset = 0;
-        size_t payload = 0;
-        bool filled = false;
-    };
-    std::unordered_map<uint32_t, resolve_memo> resolve_memos;
-    uint64_t resolve_hits = 0;
-    uint64_t resolve_misses = 0;
+    // Resolver callbacks may change ranges or descriptors between runs.
+    // Only the owned source index can cache immutable file metadata.
     double resolve_us = 0;
-    static bool expert_slot_key(const char * name, int32_t expert, uint32_t * key) {
-        int layer = -1, consumed = 0;
-        if (!name || expert < 0 || expert >= 4096 ||
-                std::sscanf(name, "blk.%d.ffn_%n", &layer, &consumed) != 1 || layer < 0 || layer >= 256) {
-            return false;
-        }
-        int role = -1;
-        const char * rest = name + consumed;
-        if (std::strncmp(rest, "up_exps", 7) == 0) { role = 0; }
-        else if (std::strncmp(rest, "gate_exps", 9) == 0) { role = 1; }
-        else if (std::strncmp(rest, "down_exps", 9) == 0) { role = 2; }
-        else { return false; }
-        *key = (uint32_t(layer) * 3u + uint32_t(role)) * 4096u + uint32_t(expert);
-        return true;
-    }
-    bool attach_identity(kimi_cpu_sink_source * source) {
+    uint64_t resolve_hits = 0, resolve_misses = 0;
+    bool resolve(const char * tensor, int32_t expert, kimi_cpu_sink_source * source) {
+        ++resolve_misses;
+        if (!resolver(userdata, tensor, expert, source)) { return false; }
         for (const auto & known : file_identities) {
             if (known.first == source->fd_direct) { source->file = known.second; return true; }
         }
         if (!ssd::platform::identity(source->fd_direct, source->file)) { return false; }
         file_identities.emplace_back(source->fd_direct, source->file);
-        return true;
-    }
-    bool resolve(const char * tensor, int32_t expert, kimi_cpu_sink_source * source) {
-        uint32_t key = 0;
-        const bool keyed = expert_slot_key(tensor, expert, &key);
-        if (keyed) {
-            const auto found = resolve_memos.find(key);
-            if (found != resolve_memos.end() && found->second.filled) {
-                source->fd_direct = found->second.fd;
-                source->offset = found->second.offset;
-                source->nbytes = found->second.nbytes;
-                source->data_offset = found->second.data_offset;
-                source->payload_nbytes = found->second.payload;
-                source->file = {};
-                ++resolve_hits;
-                return attach_identity(source);
-            }
-        }
-        if (!resolver(userdata, tensor, expert, source)) { return false; }
-        if (!attach_identity(source)) { return false; }
-        if (keyed) {
-            resolve_memos[key] = resolve_memo{ source->fd_direct, source->offset, source->nbytes,
-                source->data_offset, source->payload_nbytes, true };
-        }
-        ++resolve_misses;
         return true;
     }
 
@@ -2833,6 +2761,7 @@ struct kimi_cpu_sink {
         row_bytes_down = ggml_row_size(down->type, hidden);
         requests.clear();
         size_t max_bytes[3] = {};
+        sink_direct_check direct;
         const auto resolve_start = sink_clock::now();
         for (int slot = 0; slot < nslots; ++slot) {
             if (ids[slot] < 0) { continue; }
@@ -2850,7 +2779,7 @@ struct kimi_cpu_sink {
                     throw std::runtime_error("CPU sink pack resolver failed for " + std::string(tensors[role]->name));
                 }
                 const size_t bytes = ggml_row_size(tensors[role]->type, tensors[role]->ne[0]) * tensors[role]->ne[1];
-                if (!direct_fds(source.fd_direct) || source.offset % 4096 || source.nbytes % 4096 ||
+                if (!direct(source.fd_direct) || source.offset % 4096 || source.nbytes % 4096 ||
                     (source.payload_nbytes && source.payload_nbytes != bytes) || source.data_offset >= 4096 ||
                     source.data_offset > source.nbytes || bytes > source.nbytes - source.data_offset ||
                     source.nbytes > source.data_offset + bytes + 4095 ||

@@ -1,0 +1,27 @@
+{
+  "date": "2026-11-05",
+  "affected_tests": {
+    "passed": 123,
+    "skipped": 0,
+    "failed": 0
+  },
+  "unit_tests": {
+    "passed": 13,
+    "failed": 0
+  },
+  "vulkan_expert_test": {
+    "status": "VULKAN_EXPERT_MATCH",
+    "relative_l2_error": 0.00347405
+  },
+  "build": "full cmake build-linux-cpu, Release, GCC 16, Vulkan on; distrobox inferssd",
+  "source_sha256": {
+    "engine/ggml/include/ggml-vulkan.h": "6a9567cef9331bd1c235c06ef432320747c2a6eb7e449f81c7f4d2dbb3e48bd1",
+    "engine/ggml/src/ggml-backend.cpp": "d37f6db73e4fb850bc846efb9bd71c5f456658fc8bb037d7b250a39320bab6f2",
+    "engine/ggml/src/ggml-cpu/ssd/cpu-sink.cpp": "1d304500158200816a25a1ca55f573295e8d2ab1e8f905ca47d8a5110432184b",
+    "engine/ggml/src/ggml-ssd/gpu/vulkan-expert.h": "beed272b0a0f296864271a77b81552ab8f571cdc8669944795ee062b5c290023",
+    "engine/ggml/src/ggml-ssd/store/index.cpp": "02b68b07b1972c2ce9d4ea6ab1f299a487b8db70436053e535740b17b392f548",
+    "engine/ggml/src/ggml-vulkan/ggml-vulkan.cpp": "ed76030835758fae51b92b2ad14ebf6bc4c870e94e259ba55a33fe44923ace43",
+    "engine/ggml/src/ggml-vulkan/vulkan-expert.cpp": "dd87a0da2d37611b490e147a86e683f35bd0b30db75f0b2b905745cd64e07b97",
+    "engine/tests/ssd/test-server-chat-literal.cpp": "945b40195c29adcb0640db777924cb951108edc81f270905ab6d7eb808643353"
+  }
+}

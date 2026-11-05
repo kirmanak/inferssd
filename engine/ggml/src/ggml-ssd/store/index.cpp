@@ -61,6 +61,11 @@ result<std::unique_ptr<source_index>> source_index::open(const std::vector<std::
             }
         }
         auto state = std::make_unique<implementation>();
+        // Populate once while opening: view() may resolve concurrently and is noexcept.
+        state->direct_ok.reserve(index->source_count());
+        for (size_t i = 0; i < index->source_count(); ++i) {
+            state->direct_ok.push_back(platform::is_direct(index->borrowed_direct_fd(int(i))) ? 1 : -1);
+        }
         state->index = std::move(index);
         return {std::unique_ptr<source_index>(new source_index(std::move(state))), status::ok, {}};
     } catch (const std::bad_alloc &) {
@@ -83,15 +88,9 @@ source_view source_index::view() noexcept {
         c0::extent extent;
         if (!index.locate(name, expert, bytes, extent, false)) { return false; }
         const int direct = index.borrowed_direct_fd(extent.source_id);
-        auto * self = static_cast<source_index *>(opaque);
-        auto & known = self->state_->direct_ok;
+        const auto & known = static_cast<source_index *>(opaque)->state_->direct_ok;
         const int source_id = extent.source_id;
-        if (source_id < 0) { return false; }
-        if (size_t(source_id) >= known.size()) { known.resize(size_t(source_id) + 1, 0); }
-        if (known[size_t(source_id)] == 0) {
-            known[size_t(source_id)] = platform::is_direct(direct) ? 1 : -1;
-        }
-        if (known[size_t(source_id)] < 0) { return false; }
+        if (source_id < 0 || size_t(source_id) >= known.size() || known[size_t(source_id)] < 0) { return false; }
         *fd = direct; *offset = extent.offset; *logical_bytes = extent.logical_bytes;
         return true;
     }, [](void * opaque, const char * name, size_t bytes, size_t * block_bytes) noexcept -> size_t {

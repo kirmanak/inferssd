@@ -1,0 +1,13 @@
+<think>
+The user wants me to explain how a mixture-of-experts model can leave most expert weights on an SSD and still produce the next token. They want plain prose, in the order given, and I should stop after the fourth point.
+
+Let me look at the structure they've provided. They've given me four paragraphs that correspond to four points:
+
+1. How MoE routing works - only a few experts are activated per token, dense parts stay resident.
+2. The memory hierarchy - what stays in RAM vs SSD, how reads work, caching.
+3. The performance implications - cold vs warm cache, bandwidth math, prefill batching.
+4. The hardware context - desktop GPU + limited RAM, CPU runs experts, what's being measured.
+
+They want me to explain this in plain prose, in this order, stopping after the fourth point. They've essentially given me the content and structure. I need to write it as a coherent explanation in plain prose, following the four points in order, and stop after the fourth.
+
+Let me write this as a flowing explanation that covers all four points clearly, in plain prose, without bullet points or headers. I should make it read naturally as an explanation while hitting all the content points they've

@@ -1,0 +1,17 @@
+{
+  "comparison": "default Vulkan experts versus INFERSSD_DECODE_GPU=0; same final code and prompt, greedy n=256",
+  "generated_bytes_equal": true,
+  "generated_bytes": 1197,
+  "generated_sha256": "79d1120b1ff120ae8d04a816488573eacc803476a57638e112e91efe2cbdd309",
+  "cpu_exit_code": 0,
+  "cpu_decode_graphs": 256,
+  "cpu_reference_timing_note": "Concurrent regression tests; CPU timing is not used for performance comparison.",
+  "numeric_probe_before_final_startup_guard": {
+    "checks": 64,
+    "mismatches": 21,
+    "max_absolute_difference": 0.001236,
+    "max_relative_difference": 1.236,
+    "criterion": "max relative difference < 0.2, denominator floored at 1e-3",
+    "interpretation": "does not establish numeric parity; the diagnostic substitutes CPU outputs on mismatch"
+  }
+}

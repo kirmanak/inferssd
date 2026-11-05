@@ -1,0 +1,617 @@
+[
+  {
+    "name": "sched_inplace",
+    "status": "PASS",
+    "exit_code": 0
+  },
+  {
+    "name": "ssd_source_index",
+    "status": "PASS",
+    "exit_code": 0
+  },
+  {
+    "name": "kimi_cpu_sink",
+    "status": "PASS",
+    "exit_code": 0
+  },
+  {
+    "name": "kimi_cpu_sink_cache_compute_policy",
+    "status": "PASS",
+    "exit_code": 0
+  },
+  {
+    "name": "kimi_cpu_sink_cache_location_d1",
+    "status": "PASS",
+    "exit_code": 0
+  },
+  {
+    "name": "kimi_cpu_sink_cache_location_d8",
+    "status": "PASS",
+    "exit_code": 0
+  },
+  {
+    "name": "kimi_cpu_sink_cache_compute_t2_d1",
+    "status": "PASS",
+    "exit_code": 0
+  },
+  {
+    "name": "kimi_cpu_sink_cache_compute_t2_d8",
+    "status": "PASS",
+    "exit_code": 0
+  },
+  {
+    "name": "kimi_cpu_sink_cache_compute_t16_d1",
+    "status": "PASS",
+    "exit_code": 0
+  },
+  {
+    "name": "kimi_cpu_sink_cache_compute_t16_d8",
+    "status": "PASS",
+    "exit_code": 0
+  },
+  {
+    "name": "kimi_cpu_sink_schedule_invalid",
+    "status": "PASS",
+    "exit_code": 0
+  },
+  {
+    "name": "kimi_cpu_sink_threadpool",
+    "status": "PASS",
+    "exit_code": 0
+  },
+  {
+    "name": "kimi_cpu_sink_threadpool_poll",
+    "status": "PASS",
+    "exit_code": 0
+  },
+  {
+    "name": "kimi_cpu_sink_swiglu",
+    "status": "PASS",
+    "exit_code": 0
+  },
+  {
+    "name": "kimi_cpu_sink_swiglu_ordinary",
+    "status": "PASS",
+    "exit_code": 0
+  },
+  {
+    "name": "kimi_cpu_sink_muse_q8_0",
+    "status": "PASS",
+    "exit_code": 0
+  },
+  {
+    "name": "kimi_cpu_sink_muse_bf16",
+    "status": "PASS",
+    "exit_code": 0
+  },
+  {
+    "name": "kimi_cpu_sink_activation_t2_d1_ready0",
+    "status": "PASS",
+    "exit_code": 0
+  },
+  {
+    "name": "kimi_cpu_sink_activation_t2_d1_ready1",
+    "status": "PASS",
+    "exit_code": 0
+  },
+  {
+    "name": "kimi_cpu_sink_activation_t2_d8_ready0",
+    "status": "PASS",
+    "exit_code": 0
+  },
+  {
+    "name": "kimi_cpu_sink_activation_t2_d8_ready1",
+    "status": "PASS",
+    "exit_code": 0
+  },
+  {
+    "name": "kimi_cpu_sink_activation_t16_d1_ready0",
+    "status": "PASS",
+    "exit_code": 0
+  },
+  {
+    "name": "kimi_cpu_sink_activation_t16_d1_ready1",
+    "status": "PASS",
+    "exit_code": 0
+  },
+  {
+    "name": "kimi_cpu_sink_activation_t16_d8_ready0",
+    "status": "PASS",
+    "exit_code": 0
+  },
+  {
+    "name": "kimi_cpu_sink_activation_t16_d8_ready1",
+    "status": "PASS",
+    "exit_code": 0
+  },
+  {
+    "name": "kimi_cpu_sink_early_t2_d1_ready0",
+    "status": "PASS",
+    "exit_code": 0
+  },
+  {
+    "name": "kimi_cpu_sink_poll_t2_d1_ready0",
+    "status": "PASS",
+    "exit_code": 0
+  },
+  {
+    "name": "kimi_cpu_sink_early_t2_d1_ready1",
+    "status": "PASS",
+    "exit_code": 0
+  },
+  {
+    "name": "kimi_cpu_sink_poll_t2_d1_ready1",
+    "status": "PASS",
+    "exit_code": 0
+  },
+  {
+    "name": "kimi_cpu_sink_early_t2_d8_ready0",
+    "status": "PASS",
+    "exit_code": 0
+  },
+  {
+    "name": "kimi_cpu_sink_poll_t2_d8_ready0",
+    "status": "PASS",
+    "exit_code": 0
+  },
+  {
+    "name": "kimi_cpu_sink_early_t2_d8_ready1",
+    "status": "PASS",
+    "exit_code": 0
+  },
+  {
+    "name": "kimi_cpu_sink_poll_t2_d8_ready1",
+    "status": "PASS",
+    "exit_code": 0
+  },
+  {
+    "name": "kimi_cpu_sink_early_t16_d1_ready0",
+    "status": "PASS",
+    "exit_code": 0
+  },
+  {
+    "name": "kimi_cpu_sink_poll_t16_d1_ready0",
+    "status": "PASS",
+    "exit_code": 0
+  },
+  {
+    "name": "kimi_cpu_sink_early_t16_d1_ready1",
+    "status": "PASS",
+    "exit_code": 0
+  },
+  {
+    "name": "kimi_cpu_sink_poll_t16_d1_ready1",
+    "status": "PASS",
+    "exit_code": 0
+  },
+  {
+    "name": "kimi_cpu_sink_early_t16_d8_ready0",
+    "status": "PASS",
+    "exit_code": 0
+  },
+  {
+    "name": "kimi_cpu_sink_poll_t16_d8_ready0",
+    "status": "PASS",
+    "exit_code": 0
+  },
+  {
+    "name": "kimi_cpu_sink_early_t16_d8_ready1",
+    "status": "PASS",
+    "exit_code": 0
+  },
+  {
+    "name": "kimi_cpu_sink_poll_t16_d8_ready1",
+    "status": "PASS",
+    "exit_code": 0
+  },
+  {
+    "name": "kimi_cpu_sink_role_major_t2_d1_ready0",
+    "status": "PASS",
+    "exit_code": 0
+  },
+  {
+    "name": "kimi_cpu_sink_role_major_t2_d1_ready1",
+    "status": "PASS",
+    "exit_code": 0
+  },
+  {
+    "name": "kimi_cpu_sink_role_major_t2_d8_ready0",
+    "status": "PASS",
+    "exit_code": 0
+  },
+  {
+    "name": "kimi_cpu_sink_role_major_t2_d8_ready1",
+    "status": "PASS",
+    "exit_code": 0
+  },
+  {
+    "name": "kimi_cpu_sink_role_major_t16_d1_ready0",
+    "status": "PASS",
+    "exit_code": 0
+  },
+  {
+    "name": "kimi_cpu_sink_role_major_t16_d1_ready1",
+    "status": "PASS",
+    "exit_code": 0
+  },
+  {
+    "name": "kimi_cpu_sink_role_major_t16_d8_ready0",
+    "status": "PASS",
+    "exit_code": 0
+  },
+  {
+    "name": "kimi_cpu_sink_role_major_t16_d8_ready1",
+    "status": "PASS",
+    "exit_code": 0
+  },
+  {
+    "name": "kimi_cpu_sink_nonblocking_down_t2_d1_fixed0",
+    "status": "PASS",
+    "exit_code": 0
+  },
+  {
+    "name": "kimi_cpu_sink_nonblocking_down_t2_d1_fixed1",
+    "status": "PASS",
+    "exit_code": 0
+  },
+  {
+    "name": "kimi_cpu_sink_nonblocking_down_t2_d8_fixed0",
+    "status": "PASS",
+    "exit_code": 0
+  },
+  {
+    "name": "kimi_cpu_sink_nonblocking_down_t2_d8_fixed1",
+    "status": "PASS",
+    "exit_code": 0
+  },
+  {
+    "name": "kimi_cpu_sink_nonblocking_down_t16_d1_fixed0",
+    "status": "PASS",
+    "exit_code": 0
+  },
+  {
+    "name": "kimi_cpu_sink_nonblocking_down_t16_d1_fixed1",
+    "status": "PASS",
+    "exit_code": 0
+  },
+  {
+    "name": "kimi_cpu_sink_nonblocking_down_t16_d8_fixed0",
+    "status": "PASS",
+    "exit_code": 0
+  },
+  {
+    "name": "kimi_cpu_sink_nonblocking_down_t16_d8_fixed1",
+    "status": "PASS",
+    "exit_code": 0
+  },
+  {
+    "name": "kimi_cpu_sink_early_cache",
+    "status": "PASS",
+    "exit_code": 0
+  },
+  {
+    "name": "kimi_cpu_sink_poll_early",
+    "status": "PASS",
+    "exit_code": 0
+  },
+  {
+    "name": "kimi_cpu_sink_ordinary_schedule_t2_d1",
+    "status": "PASS",
+    "exit_code": 0
+  },
+  {
+    "name": "kimi_cpu_sink_ordinary_schedule_t2_d8",
+    "status": "PASS",
+    "exit_code": 0
+  },
+  {
+    "name": "kimi_cpu_sink_ordinary_schedule_t12_d1",
+    "status": "PASS",
+    "exit_code": 0
+  },
+  {
+    "name": "kimi_cpu_sink_ordinary_schedule_t12_d8",
+    "status": "PASS",
+    "exit_code": 0
+  },
+  {
+    "name": "kimi_cpu_sink_ordinary_schedule_t16_d1",
+    "status": "PASS",
+    "exit_code": 0
+  },
+  {
+    "name": "kimi_cpu_sink_ordinary_schedule_t16_d8",
+    "status": "PASS",
+    "exit_code": 0
+  },
+  {
+    "name": "kimi_cpu_sink_trace_profile",
+    "status": "PASS",
+    "exit_code": 0
+  },
+  {
+    "name": "kimi_cpu_sink_prefetch",
+    "status": "PASS",
+    "exit_code": 0
+  },
+  {
+    "name": "kimi_cpu_sink_cache_load",
+    "status": "PASS",
+    "exit_code": 0
+  },
+  {
+    "name": "kimi_cpu_sink_work_reclaim",
+    "status": "PASS",
+    "exit_code": 0
+  },
+  {
+    "name": "kimi_cpu_sink_registered",
+    "status": "PASS",
+    "exit_code": 0
+  },
+  {
+    "name": "kimi_cpu_sink_cache_t2_fixed0",
+    "status": "PASS",
+    "exit_code": 0
+  },
+  {
+    "name": "kimi_cpu_sink_cache_t2_fixed1",
+    "status": "PASS",
+    "exit_code": 0
+  },
+  {
+    "name": "kimi_cpu_sink_cache_t4_fixed0",
+    "status": "PASS",
+    "exit_code": 0
+  },
+  {
+    "name": "kimi_cpu_sink_cache_t4_fixed1",
+    "status": "PASS",
+    "exit_code": 0
+  },
+  {
+    "name": "kimi_cpu_sink_max_cache_t4_d1",
+    "status": "PASS",
+    "exit_code": 0
+  },
+  {
+    "name": "kimi_cpu_sink_max_cache_t4_d8",
+    "status": "PASS",
+    "exit_code": 0
+  },
+  {
+    "name": "kimi_cpu_sink_max_cache_t16_d1",
+    "status": "PASS",
+    "exit_code": 0
+  },
+  {
+    "name": "kimi_cpu_sink_max_cache_t16_d8",
+    "status": "PASS",
+    "exit_code": 0
+  },
+  {
+    "name": "kimi_cpu_sink_large_lru_priority",
+    "status": "PASS",
+    "exit_code": 0
+  },
+  {
+    "name": "kimi_cpu_sink_policy_lru_priority_fixed0",
+    "status": "PASS",
+    "exit_code": 0
+  },
+  {
+    "name": "kimi_cpu_sink_policy_lru_priority_fixed1",
+    "status": "PASS",
+    "exit_code": 0
+  },
+  {
+    "name": "kimi_cpu_sink_large_lru_uniform",
+    "status": "PASS",
+    "exit_code": 0
+  },
+  {
+    "name": "kimi_cpu_sink_policy_lru_uniform_fixed0",
+    "status": "PASS",
+    "exit_code": 0
+  },
+  {
+    "name": "kimi_cpu_sink_policy_lru_uniform_fixed1",
+    "status": "PASS",
+    "exit_code": 0
+  },
+  {
+    "name": "kimi_cpu_sink_large_lru_global",
+    "status": "PASS",
+    "exit_code": 0
+  },
+  {
+    "name": "kimi_cpu_sink_policy_lru_global_fixed0",
+    "status": "PASS",
+    "exit_code": 0
+  },
+  {
+    "name": "kimi_cpu_sink_policy_lru_global_fixed1",
+    "status": "PASS",
+    "exit_code": 0
+  },
+  {
+    "name": "kimi_cpu_sink_large_lfu_priority",
+    "status": "PASS",
+    "exit_code": 0
+  },
+  {
+    "name": "kimi_cpu_sink_policy_lfu_priority_fixed0",
+    "status": "PASS",
+    "exit_code": 0
+  },
+  {
+    "name": "kimi_cpu_sink_policy_lfu_priority_fixed1",
+    "status": "PASS",
+    "exit_code": 0
+  },
+  {
+    "name": "kimi_cpu_sink_large_lfu_uniform",
+    "status": "PASS",
+    "exit_code": 0
+  },
+  {
+    "name": "kimi_cpu_sink_policy_lfu_uniform_fixed0",
+    "status": "PASS",
+    "exit_code": 0
+  },
+  {
+    "name": "kimi_cpu_sink_policy_lfu_uniform_fixed1",
+    "status": "PASS",
+    "exit_code": 0
+  },
+  {
+    "name": "kimi_cpu_sink_large_lfu_global",
+    "status": "PASS",
+    "exit_code": 0
+  },
+  {
+    "name": "kimi_cpu_sink_policy_lfu_global_fixed0",
+    "status": "PASS",
+    "exit_code": 0
+  },
+  {
+    "name": "kimi_cpu_sink_policy_lfu_global_fixed1",
+    "status": "PASS",
+    "exit_code": 0
+  },
+  {
+    "name": "kimi_cpu_sink_large_decay_priority",
+    "status": "PASS",
+    "exit_code": 0
+  },
+  {
+    "name": "kimi_cpu_sink_policy_decay_priority_fixed0",
+    "status": "PASS",
+    "exit_code": 0
+  },
+  {
+    "name": "kimi_cpu_sink_policy_decay_priority_fixed1",
+    "status": "PASS",
+    "exit_code": 0
+  },
+  {
+    "name": "kimi_cpu_sink_large_decay_uniform",
+    "status": "PASS",
+    "exit_code": 0
+  },
+  {
+    "name": "kimi_cpu_sink_policy_decay_uniform_fixed0",
+    "status": "PASS",
+    "exit_code": 0
+  },
+  {
+    "name": "kimi_cpu_sink_policy_decay_uniform_fixed1",
+    "status": "PASS",
+    "exit_code": 0
+  },
+  {
+    "name": "kimi_cpu_sink_large_decay_global",
+    "status": "PASS",
+    "exit_code": 0
+  },
+  {
+    "name": "kimi_cpu_sink_policy_decay_global_fixed0",
+    "status": "PASS",
+    "exit_code": 0
+  },
+  {
+    "name": "kimi_cpu_sink_policy_decay_global_fixed1",
+    "status": "PASS",
+    "exit_code": 0
+  },
+  {
+    "name": "kimi_cpu_sink_large_count_decay2_priority",
+    "status": "PASS",
+    "exit_code": 0
+  },
+  {
+    "name": "kimi_cpu_sink_policy_count_decay2_priority_fixed0",
+    "status": "PASS",
+    "exit_code": 0
+  },
+  {
+    "name": "kimi_cpu_sink_policy_count_decay2_priority_fixed1",
+    "status": "PASS",
+    "exit_code": 0
+  },
+  {
+    "name": "kimi_cpu_sink_large_count_decay2_uniform",
+    "status": "PASS",
+    "exit_code": 0
+  },
+  {
+    "name": "kimi_cpu_sink_policy_count_decay2_uniform_fixed0",
+    "status": "PASS",
+    "exit_code": 0
+  },
+  {
+    "name": "kimi_cpu_sink_policy_count_decay2_uniform_fixed1",
+    "status": "PASS",
+    "exit_code": 0
+  },
+  {
+    "name": "kimi_cpu_sink_large_count_decay2_global",
+    "status": "PASS",
+    "exit_code": 0
+  },
+  {
+    "name": "kimi_cpu_sink_policy_count_decay2_global_fixed0",
+    "status": "PASS",
+    "exit_code": 0
+  },
+  {
+    "name": "kimi_cpu_sink_policy_count_decay2_global_fixed1",
+    "status": "PASS",
+    "exit_code": 0
+  },
+  {
+    "name": "kimi_cpu_prefill_graph",
+    "status": "PASS",
+    "exit_code": 0
+  },
+  {
+    "name": "kimi_cpu_prefill",
+    "status": "PASS",
+    "exit_code": 0
+  },
+  {
+    "name": "kimi_cpu_prefill_retain_d1",
+    "status": "PASS",
+    "exit_code": 0
+  },
+  {
+    "name": "kimi_cpu_prefill_retain_d8",
+    "status": "PASS",
+    "exit_code": 0
+  },
+  {
+    "name": "kimi_cpu_prefill_registered",
+    "status": "PASS",
+    "exit_code": 0
+  },
+  {
+    "name": "kimi_cpu_prefill_cache_t2_fixed0",
+    "status": "PASS",
+    "exit_code": 0
+  },
+  {
+    "name": "kimi_cpu_prefill_cache_t2_fixed1",
+    "status": "PASS",
+    "exit_code": 0
+  },
+  {
+    "name": "kimi_cpu_prefill_cache_t4_fixed0",
+    "status": "PASS",
+    "exit_code": 0
+  },
+  {
+    "name": "kimi_cpu_prefill_cache_t4_fixed1",
+    "status": "PASS",
+    "exit_code": 0
+  }
+]

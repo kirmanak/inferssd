@@ -38,9 +38,9 @@ int main(int argc, char ** argv) {
         json result = {{"key", row.at("key")}, {"group", row.at("group")},
             {"tokens", tokens}, {"old_tokens", old_tokens},
             {"input_spans", parsed.at("chat_input_spans")},
-            {"template_bytes_equal", text == row.at("expected_prompt")},
-            {"old_ids_equal", old_tokens == row.at("expected_tokens")},
-            {"new_ids_equal", tokens == row.at("expected_tokens")},
+            {"template_bytes_equal", text == row.at("expected_prompt").get<std::string>()},
+            {"old_ids_equal", old_tokens == row.at("expected_tokens").get<std::vector<llama_token>>()},
+            {"new_ids_equal", tokens == row.at("expected_tokens").get<std::vector<llama_token>>()},
             {"source_sha256", row.at("source_sha256")}};
         output << result.dump() << '\n';
         ++n;

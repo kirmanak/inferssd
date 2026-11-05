@@ -1138,3 +1138,107 @@ pass 2 prompt_ms=5726.034 prompt_per_second=87.32 content=</think>
 The overlapped copy was hiding the upload. Without it, the device path
 uploads those weights during the layer. 5726 ms is farther from 1250.
 Not kept.
+
+## Independent validation after the Grok handoff (2026-11-05)
+
+The handoff ended at `bd4fae2`, with 19 commits not yet pushed to
+`fork/t3/prefill-100`. Its 15.807 tok/s claim was calculated from the last
+128 `[kimi_sched] splits=98 us=...` timers of a 256-token completion.
+These are scheduler intervals, not timestamps of emitted output tokens.
+The journal had not yet recorded that decode change.
+
+The decode implementation keeps hot experts in Vulkan device memory, admits
+an expert after its second sighting, uploads during dense GPU fence waits,
+records the following dense graph early, and reads expert outputs back in
+the expert graph's command buffer. CPU experts still handle cache misses.
+The discrete-device cache has fixed Qwen3.8 shape and layer limits; these
+measurements validate this machine and checkpoint, not other GPU vendors,
+models, concurrent sessions, or operating systems.
+
+Validation found and corrected three problems before pushing:
+
+- The sink cached resolver results for its entire lifetime. A resolver may
+  change a range or descriptor between runs. Existing tests failed at
+  `after_short_read_recovery`, `fixed_unregister_grow_register`, and
+  `ub2_holes_duplicate_zero` (the last reported missing resolver calls).
+  Removed that memoization and restored per-run direct-descriptor checks.
+  The owned source index still caches its immutable descriptor metadata;
+  it now fills that table during open, avoiding allocation and mutation
+  in concurrent, `noexcept` lookups.
+- Decode-only scheduling also engaged during the server's two-token
+  startup probe. With default settings, the server aborted at layer 2
+  with `invalid CPU prefill expert ID or weight`. Disabling the decode
+  scheduling paths let it start. Those paths now require an actual
+  `inp_tokens` input with one token; small matrix widths alone do not
+  establish that a graph is decode. The original server invocation then
+  started and completed both prompt requests with default settings.
+- A full build failed in `test-server-chat-literal.cpp` because it compared
+  C++ strings/vectors directly with JSON values. Explicitly extracting the
+  expected string/token vector keeps the same assertions and builds with
+  the installed GCC 16 / JSON headers.
+
+Final code build succeeded:
+
+```sh
+distrobox enter inferssd -- bash -lc \
+  'cd /var/home/kirmanak/.t3/worktrees/local-ai/t3-4dbd2178 && cmake --build build-linux-cpu -j6'
+```
+
+Unit tests use `ctest --test-dir build-linux-cpu --output-on-failure -j2 -L unit`
+in that container.
+The affected test selection is
+`^(kimi_cpu_sink|kimi_cpu_prefill|ssd_source_index|sched_inplace)`.
+Running it only in the container skipped 109 memory-envelope tests, so the
+actual CTest commands were also executed on the host inside
+`systemd-run --user --scope -p MemoryMax=8G -p MemorySwapMax=0`.
+
+On the final code, all **123 affected tests passed with zero skips**, and
+all **13 unit tests passed**. The explicit Vulkan expert test also passed:
+`VULKAN_EXPERT_MATCH`, relative L2 error `0.00347405` against its CPU
+reference. The earlier failing recovery, range-growth, and resolver-call
+assertions were not weakened. The server startup regression is covered by
+rerunning the real two-request server invocation; it requires the local
+104 GiB checkpoint and is not an asset-free unit test.
+
+Final measurements, RX 9070 XT / RADV, six CPU threads, 52 GiB process
+memory limit, no swap, same local GGUF and expert index as above:
+
+| check | result |
+| --- | --- |
+| cold 500-token prompt, server request 1 | 8112.638 ms, 61.63 tok/s, EOS |
+| warm 500-token prompt, server request 2, no prefix reuse | 2871.216 ms, 174.14 tok/s, `</think>` |
+| last 128 scheduler intervals of `llama-completion -n 256` | 64.390 ms/interval, 15.530 tok/s |
+| external timestamps between graph completions 128 and 256 | 15.075 completions/s |
+| 256-token greedy output versus `INFERSSD_DECODE_GPU=0` | identical generated text, 1197 UTF-8 bytes |
+
+The cold server EOS also appears in the existing `prefill-100-pass1` and
+`prefill-base-pass1` records; this validation does not establish useful cold
+prompt output quality. The warm prompt rate remains above 100 tok/s, but
+the earlier fastest warm timings were not reproduced in this run.
+Neither the scheduler timer nor graph-completion timestamps are a full
+client token-delivery benchmark. The CPU-reference rerun overlapped the
+regression suite, so its timings are not used for a speed comparison.
+
+The generated sample matched byte for byte with GPU experts enabled and
+disabled on the final code. That is evidence for this prompt, not a general
+quality evaluation or proof of identical token IDs. During validation, the
+optional `INFERSSD_DECODE_CHECK=1` probe on the resolver-fixed tree flagged
+21 of 64 checks: maximum absolute difference `0.001236`, maximum relative
+difference `1.236` with a denominator floor of `1e-3`. The diagnostic
+substitutes CPU outputs on a mismatch, so that run is not counted as a
+successful GPU parity check. It preceded the final startup guard. Numerical
+parity remains unproven; the small synthetic Vulkan test and the matching
+256-token sample do not remove that limitation.
+
+Raw scheduler intervals, external timestamps, exact decode argv,
+prompt hash, generated sample, both server-request summaries, test verdicts,
+and final source hashes are archived in
+[validation-2026-11-05](validation-2026-11-05/validation.json).
+The [decode record](validation-2026-11-05/decode.json) retains the original
+HEAD plus the dirty code-diff hash at measurement time. Run its `command`
+with `GGML_VK_VISIBLE_DEVICES=0` under
+`systemd-run --user --scope -p MemoryMax=52G -p MemorySwapMax=0` to reproduce
+the completion. Repeat with `INFERSSD_DECODE_GPU=0` for the text reference.
+For the warm prompt check, use the same model/settings with
+`inferssd-server`, then send the prompt twice to `/completion` with
+`n_predict=1`, `temperature=0`, and `cache_prompt=false`.
