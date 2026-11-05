@@ -9,6 +9,9 @@ struct close_probe { void operator()(FILE * file) const noexcept { std::fclose(f
 }
 struct source_index::implementation {
     std::unique_ptr<c0::expert_index> index;
+    // is_direct is an fcntl. A token resolves every selected role, and the
+    // descriptor flags do not change for an open file.
+    std::vector<signed char> direct_ok;
 };
 
 source_index::source_index(std::unique_ptr<implementation> state) : state_(std::move(state)) {}
@@ -80,7 +83,15 @@ source_view source_index::view() noexcept {
         c0::extent extent;
         if (!index.locate(name, expert, bytes, extent, false)) { return false; }
         const int direct = index.borrowed_direct_fd(extent.source_id);
-        if (!platform::is_direct(direct)) { return false; }
+        auto * self = static_cast<source_index *>(opaque);
+        auto & known = self->state_->direct_ok;
+        const int source_id = extent.source_id;
+        if (source_id < 0) { return false; }
+        if (size_t(source_id) >= known.size()) { known.resize(size_t(source_id) + 1, 0); }
+        if (known[size_t(source_id)] == 0) {
+            known[size_t(source_id)] = platform::is_direct(direct) ? 1 : -1;
+        }
+        if (known[size_t(source_id)] < 0) { return false; }
         *fd = direct; *offset = extent.offset; *logical_bytes = extent.logical_bytes;
         return true;
     }, [](void * opaque, const char * name, size_t bytes, size_t * block_bytes) noexcept -> size_t {

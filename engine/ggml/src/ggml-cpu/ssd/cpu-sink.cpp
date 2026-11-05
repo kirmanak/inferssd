@@ -38,6 +38,7 @@
 #include <limits>
 #include <map>
 #include <memory>
+#include <unordered_map>
 #include <mutex>
 #include <new>
 #include <stdexcept>
@@ -147,11 +148,32 @@ struct sink_buffer {
 };
 
 // Whether a descriptor reads directly at the granule the ranges are padded to.
-// The alignment is a device query on Windows: ask once per descriptor in a run.
+// is_direct is an fcntl. A token resolves about 1400 roles, and asking every
+// time was the gap outside the expert walk. The flag does not change for an
+// open descriptor, so one answer per fd is kept for the life of the sink.
 struct sink_direct_check {
     int aligned = -1;
+    int known_fd[8] = { -1, -1, -1, -1, -1, -1, -1, -1 };
+    bool known_ok[8] = {};
+    int nknown = 0;
     bool operator()(int fd) {
-        if (!ssd::platform::is_direct(fd)) { return false; }
+        bool ok = false;
+        bool seen = false;
+        for (int i = 0; i < nknown; ++i) {
+            if (known_fd[i] != fd) { continue; }
+            ok = known_ok[i];
+            seen = true;
+            break;
+        }
+        if (!seen) {
+            ok = ssd::platform::is_direct(fd);
+            if (nknown < 8) {
+                known_fd[nknown] = fd;
+                known_ok[nknown] = ok;
+                ++nknown;
+            }
+        }
+        if (!ok) { return false; }
         if (fd != aligned) {
             if (sink_direct_granule % ssd::platform::direct_alignment(fd) != 0) { return false; }
             aligned = fd;
@@ -606,13 +628,68 @@ struct kimi_cpu_sink {
     // kimi_cpu_sink_cache_begin forgets it, which still catches a source replaced between tokens, at the same descriptor
     // too. run_mutex guards the list: every caller of resolve and kimi_cpu_sink_cache_begin holds it.
     std::vector<std::pair<int, ssd::platform::file_identity>> file_identities;
-    bool resolve(const char * tensor, int32_t expert, kimi_cpu_sink_source * source) {
-        if (!resolver(userdata, tensor, expert, source)) { return false; }
+    sink_direct_check direct_fds;
+    // The index lookup and its fcntl are the same answer for a layer, role and
+    // expert for the life of the open files. Graph tensor pointers are not: a
+    // rebuilt graph made a pointer key miss every token.
+    struct resolve_memo {
+        int fd = -1;
+        uint64_t offset = 0;
+        size_t nbytes = 0;
+        size_t data_offset = 0;
+        size_t payload = 0;
+        bool filled = false;
+    };
+    std::unordered_map<uint32_t, resolve_memo> resolve_memos;
+    uint64_t resolve_hits = 0;
+    uint64_t resolve_misses = 0;
+    double resolve_us = 0;
+    static bool expert_slot_key(const char * name, int32_t expert, uint32_t * key) {
+        int layer = -1, consumed = 0;
+        if (!name || expert < 0 || expert >= 4096 ||
+                std::sscanf(name, "blk.%d.ffn_%n", &layer, &consumed) != 1 || layer < 0 || layer >= 256) {
+            return false;
+        }
+        int role = -1;
+        const char * rest = name + consumed;
+        if (std::strncmp(rest, "up_exps", 7) == 0) { role = 0; }
+        else if (std::strncmp(rest, "gate_exps", 9) == 0) { role = 1; }
+        else if (std::strncmp(rest, "down_exps", 9) == 0) { role = 2; }
+        else { return false; }
+        *key = (uint32_t(layer) * 3u + uint32_t(role)) * 4096u + uint32_t(expert);
+        return true;
+    }
+    bool attach_identity(kimi_cpu_sink_source * source) {
         for (const auto & known : file_identities) {
             if (known.first == source->fd_direct) { source->file = known.second; return true; }
         }
         if (!ssd::platform::identity(source->fd_direct, source->file)) { return false; }
         file_identities.emplace_back(source->fd_direct, source->file);
+        return true;
+    }
+    bool resolve(const char * tensor, int32_t expert, kimi_cpu_sink_source * source) {
+        uint32_t key = 0;
+        const bool keyed = expert_slot_key(tensor, expert, &key);
+        if (keyed) {
+            const auto found = resolve_memos.find(key);
+            if (found != resolve_memos.end() && found->second.filled) {
+                source->fd_direct = found->second.fd;
+                source->offset = found->second.offset;
+                source->nbytes = found->second.nbytes;
+                source->data_offset = found->second.data_offset;
+                source->payload_nbytes = found->second.payload;
+                source->file = {};
+                ++resolve_hits;
+                return attach_identity(source);
+            }
+        }
+        if (!resolver(userdata, tensor, expert, source)) { return false; }
+        if (!attach_identity(source)) { return false; }
+        if (keyed) {
+            resolve_memos[key] = resolve_memo{ source->fd_direct, source->offset, source->nbytes,
+                source->data_offset, source->payload_nbytes, true };
+        }
+        ++resolve_misses;
         return true;
     }
 
@@ -814,6 +891,16 @@ struct kimi_cpu_sink {
     std::vector<float> resident_weight, resident_up_act, resident_gate_act;
     std::vector<uint8_t> resident_quant;
     uint64_t resident_layers = 0;
+    // Decode GPU cache. gpu_hit[i] is an expert whose weights are already on the device, so the CPU row loops skip it.
+    int decode_layer = -1;
+    const float * f32_input = nullptr;
+    ggml_type weight_up_type = GGML_TYPE_F32;
+    ggml_type weight_down_type = GGML_TYPE_F32;
+    std::vector<uint8_t> gpu_hit;
+    std::vector<ggml_vk_decode_expert> decode_experts;
+    bool decode_prepared = false;
+    bool decode_launch_pending = false;
+    bool decode_launch_failed = false;
     const uint8_t * down_quant_data = nullptr;
     size_t quant_hidden_stride = 0;
     // Selected from the expert tensor types by prepare(); up and gate share one.
@@ -2013,13 +2100,28 @@ struct kimi_cpu_sink {
         const size_t stride = sink.row_bytes_up;
         const void * input = sink.quant_input.data();
         const int k = sink.latent;
+        // Thread 0 records the device graph while the other threads walk the misses.
+        if (ith == 0 && sink.decode_launch_pending) {
+            sink.decode_launch_pending = false;
+            if (!sink.vulkan_api || !sink.vulkan_api->decode_launch ||
+                    !sink.vulkan_api->decode_launch(sink.vulkan_session)) {
+                sink.decode_launch_failed = true;
+            }
+        }
         for (int expert = 0; expert < n; ++expert) {
+            if (expert < int(sink.gpu_hit.size()) && sink.gpu_hit[size_t(expert)]) { continue; }
             const char * up = sink.resident_up[size_t(expert)];
             const char * gate = sink.resident_gate[size_t(expert)];
             float * u = sink.resident_up_act.data() + size_t(expert) * size_t(rows);
             float * g = sink.resident_gate_act.data() + size_t(expert) * size_t(rows);
+            // One matrix, then the other. Alternating rows jumped between two
+            // distant buffers and cut the stream the dot kernel was already reading.
             for (int row = begin; row < end; ++row) {
+                if (row + 4 < end) { __builtin_prefetch(up + size_t(row + 4) * stride, 0, 1); }
                 sink.dot_up(k, &u[row], 0, up + size_t(row) * stride, 0, input, 0, 1);
+            }
+            for (int row = begin; row < end; ++row) {
+                if (row + 4 < end) { __builtin_prefetch(gate + size_t(row + 4) * stride, 0, 1); }
                 sink.dot_up(k, &g[row], 0, gate + size_t(row) * stride, 0, input, 0, 1);
             }
         }
@@ -2035,11 +2137,13 @@ struct kimi_cpu_sink {
         const size_t stride = sink.row_bytes_down;
         const int k = sink.hidden;
         for (int expert = 0; expert < n; ++expert) {
+            if (expert < int(sink.gpu_hit.size()) && sink.gpu_hit[size_t(expert)]) { continue; }
             const char * down = sink.resident_down[size_t(expert)];
             const uint8_t * hidden_q = sink.resident_quant.data() + size_t(expert) * sink.quant_hidden_stride;
             float * destination = sink.expert_output.data() + size_t(expert) * size_t(rows);
             const float weight = sink.resident_weight[size_t(expert)];
             for (int row = begin; row < end; ++row) {
+                if (row + 4 < end) { __builtin_prefetch(down + size_t(row + 4) * stride, 0, 1); }
                 float value;
                 sink.dot_down(k, &value, 0, down + size_t(row) * stride, 0, hidden_q, 0, 1);
                 // Same rounded multiply the per-expert path stores before the slot-order sum.
@@ -2074,24 +2178,136 @@ struct kimi_cpu_sink {
             resident_weight[expert] = request.weight;
             expert_computed[expert] = 1;
         }
-        const auto compute_start = sink_clock::now();
-        const auto up_start = compute_start;
-        parallel_phase(resident_up_rows, this, false);
-        current.up_gate_us += elapsed_us(up_start);
-        const auto quant_start = sink_clock::now();
-        for (size_t expert = 0; expert < n; ++expert) {
-            float * gate = resident_gate_act.data() + expert * size_t(hidden);
-            const float * up = resident_up_act.data() + expert * size_t(hidden);
-            ggml_vec_swiglu_f32(hidden, gate, gate, up);
-            quantize_hidden(gate, resident_quant.data() + expert * quant_hidden_stride, hidden);
+        gpu_hit.assign(n, 0);
+        decode_prepared = false;
+        ggml_vk_decode_batch batch = {};
+        decode_experts.resize(n);
+        void * const vk_session = kimi_cpu_sink_vulkan_session(this);
+        const auto prepare_start = sink_clock::now();
+        if (vulkan_api && vulkan_api->decode_prepare && vulkan_api->decode_launch && vulkan_api->decode_wait &&
+                vk_session && f32_input && decode_layer >= 0 && n <= 16) {
+            for (size_t expert = 0; expert < n; ++expert) {
+                decode_experts[expert] = { decode_layer, requests[expert].id, resident_up[expert], resident_gate[expert],
+                    resident_down[expert], resident_weight[expert], expert_output.data() + expert * size_t(latent) };
+            }
+            batch = { int32_t(weight_up_type), int32_t(weight_down_type), latent, hidden,
+                row_bytes_up * size_t(hidden), row_bytes_down * size_t(latent), f32_input,
+                decode_experts.data(), int(n), gpu_hit.data() };
+            decode_prepared = vulkan_api->decode_prepare(vk_session, &batch);
+            if (!decode_prepared) { std::fill(gpu_hit.begin(), gpu_hit.end(), 0); }
         }
-        current.hidden_quantize_us += elapsed_us(quant_start);
-        const auto down_start = sink_clock::now();
-        parallel_phase(resident_down_rows, this, true);
-        current.down_reduce_us += elapsed_us(down_start);
+        const double prepare_us = elapsed_us(prepare_start);
+        bool any_gpu = false;
+        for (uint8_t hit : gpu_hit) { any_gpu = any_gpu || hit; }
+        decode_launch_pending = any_gpu;
+        decode_launch_failed = false;
+        auto cpu_layer = [&] {
+            const auto up_start = sink_clock::now();
+            parallel_phase(resident_up_rows, this, false);
+            current.up_gate_us += elapsed_us(up_start);
+            const auto quant_start = sink_clock::now();
+            for (size_t expert = 0; expert < n; ++expert) {
+                if (expert < gpu_hit.size() && gpu_hit[expert]) { continue; }
+                float * gate = resident_gate_act.data() + expert * size_t(hidden);
+                const float * up = resident_up_act.data() + expert * size_t(hidden);
+                ggml_vec_swiglu_f32(hidden, gate, gate, up);
+                quantize_hidden(gate, resident_quant.data() + expert * quant_hidden_stride, hidden);
+            }
+            current.hidden_quantize_us += elapsed_us(quant_start);
+            const auto down_start = sink_clock::now();
+            parallel_phase(resident_down_rows, this, true);
+            current.down_reduce_us += elapsed_us(down_start);
+        };
+        const auto compute_start = sink_clock::now();
+        bool any_cpu = false;
+        int n_gpu = 0;
+        for (size_t expert = 0; expert < n; ++expert) {
+            if (expert >= gpu_hit.size() || !gpu_hit[expert]) { any_cpu = true; }
+            else { ++n_gpu; }
+        }
+        if (any_cpu) {
+            cpu_layer();
+        } else if (decode_launch_pending) {
+            decode_launch_pending = false;
+            decode_launch_failed = !vulkan_api->decode_launch(vk_session);
+        }
+        if (decode_launch_failed) {
+            std::fill(gpu_hit.begin(), gpu_hit.end(), 0);
+            static int logged = 0;
+            if (!logged++) { std::fprintf(stderr, "[kimi_vk_decode] launch failed layer=%d\n", decode_layer); }
+            cpu_layer();
+        }
+        if (decode_prepared && !vulkan_api->decode_wait(vk_session, &batch)) {
+            std::fill(gpu_hit.begin(), gpu_hit.end(), 0);
+            std::fprintf(stderr, "[kimi_vk_decode] wait failed layer=%d\n", decode_layer);
+            cpu_layer();
+        } else if (decode_prepared) {
+            // One token of layers, only when asked. A wrong slot read is a large
+            // relative error; quantization noise between the two walks is not.
+            static int checks = -1;
+            if (checks < 0) {
+                const char * env = std::getenv("INFERSSD_DECODE_CHECK");
+                checks = env && env[0] == '1' && env[1] == '\0' ? 64 : 0;
+            }
+            bool any = false;
+            for (uint8_t hit : gpu_hit) { any = any || hit; }
+            if (checks > 0 && any && latent > 0 && expert_output.size() >= requests.size() * size_t(latent)) {
+                const size_t rows = requests.size() * size_t(latent);
+                std::vector<float> gpu(expert_output.begin(), expert_output.begin() + rows);
+                std::vector<uint8_t> was(gpu_hit.begin(), gpu_hit.end());
+                std::fill(gpu_hit.begin(), gpu_hit.end(), 0);
+                cpu_layer();
+                double max_abs = 0, max_rel = 0;
+                int worst = -1;
+                float gpu0 = 0, cpu0 = 0;
+                for (size_t expert = 0; expert < was.size() && expert < requests.size(); ++expert) {
+                    if (!was[expert]) { continue; }
+                    const float * g = gpu.data() + expert * size_t(latent);
+                    const float * c = expert_output.data() + expert * size_t(latent);
+                    for (int row = 0; row < latent; ++row) {
+                        const double diff = std::fabs(double(g[row]) - double(c[row]));
+                        const double scale = std::max(std::fabs(double(c[row])), 1e-3);
+                        if (diff > max_abs) { max_abs = diff; worst = int(expert); gpu0 = g[row]; cpu0 = c[row]; }
+                        max_rel = std::max(max_rel, diff / scale);
+                    }
+                }
+                const bool match = std::isfinite(max_abs) && max_rel < 0.2;
+                if (match) {
+                    for (size_t expert = 0; expert < was.size() && expert < requests.size(); ++expert) {
+                        if (!was[expert]) { continue; }
+                        std::memcpy(expert_output.data() + expert * size_t(latent),
+                            gpu.data() + expert * size_t(latent), size_t(latent) * sizeof(float));
+                    }
+                }
+                --checks;
+                std::fprintf(stderr, "[kimi_vk_decode] check layer=%d up=%d down=%d max_abs=%.4g max_rel=%.4g worst=%d gpu=%.4g cpu=%.4g %s\n",
+                    decode_layer, int(weight_up_type), int(weight_down_type), max_abs, max_rel, worst, gpu0, cpu0,
+                    match ? "ok" : "MISMATCH");
+                std::fflush(stderr);
+            }
+        }
         const double layer_us = elapsed_us(compute_start);
         current.compute_us += layer_us;
         if (n) { observe_decode_threads(layer_us / double(n)); }
+        // One line per token. The scheduler time is the whole token; this is the expert phase inside it.
+        {
+            static double acc_prepare = 0, acc_walk = 0, acc_up = 0, acc_quant = 0, acc_down = 0;
+            static int acc_gpu = 0, acc_n = 0, acc_layers = 0;
+            acc_prepare += prepare_us;
+            acc_walk += layer_us;
+            acc_up += current.up_gate_us;
+            acc_quant += current.hidden_quantize_us;
+            acc_down += current.down_reduce_us;
+            acc_gpu += n_gpu;
+            acc_n += int(n);
+            if (++acc_layers == 48) {
+                std::fprintf(stderr, "[kimi_vk_decode] phase prepare_us=%.0f walk_us=%.0f up_us=%.0f quant_us=%.0f down_us=%.0f gpu=%d/%d\n",
+                    acc_prepare, acc_walk, acc_up, acc_quant, acc_down, acc_gpu, acc_n);
+                std::fflush(stderr);
+                acc_prepare = acc_walk = acc_up = acc_quant = acc_down = 0;
+                acc_gpu = acc_n = acc_layers = 0;
+            }
+        }
         for (size_t expert = 0; expert < n; ++expert) {
             const void * data[3] = { resident_up[expert], resident_gate[expert], resident_down[expert] };
             vram.admit(expert, data, true);
@@ -2561,6 +2777,9 @@ struct kimi_cpu_sink {
         for (const auto & slot : slots) { for (int role = 0; role < 3; ++role) {
             if (slot.role[role].size < max_bytes[role]) { growth = sink_cache::add(growth, max_bytes[role]); }
         } }
+        // A warm token asks for nothing. take() still reads the cgroup, and that
+        // was on the decode path once per layer.
+        if (growth == 0) { return allocated; }
         auto ticket = cache.ledger.client->take(growth, 0, ssd::host::requester::outside, false,
             ssd::host::allocation_class::tracked);
         if (!ticket) { throw std::runtime_error(ticket.error); }
@@ -2600,6 +2819,8 @@ struct kimi_cpu_sink {
             throw std::runtime_error("CPU sink expert shape mismatch");
         }
         latent = static_cast<int>(up->ne[0]); hidden = static_cast<int>(up->ne[1]);
+        weight_up_type = up->type;
+        weight_down_type = down->type;
         // The graph's MUL_MAT_ID kernels: vec_dot of the weight type against the
         // input quantized to its vec_dot_type (Q3_K/Q8_K, MXFP4/Q8_0, ...).
         const auto * up_traits = ggml_get_type_traits_cpu(up->type);
@@ -2612,11 +2833,12 @@ struct kimi_cpu_sink {
         row_bytes_down = ggml_row_size(down->type, hidden);
         requests.clear();
         size_t max_bytes[3] = {};
-        sink_direct_check direct;
+        const auto resolve_start = sink_clock::now();
         for (int slot = 0; slot < nslots; ++slot) {
             if (ids[slot] < 0) { continue; }
             if (ids[slot] >= up->ne[2] || !std::isfinite(weights[slot]) || weights[slot] < 0.0f) {
-                throw std::runtime_error("invalid CPU sink expert id or weight");
+                throw std::runtime_error("invalid CPU sink expert id or weight id=" + std::to_string(ids[slot]) +
+                    " ne2=" + std::to_string(up->ne[2]) + " weight=" + std::to_string(weights[slot]));
             }
             sink_request request = {};
             request.weight = weights[slot];
@@ -2628,7 +2850,7 @@ struct kimi_cpu_sink {
                     throw std::runtime_error("CPU sink pack resolver failed for " + std::string(tensors[role]->name));
                 }
                 const size_t bytes = ggml_row_size(tensors[role]->type, tensors[role]->ne[0]) * tensors[role]->ne[1];
-                if (!direct(source.fd_direct) || source.offset % 4096 || source.nbytes % 4096 ||
+                if (!direct_fds(source.fd_direct) || source.offset % 4096 || source.nbytes % 4096 ||
                     (source.payload_nbytes && source.payload_nbytes != bytes) || source.data_offset >= 4096 ||
                     source.data_offset > source.nbytes || bytes > source.nbytes - source.data_offset ||
                     source.nbytes > source.data_offset + bytes + 4095 ||
@@ -2645,6 +2867,7 @@ struct kimi_cpu_sink {
             }
             requests.push_back(request);
         }
+        resolve_us += elapsed_us(resolve_start);
         if (use_cache && ready_first) {
             // nslots <= 1024 and latent <= 16384: at most 64 MiB. Allocate
             // before the cache admission check so memory.current includes it.
@@ -3933,17 +4156,22 @@ extern "C" bool kimi_cpu_sink_run_activation(
                 "invalid CPU sink input or SiTU parameters" : "invalid CPU sink input or activation parameters");
         }
         if (sink->poisoned) { throw std::runtime_error("CPU sink ring is poisoned after an I/O failure"); }
+        const auto drain_start = sink_clock::now();
         {
             // with the ids checked: an in-flight prefetch of an expert this run uses becomes a hit it waits for
             int layer = -1, consumed = 0;
+            sink->decode_layer = -1;
             if (up && std::sscanf(up->name, "blk.%d.ffn_up_exps.weight%n", &layer, &consumed) == 1 && consumed &&
                     !up->name[consumed]) {
+                sink->decode_layer = layer;
                 sink->prefetch_drain(layer, ids, nslots);
                 sink->mrc.observe(layer, ids, nslots);
             } else {
                 sink->prefetch_drain();
             }
         }
+        const double drain_us = elapsed_us(drain_start);
+        const auto prep_start = sink_clock::now();
         sink->post_exp_norm = activation->post_exp_norm;
         if (sink->post_exp_norm && (!sink->ready_first || !std::isfinite(activation->post_exp_norm_eps) ||
                 activation->post_exp_norm_eps <= 0.0f)) {
@@ -3953,6 +4181,8 @@ extern "C" bool kimi_cpu_sink_run_activation(
         sink->beta = activation->situ_beta; sink->linear_beta = activation->situ_linear_beta;
         sink->swiglu_limit = activation->swiglu_limit;
         sink->prepare(up, gate, down, ids, weights, nslots);
+        const double prep_us = elapsed_us(prep_start);
+        const auto mid_start = sink_clock::now();
         sink->prefetch_keep_used_hits();
         sink->prefetch_count_used();
         if (sink->timeline_active) {
@@ -3961,6 +4191,7 @@ extern "C" bool kimi_cpu_sink_run_activation(
             sink->timeline_call[1] = ggml_time_us();
         }
         sink->output = output;
+        sink->f32_input = input;
         auto compute_start = sink_clock::now();
         double quant_cpu_start = sink->profile_enabled ? sink_thread_cpu_us() : 0.0;
         sink->quantize_input(input, sink->quant_input.data(), sink->latent);
@@ -3984,11 +4215,15 @@ extern "C" bool kimi_cpu_sink_run_activation(
         // The plan reads nothing the reads change (its landing times start at plan.start): planned once they run.
         sink->plan_decode_layer();
         const bool resident = sink->resident_layer_ready();
+        const double mid_us = elapsed_us(mid_start);
+        const auto body_start = sink_clock::now();
         if (resident) {
             sink->compute_resident_layer();
         } else if (sink->nonblocking_down_sched) {
             sink->run_nonblocking_down_schedule();
         }
+        const double body_us = elapsed_us(body_start);
+        const auto tail_start = sink_clock::now();
         const size_t blocking_experts = resident || sink->nonblocking_down_sched ? 0 :
             sink->requests.size() - size_t(sink->vram.hits);
         for (size_t ordinal = 0; ordinal < blocking_experts; ++ordinal) {
@@ -4125,6 +4360,28 @@ extern "C" bool kimi_cpu_sink_run_activation(
         sink->current.total_us = elapsed_us(start);
         sink->current.read_completions = sink->ring.completed() - completed_before;
         sink->current.pending_reads = sink->ring.pending();
+        {
+            static double acc = 0, acc_walk = 0, acc_drain = 0, acc_prep = 0, acc_mid = 0, acc_body = 0, acc_tail = 0;
+            static double acc_resolve = 0;
+            static int layers = 0;
+            acc += sink->current.total_us;
+            acc_walk += sink->current.compute_us;
+            acc_drain += drain_us;
+            acc_prep += prep_us;
+            acc_mid += mid_us;
+            acc_body += body_us;
+            acc_tail += elapsed_us(tail_start);
+            acc_resolve += sink->resolve_us;
+            sink->resolve_us = 0;
+            if (++layers == 48) {
+                std::fprintf(stderr, "[kimi_cpu_sink] token_us=%.0f compute_us=%.0f drain_us=%.0f prep_us=%.0f mid_us=%.0f body_us=%.0f tail_us=%.0f resolve_us=%.0f resolve_hits=%llu resolve_misses=%llu\n",
+                    acc, acc_walk, acc_drain, acc_prep, acc_mid, acc_body, acc_tail, acc_resolve,
+                    (unsigned long long) sink->resolve_hits, (unsigned long long) sink->resolve_misses);
+                std::fflush(stderr);
+                acc = acc_walk = acc_drain = acc_prep = acc_mid = acc_body = acc_tail = acc_resolve = 0;
+                layers = 0;
+            }
+        }
         sink->observe_decode_layer(lanes_us, sink->current.total_us);
         sink->finish_observation();
         if (stats) { *stats = sink->current; }

@@ -3,11 +3,16 @@
 #include "../ggml-ssd/gpu/vulkan-expert.h"
 #include "ggml-vulkan.h"
 
+#include <atomic>
 #include <algorithm>
+#include <cmath>
 #include <chrono>
+#include <condition_variable>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <deque>
+#include <mutex>
 #include <new>
 #include <thread>
 #include <unordered_map>
@@ -16,7 +21,14 @@
 
 namespace {
 
+struct decode_cache;
+std::atomic<decode_cache *> live_cache{nullptr};
+std::atomic<int> upload_window_flag{0};
+
 constexpr uint64_t k_staging_cap = 64ull << 20;
+// Set while a decode layer walks misses. Uploads copy about 4 MB each and
+// were stealing that bandwidth from the walk.
+std::atomic<int> decode_walk_active{0};
 
 void set_error(char * error, size_t error_size, const char * message) {
     if (error && error_size) { std::snprintf(error, error_size, "%s", message ? message : ""); }
@@ -43,6 +55,8 @@ bool expert_supports(int32_t type) {
             return false;
     }
 }
+
+struct decode_cache;
 
 struct expert_session {
     ggml_backend_t backend = nullptr;
@@ -76,6 +90,7 @@ struct expert_session {
     int64_t k = 0;
     int64_t n = 0;
     int n_tokens = 0;
+    decode_cache * decode = nullptr;
 
     explicit expert_session(ggml_backend_t device) : backend(device) {}
 
@@ -104,18 +119,7 @@ struct expert_session {
         }
     }
 
-    ~expert_session() {
-        join_ahead();
-        drop_graph();
-        if (buffer) { ggml_backend_buffer_free(buffer); }
-        if (batch_buffer) { ggml_backend_buffer_free(batch_buffer); }
-        for (auto & slot : ahead_slots) {
-            if (slot.buffer) { ggml_backend_buffer_free(slot.buffer); }
-        }
-        for (auto & buf : slot_buf) {
-            if (buf) { ggml_backend_buffer_free(buf); }
-        }
-    }
+    ~expert_session();
 };
 
 size_t align_up(size_t value, size_t alignment) {
@@ -1017,7 +1021,1527 @@ bool expert_device_layer(void * raw, const ggml_tensor * activation, int32_t up_
     return true;
 }
 
+// Decode weight cache. Hot experts stay in device memory so a one-token layer
+// does not walk their bytes on the CPU. Misses stay on the CPU walk. Uploads
+// copy off the caller's pointers immediately and finish on a side thread, so a
+// later token sees the expert without waiting on this one.
+struct decode_cache {
+    static constexpr int k_layers = 48;
+    static constexpr int k_experts = 512;
+    static constexpr int k_max_n = 16;
+    // A full slab is about 2GB. Binding that as one storage buffer corrupts later
+    // dispatches on this driver. One window stays under the 128MB Vulkan minimum
+    // (28 * 4308480 = 120.6MB). Sixteen slots left a third of a warm token on the
+    // CPU walk; the matmul still pads to 16 because a token uses 10 experts.
+    static constexpr int k_window = 28;
+    static constexpr size_t k_align = 256;
+    static constexpr size_t k_max_up = 1126400;
+    static constexpr size_t k_max_down = 1740800;
+    static constexpr size_t k_gate_off = 1126400;
+    static constexpr size_t k_down_off = 2252800;
+    // The vec shader indexes experts in whole quant blocks, so the slot stride
+    // has to be a multiple of every block size stored here and of the 256-byte
+    // buffer alignment. Q4_K is 144, Q5_K is 176, Q5_1 is 24, Q8_0 is 34.
+    // LCM of those is 430848. Packed slot end is 3993600; 10 * 430848 = 4308480.
+    // A stride that misses Q5_K (layer 2 up/gate) makes the shader read the
+    // next expert at the packed size and the matmul comes back non-finite.
+    static constexpr size_t k_stride = 4308480;
+    static_assert(k_stride % 144 == 0, "Q4_K block");
+    static_assert(k_stride % 176 == 0, "Q5_K block");
+    static_assert(k_stride % 24 == 0, "Q5_1 block");
+    static_assert(k_stride % 34 == 0, "Q8_0 block");
+    static_assert(k_stride % 256 == 0, "alignment");
+    static_assert(k_stride >= k_down_off + k_max_down, "slot fits");
+
+    struct slot_rec {
+        int32_t key = -1;
+        uint16_t freq = 0;
+        uint32_t stamp = 0;
+        int slab = -1;
+        size_t offset = 0;
+        bool ready = false;
+        bool busy = false;
+        // 0 while an acquire is deferred, 1 once the compute queue can read it,
+        // -1 if the upload failed. Not atomic-typed: the slot vector is resized.
+        int acquire_done = 1;
+    };
+    struct slab_rec {
+        ggml_backend_buffer_t buffer = nullptr;
+        int nslots = 0;
+    };
+    struct layer_home {
+        int begin = -1;
+        int slab = -1;
+        int base = 0;
+        // Overflow window. Same 28-slot bind; a second chain only when it has hits.
+        int begin2 = -1;
+        int slab2 = -1;
+        int base2 = 0;
+    };
+    struct job {
+        int slot = -1;
+        ggml_backend_buffer_t buffer = nullptr;
+        size_t offset = 0;
+        // Copied on the worker. The host-cache slot stays until this layer's
+        // admit, which is after the worker has been woken.
+        const void * up = nullptr;
+        const void * gate = nullptr;
+        const void * down = nullptr;
+        size_t up_bytes = 0;
+        size_t down_bytes = 0;
+    };
+    // Owned copy of a job. The host-cache pointers are only valid until the
+    // worker copies them, and that copy stays off the miss walk.
+    struct staged {
+        int slot = -1;
+        ggml_backend_buffer_t buffer = nullptr;
+        size_t offset = 0;
+        std::vector<uint8_t> up;
+        std::vector<uint8_t> gate;
+        std::vector<uint8_t> down;
+    };
+    struct span {
+        ggml_backend_buffer_t buffer = nullptr;
+        size_t offset = 0;
+    };
+    struct gpu_piece {
+        int index = -1;
+        int slab = -1;
+        int local = -1;
+        span up, gate, down;
+        bool imported = false;
+    };
+    struct import_rec {
+        uintptr_t base = 0;
+        size_t bytes = 0;
+        ggml_backend_buffer_t buffer = nullptr;
+    };
+    struct built {
+        int32_t up_type = -1;
+        int32_t down_type = -1;
+        int64_t latent = 0;
+        int64_t hidden = 0;
+        int n = 0;
+        ggml_context * ctx = nullptr;
+        ggml_cgraph * gf = nullptr;
+        ggml_tensor * input = nullptr;
+        ggml_backend_buffer_t scratch = nullptr;
+        void * mapped = nullptr;
+        bool batched = false;
+        ggml_backend_buffer_t pack = nullptr;
+        size_t pack_up = 0, pack_gate = 0, pack_down = 0;
+        ggml_tensor * down_batched = nullptr;
+        std::vector<ggml_tensor *> up_w, gate_w, down_w, down_out;
+        struct chain {
+            ggml_tensor * ids = nullptr;
+            ggml_tensor * down = nullptr;
+            int n = 0;
+            ggml_tensor * up_w = nullptr;
+            ggml_tensor * gate_w = nullptr;
+            ggml_tensor * down_w = nullptr;
+            int span = 0;
+        };
+        // One mul_mat_id chain per slab window. Weights stay in the cache; ids are slot indexes.
+        bool inplace = false;
+        std::vector<chain> chains;
+        std::vector<int> key;
+        uint32_t used = 0;
+    };
+
+    ggml_backend_t backend = nullptr;
+    ggml_backend_buffer_type_t buft = nullptr;
+    std::vector<slab_rec> slabs;
+    std::vector<slot_rec> slots;
+    // One full window per layer, inside a single slab. Ten hits then share one
+    // matmul. A stripe that crossed a slab boundary scattered them into several
+    // chains, and each chain was a new graph.
+    std::vector<layer_home> homes;
+    std::unordered_map<int32_t, int> at;
+    std::vector<uint16_t> seen;
+    std::mutex mu;
+    std::condition_variable cv;
+    std::condition_variable idle_cv;
+    std::deque<job> jobs;
+    std::vector<int> pending_ready;
+    std::atomic<int> upload_busy{0};
+    std::thread worker;
+    bool stop = false;
+    bool failed = false;
+    bool live = false;
+    uint32_t stamp = 0;
+    int admits_window = 0;
+    int evicts_window = 0;
+    int window_layers = 0;
+    int stat_hits = 0;
+    int stat_n = 0;
+    double stat_record = 0;
+    double stat_wait = 0;
+    double stat_copy = 0;
+
+    ggml_vk_decode_batch * held = nullptr;
+    std::vector<int> hit_of;
+    std::vector<gpu_piece> plan;
+    std::vector<import_rec> imports;
+    bool import_off = true;
+    bool batched_broken = false;
+    bool inplace_broken = false;
+    bool plan_imports = false;
+    bool launched_inplace = false;
+    std::vector<int> launched_real;
+    std::vector<built> inplace_pool;
+    int active_inplace = -1;
+    uint32_t pool_clock = 0;
+    int stat_reuse = 0;
+    int stat_build = 0;
+    int stat_import = 0;
+    int stat_cold = 0;
+    int stat_full = 0;
+    int stat_reclaim = 0;
+    int stat_pending = 0;
+    int stat_chains = 0;
+    int stat_multi = 0;
+    std::atomic<int> stat_upload_n{0};
+    std::atomic<int64_t> stat_upload_us{0};
+    std::atomic<int> stat_upload_late{0};
+    int graph_index = -1;
+    bool launched = false;
+    std::atomic<int> vulkan_busy{0};
+    std::vector<built> graphs;
+    std::vector<float> raw;
+
+    ~decode_cache() {
+        {
+            std::lock_guard<std::mutex> lock(mu);
+            stop = true;
+            if (live_cache.load(std::memory_order_acquire) == this) {
+                live_cache.store(nullptr, std::memory_order_release);
+            }
+        }
+        cv.notify_all();
+        idle_cv.notify_all();
+        if (worker.joinable()) { worker.join(); }
+        for (auto & g : graphs) {
+            if (g.scratch) { ggml_backend_buffer_free(g.scratch); }
+            if (g.pack) { ggml_backend_buffer_free(g.pack); }
+            if (g.ctx) { ggml_free(g.ctx); }
+        }
+        for (auto & g : inplace_pool) { drop_built(g); }
+        inplace_pool.clear();
+        active_inplace = -1;
+        for (auto & slab : slabs) {
+            if (slab.buffer) { ggml_backend_buffer_free(slab.buffer); }
+        }
+        for (auto & rec : imports) {
+            if (rec.buffer) { ggml_backend_buffer_free(rec.buffer); }
+        }
+    }
+
+    void fail_staged(std::vector<staged> & held) {
+        std::lock_guard<std::mutex> lock(mu);
+        for (auto & item : held) {
+            if (item.slot < 0 || item.slot >= int(slots.size())) { continue; }
+            auto & slot = slots[size_t(item.slot)];
+            slot.busy = false;
+            slot.ready = false;
+            if (slot.key >= 0) {
+                at.erase(slot.key);
+                slot.key = -1;
+            }
+            __atomic_store_n(&slot.acquire_done, -1, __ATOMIC_RELEASE);
+        }
+        held.clear();
+    }
+
+    void flush_staged(std::vector<staged> & held) {
+        if (held.empty()) { return; }
+        const auto t0 = std::chrono::steady_clock::now();
+        std::vector<size_t> order(held.size());
+        for (size_t i = 0; i < order.size(); ++i) { order[i] = i; }
+        std::sort(order.begin(), order.end(), [&](size_t a, size_t b) {
+            return held[a].buffer < held[b].buffer;
+        });
+        size_t begin = 0;
+        while (begin < order.size()) {
+            ggml_backend_buffer_t buffer = held[order[begin]].buffer;
+            size_t end = begin + 1;
+            while (end < order.size() && held[order[end]].buffer == buffer) { ++end; }
+            std::vector<size_t> offs;
+            std::vector<const void *> srcs;
+            std::vector<size_t> sizes;
+            std::vector<int *> flags;
+            std::vector<size_t> good;
+            std::vector<size_t> bad;
+            for (size_t k = begin; k < end; ++k) {
+                auto & item = held[order[k]];
+                if (!buffer || item.slot < 0 || item.slot >= int(slots.size()) ||
+                        item.up.empty() || item.gate.empty() || item.down.empty()) {
+                    bad.push_back(k);
+                    continue;
+                }
+                offs.push_back(item.offset);
+                srcs.push_back(item.up.data());
+                sizes.push_back(item.up.size());
+                offs.push_back(item.offset + k_gate_off);
+                srcs.push_back(item.gate.data());
+                sizes.push_back(item.gate.size());
+                offs.push_back(item.offset + k_down_off);
+                srcs.push_back(item.down.data());
+                sizes.push_back(item.down.size());
+                flags.push_back(&slots[size_t(item.slot)].acquire_done);
+                good.push_back(k);
+            }
+            const int visible = !offs.empty() ?
+                ggml_vk_upload_host_ranges(buffer, offs.data(), srcs.data(), sizes.data(),
+                        int(offs.size()), flags.data(), int(flags.size())) : 0;
+            auto drop_slot = [&](size_t k) {
+                auto & item = held[order[k]];
+                if (item.slot < 0 || item.slot >= int(slots.size())) { return; }
+                auto & slot = slots[size_t(item.slot)];
+                slot.busy = false;
+                slot.ready = false;
+                if (slot.key >= 0) {
+                    at.erase(slot.key);
+                    slot.key = -1;
+                }
+                __atomic_store_n(&slot.acquire_done, -1, __ATOMIC_RELEASE);
+            };
+            std::lock_guard<std::mutex> lock(mu);
+            for (size_t k : bad) { drop_slot(k); }
+            for (size_t k : good) {
+                if (!visible) { drop_slot(k); continue; }
+                auto & item = held[order[k]];
+                auto & slot = slots[size_t(item.slot)];
+                slot.busy = false;
+                slot.ready = true;
+            }
+            begin = end;
+        }
+        const auto us = std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now() - t0).count();
+        stat_upload_us.fetch_add(us, std::memory_order_relaxed);
+        stat_upload_n.fetch_add(int(held.size()), std::memory_order_relaxed);
+        held.clear();
+    }
+
+    bool walk_busy() const {
+        return decode_walk_active.load(std::memory_order_acquire) ||
+            vulkan_busy.load(std::memory_order_acquire);
+    }
+
+    void fail_slot_locked(int index) {
+        if (index < 0 || index >= int(slots.size())) { return; }
+        auto & slot = slots[size_t(index)];
+        slot.busy = false;
+        slot.ready = false;
+        if (slot.key >= 0) {
+            at.erase(slot.key);
+            slot.key = -1;
+        }
+        __atomic_store_n(&slot.acquire_done, -1, __ATOMIC_RELEASE);
+    }
+
+    void mark_ready_locked(int index) {
+        if (index < 0 || index >= int(slots.size())) { return; }
+        auto & slot = slots[size_t(index)];
+        __atomic_store_n(&slot.acquire_done, 1, __ATOMIC_RELEASE);
+        slot.busy = false;
+        slot.ready = slot.key >= 0;
+    }
+
+    // One expert per GPU fence wait. The copy and the DMA both read host DRAM,
+    // so they stay inside that wait. A yield-spin here was a seventh runnable
+    // thread on a 6-core CPU for the whole miss walk.
+    void worker_main() {
+        for (;;) {
+            job item;
+            {
+                std::unique_lock<std::mutex> lock(mu);
+                cv.wait(lock, [&] {
+                    return stop || (upload_window_flag.load(std::memory_order_acquire) && !jobs.empty());
+                });
+                if (stop) { return; }
+                if (!upload_window_flag.load(std::memory_order_acquire) || jobs.empty()) { continue; }
+                item = std::move(jobs.front());
+                jobs.pop_front();
+                upload_busy.store(1, std::memory_order_release);
+            }
+            int rc = 0;
+            int64_t us = 0;
+            const bool pointers = item.buffer && item.up && item.gate && item.down && item.up_bytes && item.down_bytes;
+            if (!pointers) {
+                rc = 0;
+            } else if (upload_window_flag.load(std::memory_order_acquire) &&
+                    !decode_walk_active.load(std::memory_order_acquire)) {
+                const auto t0 = std::chrono::steady_clock::now();
+                rc = ggml_vk_upload_expert_fast(item.buffer,
+                        item.offset, item.up, item.up_bytes,
+                        item.offset + k_gate_off, item.gate, item.up_bytes,
+                        item.offset + k_down_off, item.down, item.down_bytes);
+                us = std::chrono::duration_cast<std::chrono::microseconds>(
+                        std::chrono::steady_clock::now() - t0).count();
+            } else {
+                rc = -1;
+            }
+            {
+                std::lock_guard<std::mutex> lock(mu);
+                if (rc == -1) {
+                    jobs.push_front(std::move(item));
+                } else if (rc == 1) {
+                    mark_ready_locked(item.slot);
+                    stat_upload_n.fetch_add(1, std::memory_order_relaxed);
+                    stat_upload_us.fetch_add(us, std::memory_order_relaxed);
+                } else if (rc == 2) {
+                    pending_ready.push_back(item.slot);
+                    stat_upload_n.fetch_add(1, std::memory_order_relaxed);
+                    stat_upload_us.fetch_add(us, std::memory_order_relaxed);
+                } else {
+                    fail_slot_locked(item.slot);
+                }
+                if (rc > 0 && !upload_window_flag.load(std::memory_order_acquire)) {
+                    stat_upload_late.fetch_add(1, std::memory_order_relaxed);
+                }
+                upload_busy.store(0, std::memory_order_release);
+            }
+            idle_cv.notify_all();
+            if (rc == -1) {
+                std::unique_lock<std::mutex> lock(mu);
+                cv.wait(lock, [&] {
+                    return stop || !upload_window_flag.load(std::memory_order_acquire);
+                });
+            } else if (rc > 0) {
+                // One expert per window. A second submit at the end of the wait
+                // runs its DMA into the miss walk.
+                std::unique_lock<std::mutex> lock(mu);
+                cv.wait(lock, [&] {
+                    return stop || !upload_window_flag.load(std::memory_order_acquire);
+                });
+            }
+            if (stop) { return; }
+        }
+    }
+
+    bool ensure(expert_session * session) {
+        if (live) { return true; }
+        if (failed) { return false; }
+        const char * off = std::getenv("INFERSSD_DECODE_GPU");
+        if (off && off[0] == '0' && off[1] == '\0') { failed = true; return false; }
+        const char * inplace = std::getenv("INFERSSD_DECODE_INPLACE");
+        if (inplace && inplace[0] == '0' && inplace[1] == '\0') { inplace_broken = true; }
+        // Importing every miss copies about a gigabyte of tiny regions and
+        // makes a token take seconds. Misses stay on the CPU walk.
+        import_off = true;
+        const char * imp = std::getenv("INFERSSD_DECODE_IMPORT");
+        if (imp && imp[0] == '1' && imp[1] == '\0') { import_off = false; }
+        session->join_ahead();
+        for (auto & ahead : session->ahead_slots) {
+            if (ahead.buffer) { ggml_backend_buffer_free(ahead.buffer); ahead.buffer = nullptr; ahead.cap = 0; }
+            ahead.at.clear();
+            ahead.bytes.clear();
+        }
+        session->ahead_buffer = nullptr;
+        session->ahead_at.clear();
+        session->ahead_bytes.clear();
+        backend = session->backend;
+        buft = ggml_backend_get_default_buffer_type(backend);
+        size_t free_bytes = 0, total = 0;
+        ggml_backend_dev_memory(ggml_backend_get_device(backend), &free_bytes, &total);
+        constexpr size_t reserve = 256ull << 20;
+        size_t budget = free_bytes > reserve ? free_bytes - reserve : 0;
+        if (budget > (10ull << 30)) { budget = 10ull << 30; }
+        const int want = int(budget / k_stride);
+        if (want < 64 || !buft) {
+            failed = true;
+            std::fprintf(stderr, "[kimi_vk_decode] no cache free=%zu budget=%zu\n", free_bytes, budget);
+            return false;
+        }
+        size_t left = size_t(want) * k_stride;
+        constexpr size_t slab_cap = 2ull << 30;
+        while (left >= k_stride) {
+            size_t chunk = std::min(left, slab_cap - (slab_cap % k_stride));
+            chunk = (chunk / k_stride) * k_stride;
+            if (chunk < k_stride) { break; }
+            ggml_backend_buffer_t buf = nullptr;
+            try { buf = ggml_backend_buft_alloc_buffer(buft, chunk); }
+            catch (...) { buf = nullptr; }
+            if (!buf && chunk > k_stride * 128) {
+                chunk = k_stride * 128;
+                try { buf = ggml_backend_buft_alloc_buffer(buft, chunk); }
+                catch (...) { buf = nullptr; }
+            }
+            if (!buf) { break; }
+            slab_rec slab;
+            slab.buffer = buf;
+            slab.nslots = int(ggml_backend_buffer_get_size(buf) / k_stride);
+            const int base = int(slots.size());
+            slots.resize(size_t(base + slab.nslots));
+            for (int i = 0; i < slab.nslots; ++i) {
+                slots[size_t(base + i)].slab = int(slabs.size());
+                slots[size_t(base + i)].offset = size_t(i) * k_stride;
+            }
+            slabs.push_back(slab);
+            left -= size_t(slab.nslots) * k_stride;
+        }
+        if (slots.size() < 64) {
+            failed = true;
+            std::fprintf(stderr, "[kimi_vk_decode] allocation failed free=%zu slabs=%zu\n", free_bytes, slabs.size());
+            return false;
+        }
+        seen.assign(size_t(k_layers * k_experts), 0);
+        graphs.reserve(8);
+        homes.assign(k_layers, {});
+        struct window_rec { int begin; int slab; int base; };
+        std::vector<window_rec> windows;
+        int global = 0;
+        for (int s = 0; s < int(slabs.size()); ++s) {
+            const int n = slabs[size_t(s)].nslots;
+            for (int base = 0; base + k_window <= n; base += k_window) {
+                windows.push_back({ global + base, s, base });
+            }
+            global += n;
+        }
+        const int primary = std::min(k_layers, int(windows.size()));
+        for (int i = 0; i < primary; ++i) {
+            homes[size_t(i)] = { windows[size_t(i)].begin, windows[size_t(i)].slab, windows[size_t(i)].base, -1, -1, 0 };
+        }
+        int extra = 0;
+        for (int i = primary; i < int(windows.size()) && extra < k_layers; ++i, ++extra) {
+            auto & home = homes[size_t(extra)];
+            home.begin2 = windows[size_t(i)].begin;
+            home.slab2 = windows[size_t(i)].slab;
+            home.base2 = windows[size_t(i)].base;
+        }
+        int assigned = primary;
+        live_cache.store(this, std::memory_order_release);
+        worker = std::thread([this] { worker_main(); });
+        live = true;
+        std::fprintf(stderr, "[kimi_vk_decode] cache slots=%zu stride=%zu free_was=%zu windows=%d extra=%d\n",
+                slots.size(), k_stride, free_bytes, assigned, extra);
+        return true;
+    }
+
+    // Each layer owns a run of windows. Ten hot experts then share one matmul
+    // instead of a chain per scattered slot, which is what made recording the token.
+    int layer_stripe(int layer) const {
+        const int stripe = (int(slots.size()) / k_layers / k_window) * k_window;
+        return stripe >= k_window ? stripe : 0;
+    }
+
+    int free_in_range_locked(int begin, int end) const {
+        if (begin < 0) { begin = 0; }
+        if (end > int(slots.size())) { end = int(slots.size()); }
+        for (int i = begin; i < end; ++i) {
+            if (slots[size_t(i)].key < 0 && !slots[size_t(i)].busy) { return i; }
+        }
+        return -1;
+    }
+
+    int same_window_free_locked(int32_t key) const {
+        const int layer = key / k_experts;
+        if (layer < 0 || layer >= k_layers) { return -1; }
+        const int stripe = layer_stripe(layer);
+        const int origin = stripe ? layer * stripe : 0;
+        const int limit = stripe ? std::min(origin + stripe, int(slots.size())) : int(slots.size());
+        int anchor = -1;
+        for (const auto & ent : at) {
+            if (ent.first / k_experts != layer || ent.second < origin || ent.second >= limit) { continue; }
+            anchor = ent.second;
+            break;
+        }
+        if (anchor >= 0) {
+            const auto & home = slots[size_t(anchor)];
+            if (home.slab >= 0 && home.slab < int(slabs.size())) {
+                const int local = int(home.offset / k_stride);
+                const int base = (local / k_window) * k_window;
+                const int end = std::min(base + k_window, slabs[size_t(home.slab)].nslots);
+                for (int i = origin; i < limit; ++i) {
+                    const auto & slot = slots[size_t(i)];
+                    if (slot.slab != home.slab || slot.key >= 0 || slot.busy) { continue; }
+                    const int loc = int(slot.offset / k_stride);
+                    if (loc >= base && loc < end) { return i; }
+                }
+            }
+        }
+        return free_in_range_locked(origin, limit);
+    }
+
+    int free_slot_locked() const {
+        for (int i = 0; i < int(slots.size()); ++i) {
+            if (slots[size_t(i)].key < 0 && !slots[size_t(i)].busy) { return i; }
+        }
+        return -1;
+    }
+
+    int victim_in_range_locked(int begin, int end) const {
+        int victim = -1;
+        uint16_t best_freq = 65535;
+        uint32_t best_stamp = UINT32_MAX;
+        if (begin < 0) { begin = 0; }
+        if (end > int(slots.size())) { end = int(slots.size()); }
+        for (int i = begin; i < end; ++i) {
+            const auto & slot = slots[size_t(i)];
+            if (slot.key < 0 || slot.busy || slot.stamp == stamp) { continue; }
+            if (slot.freq < best_freq || (slot.freq == best_freq && slot.stamp < best_stamp)) {
+                best_freq = slot.freq;
+                best_stamp = slot.stamp;
+                victim = i;
+            }
+        }
+        return victim;
+    }
+
+    // stamp advances once per layer, 48 times a token. Six quiet tokens still
+    // left the window full of experts used inside that window, so twice-seen
+    // newcomers stayed misses. Two quiet tokens is not LRU: anything used in
+    // the last two tokens keeps its slot.
+    static constexpr uint32_t k_quiet = 48u * 2u;
+
+    int stale_in_range_locked(int begin, int end) const {
+        int victim = -1;
+        uint32_t best_gap = 0;
+        if (begin < 0) { begin = 0; }
+        if (end > int(slots.size())) { end = int(slots.size()); }
+        for (int i = begin; i < end; ++i) {
+            const auto & slot = slots[size_t(i)];
+            if (slot.key < 0 || slot.busy) { continue; }
+            const uint32_t gap = stamp - slot.stamp;
+            if (gap < k_quiet) { continue; }
+            if (victim < 0 || gap > best_gap ||
+                    (gap == best_gap && slot.freq < slots[size_t(victim)].freq)) {
+                best_gap = gap;
+                victim = i;
+            }
+        }
+        return victim;
+    }
+
+    int victim_locked() const {
+        return victim_in_range_locked(0, int(slots.size()));
+    }
+
+    void enqueue_locked(int index, const void * up, const void * gate, const void * down, size_t up_bytes, size_t down_bytes) {
+        auto & slot = slots[size_t(index)];
+        job item;
+        item.slot = index;
+        item.buffer = slabs[size_t(slot.slab)].buffer;
+        item.offset = slot.offset;
+        item.up = up;
+        item.gate = gate;
+        item.down = down;
+        item.up_bytes = up_bytes;
+        item.down_bytes = down_bytes;
+        slot.busy = true;
+        slot.ready = false;
+        __atomic_store_n(&slot.acquire_done, 0, __ATOMIC_RELEASE);
+        jobs.push_back(std::move(item));
+        ++admits_window;
+        cv.notify_one();
+    }
+
+    bool admit_locked(int32_t key, uint16_t freq, const void * up, const void * gate, const void * down,
+            size_t up_bytes, size_t down_bytes) {
+        // A one-shot expert never earns a slot. The first-come fill left every
+        // warm token with a miss even when the cache was full.
+        if (freq < 2) { return false; }
+        // One expert per GPU fence wait. A deeper queue only occupies slots
+        // that are not ready yet. Cap 48 admitted more and the mean did not move.
+        if (jobs.size() >= 24) { return false; }
+        const int layer = key / k_experts;
+        if (layer < 0 || layer >= int(homes.size()) || homes[size_t(layer)].begin < 0) { return false; }
+        const auto & home = homes[size_t(layer)];
+        const int begin = home.begin;
+        const int end = std::min(begin + k_window, int(slots.size()));
+        const int begin2 = home.begin2;
+        const int end2 = begin2 >= 0 ? std::min(begin2 + k_window, int(slots.size())) : -1;
+        auto take_free = [&](int from, int to) {
+            for (int i = from; i < to; ++i) {
+                if (slots[size_t(i)].key < 0 && !slots[size_t(i)].busy) { return i; }
+            }
+            return -1;
+        };
+        auto take_victim = [&](int from, int to) {
+            const int found = victim_in_range_locked(from, to);
+            if (found >= 0 && freq > slots[size_t(found)].freq) { return found; }
+            // A prompt-hot expert keeps a huge lifetime count. Reclaim it only
+            // after it has been quiet for many tokens, so a working-set expert
+            // is not evicted to make room for a newcomer.
+            return stale_in_range_locked(from, to);
+        };
+        // Fill the primary window first so a layer whose hot set fits in 28 slots
+        // stays one chain. Overflow uses the second window before evicting a hot one.
+        int index = take_free(begin, end);
+        bool took_victim = false;
+        if (index < 0 && end2 > begin2) { index = take_free(begin2, end2); }
+        // Evictions copy during the GPU fence wait and finish before the miss
+        // walk. Raising this from 32 to 48 admitted more and the token did not
+        // get faster: the extra evictions were not the misses on the mean.
+        const bool can_evict = evicts_window < 32;
+        if (can_evict && index < 0 && end2 > begin2) {
+            index = take_victim(begin2, end2);
+            took_victim = index >= 0;
+        }
+        if (can_evict && index < 0) {
+            index = take_victim(begin, end);
+            if (index < 0) { return false; }
+            took_victim = true;
+        }
+        if (index < 0) { return false; }
+        if (took_victim) { ++evicts_window; }
+        if (took_victim) {
+            const auto & old = slots[size_t(index)];
+            if (stamp - old.stamp >= k_quiet && freq <= old.freq) { ++stat_reclaim; }
+            at.erase(old.key);
+        }
+        auto & slot = slots[size_t(index)];
+        slot.key = key;
+        slot.freq = freq;
+        slot.stamp = stamp;
+        at[key] = index;
+        enqueue_locked(index, up, gate, down, up_bytes, down_bytes);
+        return true;
+    }
+
+    // A type whose block does not divide the slot stride cannot be indexed by
+    // the vec shader. Leave those experts on the CPU walk instead of reading
+    // the wrong bytes.
+    static bool stride_fits(int32_t type) {
+        const size_t block = ggml_type_size(static_cast<ggml_type>(type));
+        return block != 0 && k_stride % block == 0;
+    }
+
+    static void bind_weight(ggml_tensor * tensor, ggml_backend_buffer_t buffer, size_t offset) {
+        tensor->buffer = buffer;
+        tensor->data = static_cast<char *>(ggml_backend_buffer_get_base(buffer)) + offset;
+    }
+
+    static void drop_built(built & g) {
+        if (g.scratch) { ggml_backend_buffer_free(g.scratch); g.scratch = nullptr; }
+        if (g.pack) { ggml_backend_buffer_free(g.pack); g.pack = nullptr; }
+        if (g.ctx) { ggml_free(g.ctx); g.ctx = nullptr; }
+        g.gf = nullptr;
+        g.input = nullptr;
+        g.down_batched = nullptr;
+        g.chains.clear();
+        g.up_w.clear();
+        g.gate_w.clear();
+        g.down_w.clear();
+        g.down_out.clear();
+        g.inplace = false;
+        g.key.clear();
+    }
+
+    struct slab_group {
+        int slab = -1;
+        int base = 0;
+        std::vector<int32_t> local;
+        std::vector<int> hit;
+    };
+
+    // Shape only: window count and how many hits sit in each. The slab and base
+    // are a rebind, not a new graph. Rebuilding every layer was the 25 ms.
+    std::vector<int> shape_key(const ggml_vk_decode_batch * batch, const std::vector<slab_group> & groups) {
+        std::vector<int> key;
+        key.reserve(5 + groups.size() * 2);
+        key.push_back(batch->up_type);
+        key.push_back(batch->down_type);
+        key.push_back(int(batch->latent));
+        key.push_back(int(batch->hidden));
+        key.push_back(int(groups.size()));
+        for (const auto & group : groups) {
+            if (group.slab < 0 || group.slab >= int(slabs.size())) {
+                key.push_back(-1);
+                key.push_back(int(group.local.size()));
+                continue;
+            }
+            const int span = std::min(k_window, slabs[size_t(group.slab)].nslots - group.base);
+            key.push_back(span);
+            key.push_back(int(group.local.size()));
+        }
+        return key;
+    }
+
+    bool rebind_inplace(built & g, const std::vector<slab_group> & groups) {
+        if (g.chains.size() != groups.size()) { return false; }
+        for (size_t c = 0; c < groups.size(); ++c) {
+            const auto & group = groups[c];
+            auto & chain = g.chains[c];
+            if (!chain.up_w || !chain.gate_w || !chain.down_w || !chain.ids) { return false; }
+            if (group.slab < 0 || group.slab >= int(slabs.size())) { return false; }
+            const auto & slab = slabs[size_t(group.slab)];
+            const int span = std::min(k_window, slab.nslots - group.base);
+            if (!slab.buffer || span != chain.span || int(group.local.size()) != chain.n) { return false; }
+            for (int32_t slot : group.local) {
+                if (slot < 0 || slot >= span) { return false; }
+            }
+            const size_t origin = size_t(group.base) * k_stride;
+            char * base = static_cast<char *>(ggml_backend_buffer_get_base(slab.buffer));
+            auto poke = [&](ggml_tensor * tensor, size_t role) {
+                tensor->buffer = slab.buffer;
+                tensor->data = base + origin + role;
+            };
+            poke(chain.up_w, 0);
+            poke(chain.gate_w, k_gate_off);
+            poke(chain.down_w, k_down_off);
+        }
+        return true;
+    }
+
+    // Hits in one slab share a buffer and a slot stride, so one mul_mat_id reads
+    // them where they sit. No gather copy.
+    built * ensure_inplace(const ggml_vk_decode_batch * batch, const std::vector<slab_group> & groups) {
+        if (groups.empty() || !buft || !backend || !batch) { return nullptr; }
+        const std::vector<int> key = shape_key(batch, groups);
+        for (int part : key) {
+            if (part < 0) { return nullptr; }
+        }
+        int hits = 0;
+        for (const auto & group : groups) { hits += int(group.local.size()); }
+        for (size_t i = 0; i < inplace_pool.size(); ++i) {
+            auto & held = inplace_pool[i];
+            if (!held.inplace || held.key != key) { continue; }
+            if (!rebind_inplace(held, groups)) { return nullptr; }
+            held.used = ++pool_clock;
+            active_inplace = int(i);
+            ++stat_reuse;
+            return &inplace_pool[i];
+        }
+        if (inplace_pool.size() >= 48) {
+            size_t oldest = 0;
+            for (size_t i = 1; i < inplace_pool.size(); ++i) {
+                if (inplace_pool[i].used < inplace_pool[oldest].used) { oldest = i; }
+            }
+            drop_built(inplace_pool[oldest]);
+            inplace_pool.erase(inplace_pool.begin() + std::ptrdiff_t(oldest));
+            if (active_inplace == int(oldest)) { active_inplace = -1; }
+            else if (active_inplace > int(oldest)) { --active_inplace; }
+        }
+        built g;
+        g.inplace = true;
+        g.key = key;
+        g.up_type = batch->up_type;
+        g.down_type = batch->down_type;
+        g.latent = batch->latent;
+        g.hidden = batch->hidden;
+        g.n = hits;
+        auto fail = [&](const char * why) -> built * {
+            static int logged = 0;
+            if (!logged++) { std::fprintf(stderr, "[kimi_vk_decode] inplace unavailable: %s\n", why); std::fflush(stderr); }
+            drop_built(g);
+            return nullptr;
+        };
+        const int nchains = int(groups.size());
+        const int nodes = nchains * 8 + 8;
+        const size_t mem = ggml_tensor_overhead() * size_t(nchains) * 12 + ggml_graph_overhead_custom(nodes, false) + 65536;
+        g.ctx = ggml_init({ mem, nullptr, true });
+        if (!g.ctx) { return fail("context"); }
+        g.input = ggml_new_tensor_3d(g.ctx, GGML_TYPE_F32, batch->latent, 1, 1);
+        if (!g.input) { return fail("input"); }
+        const size_t alignment = std::max<size_t>(ggml_backend_buft_get_alignment(buft), k_align);
+        struct scratch_item { ggml_tensor * tensor = nullptr; size_t off = 0; };
+        std::vector<scratch_item> scratch;
+        size_t cursor = 0;
+        auto take = [&](ggml_tensor * tensor) -> bool {
+            if (!tensor) { return false; }
+            cursor = align_up(cursor, alignment);
+            scratch.push_back({ tensor, cursor });
+            cursor += ggml_backend_buft_get_alloc_size(buft, tensor);
+            return true;
+        };
+        if (!take(g.input)) { return fail("input place"); }
+        auto view_weight = [&](ggml_tensor * tensor, ggml_backend_buffer_t buffer, size_t role) -> bool {
+            if (!tensor || !buffer) { return false; }
+            tensor->nb[2] = k_stride;
+            tensor->nb[3] = k_stride * size_t(tensor->ne[2]);
+            const size_t need = ggml_nbytes(tensor);
+            if (role + need > ggml_backend_buffer_get_size(buffer)) {
+                std::fprintf(stderr, "[kimi_vk_decode] inplace view role=%zu need=%zu slab=%zu\n",
+                        role, need, ggml_backend_buffer_get_size(buffer));
+                return false;
+            }
+            void * base = ggml_backend_buffer_get_base(buffer);
+            return ggml_backend_tensor_alloc(buffer, tensor, static_cast<char *>(base) + role) == GGML_STATUS_SUCCESS;
+        };
+        g.chains.resize(size_t(nchains));
+        for (int c = 0; c < nchains; ++c) {
+            const auto & group = groups[size_t(c)];
+            if (group.slab < 0 || group.slab >= int(slabs.size()) || group.local.empty()) { return fail("slab"); }
+            const auto & slab = slabs[size_t(group.slab)];
+            const int n = int(group.local.size());
+            const int span = std::min(k_window, slab.nslots - group.base);
+            if (span < 1 || n > k_max_n || group.base < 0) { return fail("count"); }
+            for (int32_t slot : group.local) {
+                if (slot < 0 || slot >= span) { return fail("slot"); }
+            }
+            const size_t origin = size_t(group.base) * k_stride;
+            ggml_tensor * up_w = ggml_new_tensor_3d(g.ctx, ggml_type(batch->up_type), batch->latent, batch->hidden, span);
+            ggml_tensor * gate_w = ggml_new_tensor_3d(g.ctx, ggml_type(batch->up_type), batch->latent, batch->hidden, span);
+            ggml_tensor * down_w = ggml_new_tensor_3d(g.ctx, ggml_type(batch->down_type), batch->hidden, batch->latent, span);
+            ggml_tensor * ids = ggml_new_tensor_2d(g.ctx, GGML_TYPE_I32, n, 1);
+            if (!view_weight(up_w, slab.buffer, origin) || !view_weight(gate_w, slab.buffer, origin + k_gate_off) ||
+                    !view_weight(down_w, slab.buffer, origin + k_down_off) || !ids) {
+                return fail("weight view");
+            }
+            ggml_tensor * up_out = ggml_mul_mat_id(g.ctx, up_w, g.input, ids);
+            ggml_tensor * gate_out = ggml_mul_mat_id(g.ctx, gate_w, g.input, ids);
+            ggml_tensor * hidden = up_out && gate_out ? ggml_swiglu_split(g.ctx, gate_out, up_out) : nullptr;
+            ggml_tensor * down_out = hidden ? ggml_mul_mat_id(g.ctx, down_w, hidden, ids) : nullptr;
+            if (!down_out || !take(ids) || !take(up_out) || !take(gate_out) || !take(hidden) || !take(down_out)) {
+                return fail("chain");
+            }
+            if (!ggml_backend_supports_op(backend, up_out) || !ggml_backend_supports_op(backend, gate_out) ||
+                    !ggml_backend_supports_op(backend, hidden) || !ggml_backend_supports_op(backend, down_out)) {
+                std::fprintf(stderr, "[kimi_vk_decode] inplace op unsupported nbytes=%zu\n", ggml_nbytes(up_w));
+                return fail("op");
+            }
+            g.chains[size_t(c)] = { ids, down_out, n, up_w, gate_w, down_w, span };
+        }
+        g.scratch = nullptr;
+        try { g.scratch = ggml_backend_buft_alloc_buffer(buft, cursor); }
+        catch (...) { g.scratch = nullptr; }
+        if (!g.scratch) { return fail("scratch"); }
+        void * base = ggml_backend_buffer_get_base(g.scratch);
+        for (const auto & item : scratch) {
+            if (ggml_backend_tensor_alloc(g.scratch, item.tensor, static_cast<char *>(base) + item.off) != GGML_STATUS_SUCCESS) {
+                return fail("scratch place");
+            }
+        }
+        g.gf = ggml_new_graph_custom(g.ctx, nodes, false);
+        if (!g.gf) { return fail("graph"); }
+        for (const auto & chain : g.chains) { ggml_build_forward_expand(g.gf, chain.down); }
+        g.used = ++pool_clock;
+        ++stat_build;
+        inplace_pool.push_back(std::move(g));
+        active_inplace = int(inplace_pool.size()) - 1;
+        if (stat_build <= 8) {
+            std::fprintf(stderr, "[kimi_vk_decode] inplace graph slabs=%d hits=%d pool=%zu stride=%zu\n",
+                nchains, hits, inplace_pool.size(), k_stride);
+            std::fflush(stderr);
+        }
+        return &inplace_pool[size_t(active_inplace)];
+    }
+
+    // Host-cache bytes are an anonymous arena. Import a window so a miss can be
+    // copied by the GPU instead of walked on the CPU.
+    bool cover(const void * ptr, size_t bytes, ggml_backend_buffer_t & buffer, size_t & offset) {
+        if (!ptr || !bytes || import_off || !backend) { return false; }
+        const uintptr_t p = reinterpret_cast<uintptr_t>(ptr);
+        for (const auto & rec : imports) {
+            if (p >= rec.base && p + bytes <= rec.base + rec.bytes && rec.buffer) {
+                buffer = rec.buffer;
+                offset = size_t(p - rec.base);
+                return true;
+            }
+        }
+        static const uintptr_t aligns[] = { 4096, 65536 };
+        for (uintptr_t align : aligns) {
+            const uintptr_t base = p & ~(align - 1);
+            const size_t need = size_t((p + bytes) - base);
+            const size_t size = (need + align - 1) & ~(align - 1);
+            if (size == 0 || size > (16ull << 20)) { continue; }
+            ggml_backend_buffer_t buf = nullptr;
+            try {
+                buf = ggml_backend_dev_buffer_from_host_ptr(ggml_backend_get_device(backend),
+                        reinterpret_cast<void *>(base), size, size);
+            } catch (...) {
+                buf = nullptr;
+            }
+            if (!buf) { continue; }
+            imports.push_back({ base, size, buf });
+            buffer = buf;
+            offset = size_t(p - base);
+            static int logged = 0;
+            if (!logged++) { std::fprintf(stderr, "[kimi_vk_decode] host import ok align=%zu\n", size_t(align)); }
+            return true;
+        }
+        static int failed_log = 0;
+        if (!failed_log++) { std::fprintf(stderr, "[kimi_vk_decode] host import unavailable\n"); }
+        return false;
+    }
+
+    bool cover_expert(const void * up, const void * gate, const void * down, size_t up_bytes, size_t down_bytes, gpu_piece & piece) {
+        const char * a = static_cast<const char *>(up);
+        const char * b = static_cast<const char *>(gate);
+        const char * c = static_cast<const char *>(down);
+        if (!a || !b || !c) { return false; }
+        const char * lo = std::min(a, std::min(b, c));
+        const char * hi = std::max(a + up_bytes, std::max(b + up_bytes, c + down_bytes));
+        if (hi < lo || size_t(hi - lo) > (8ull << 20)) {
+            return cover(up, up_bytes, piece.up.buffer, piece.up.offset) &&
+                    cover(gate, up_bytes, piece.gate.buffer, piece.gate.offset) &&
+                    cover(down, down_bytes, piece.down.buffer, piece.down.offset);
+        }
+        ggml_backend_buffer_t buf = nullptr;
+        size_t base_off = 0;
+        if (!cover(lo, size_t(hi - lo), buf, base_off)) { return false; }
+        piece.up.buffer = piece.gate.buffer = piece.down.buffer = buf;
+        piece.up.offset = base_off + size_t(a - lo);
+        piece.gate.offset = base_off + size_t(b - lo);
+        piece.down.offset = base_off + size_t(c - lo);
+        return true;
+    }
+
+    // One mul_mat chain for the layer. mul_mat_id crashed on the first hit, and
+    // a per-expert graph re-records every weight.
+    built * graph_for_batched(const ggml_vk_decode_batch * batch, int n) {
+        for (auto & g : graphs) {
+            if (g.batched && g.up_type == batch->up_type && g.down_type == batch->down_type &&
+                    g.latent == batch->latent && g.hidden == batch->hidden && g.n == n) {
+                return &g;
+            }
+        }
+        if (n < 1 || n > k_max_n || !buft) { return nullptr; }
+        built g;
+        g.batched = true;
+        g.up_type = batch->up_type;
+        g.down_type = batch->down_type;
+        g.latent = batch->latent;
+        g.hidden = batch->hidden;
+        g.n = n;
+        const size_t up_bytes = batch->up_bytes;
+        const size_t down_bytes = batch->down_bytes;
+        const size_t alignment = std::max<size_t>(ggml_backend_buft_get_alignment(buft), k_align);
+        auto fail = [&]() -> built * {
+            if (g.scratch) { ggml_backend_buffer_free(g.scratch); }
+            if (g.pack) { ggml_backend_buffer_free(g.pack); }
+            if (g.ctx) { ggml_free(g.ctx); }
+            return nullptr;
+        };
+        const int nodes = 16;
+        const size_t mem = ggml_tensor_overhead() * 16 + ggml_graph_overhead_custom(nodes, false) + 65536;
+        g.ctx = ggml_init({ mem, nullptr, true });
+        if (!g.ctx) { return nullptr; }
+        ggml_tensor * up_w = ggml_new_tensor_3d(g.ctx, ggml_type(batch->up_type), batch->latent, batch->hidden, n);
+        ggml_tensor * gate_w = ggml_new_tensor_3d(g.ctx, ggml_type(batch->up_type), batch->latent, batch->hidden, n);
+        ggml_tensor * down_w = ggml_new_tensor_3d(g.ctx, ggml_type(batch->down_type), batch->hidden, batch->latent, n);
+        g.input = ggml_new_tensor_3d(g.ctx, GGML_TYPE_F32, batch->latent, 1, n);
+        ggml_tensor * up_out = up_w && g.input ? ggml_mul_mat(g.ctx, up_w, g.input) : nullptr;
+        ggml_tensor * gate_out = gate_w && g.input ? ggml_mul_mat(g.ctx, gate_w, g.input) : nullptr;
+        ggml_tensor * hidden = up_out && gate_out ? ggml_swiglu_split(g.ctx, gate_out, up_out) : nullptr;
+        ggml_tensor * down_out = down_w && hidden ? ggml_mul_mat(g.ctx, down_w, hidden) : nullptr;
+        const size_t row = size_t(batch->latent) * sizeof(float);
+        if (!down_out || !up_w || !down_w || !g.input || up_w->nb[2] != up_bytes || down_w->nb[2] != down_bytes ||
+                g.input->nb[1] != row || down_out->nb[2] != row) {
+            static int logged = 0;
+            if (!logged++) {
+                std::fprintf(stderr, "[kimi_vk_decode] matmul stride up=%zu nb2=%zu down=%zu nb2=%zu out=%zu\n",
+                        up_bytes, up_w ? up_w->nb[2] : 0, down_bytes, down_w ? down_w->nb[2] : 0,
+                        down_out ? down_out->nb[2] : 0);
+            }
+            return fail();
+        }
+        g.pack_up = 0;
+        g.pack_gate = align_up(size_t(n) * up_bytes, alignment);
+        g.pack_down = align_up(g.pack_gate + size_t(n) * up_bytes, alignment);
+        const size_t pack_bytes = align_up(g.pack_down + size_t(n) * down_bytes, alignment);
+        g.pack = ggml_backend_buft_alloc_buffer(buft, pack_bytes);
+        if (!g.pack) { return fail(); }
+        size_t cursor = 0;
+        auto take = [&](ggml_tensor * tensor) -> size_t {
+            cursor = align_up(cursor, alignment);
+            const size_t at = cursor;
+            cursor += ggml_backend_buft_get_alloc_size(buft, tensor);
+            return at;
+        };
+        const size_t in_at = take(g.input);
+        const size_t up_out_at = take(up_out);
+        const size_t gate_out_at = take(gate_out);
+        const size_t hidden_at = take(hidden);
+        const size_t down_out_at = take(down_out);
+        g.scratch = ggml_backend_buft_alloc_buffer(buft, cursor);
+        if (!g.scratch) { return fail(); }
+        void * pack_base = ggml_backend_buffer_get_base(g.pack);
+        void * scratch_base = ggml_backend_buffer_get_base(g.scratch);
+        auto place = [&](ggml_backend_buffer_t buffer, void * base, ggml_tensor * tensor, size_t offset) -> bool {
+            return tensor && ggml_backend_tensor_alloc(buffer, tensor, static_cast<char *>(base) + offset) == GGML_STATUS_SUCCESS;
+        };
+        if (!place(g.pack, pack_base, up_w, g.pack_up) || !place(g.pack, pack_base, gate_w, g.pack_gate) ||
+                !place(g.pack, pack_base, down_w, g.pack_down) || !place(g.scratch, scratch_base, g.input, in_at) ||
+                !place(g.scratch, scratch_base, up_out, up_out_at) || !place(g.scratch, scratch_base, gate_out, gate_out_at) ||
+                !place(g.scratch, scratch_base, hidden, hidden_at) || !place(g.scratch, scratch_base, down_out, down_out_at)) {
+            return fail();
+        }
+        g.gf = ggml_new_graph_custom(g.ctx, nodes, false);
+        if (!g.gf) { return fail(); }
+        ggml_build_forward_expand(g.gf, down_out);
+        if (!ggml_backend_supports_op(backend, up_out) || !ggml_backend_supports_op(backend, down_out) ||
+                !ggml_backend_supports_op(backend, hidden)) {
+            static int logged = 0;
+            if (!logged++) { std::fprintf(stderr, "[kimi_vk_decode] matmul graph unsupported\n"); }
+            return fail();
+        }
+        g.down_batched = down_out;
+        graphs.push_back(std::move(g));
+        std::fprintf(stderr, "[kimi_vk_decode] matmul graph n=%d\n", n);
+        std::fflush(stderr);
+        return &graphs.back();
+    }
+
+    built * graph_for(const ggml_vk_decode_batch * batch, int n) {
+        for (auto & g : graphs) {
+            if (!g.batched && g.up_type == batch->up_type && g.down_type == batch->down_type && g.latent == batch->latent &&
+                    g.hidden == batch->hidden && g.n == n) {
+                return &g;
+            }
+        }
+        built g;
+        g.up_type = batch->up_type;
+        g.down_type = batch->down_type;
+        g.latent = batch->latent;
+        g.hidden = batch->hidden;
+        g.n = n;
+        const int nodes = n * 8 + 32;
+        const size_t mem = ggml_tensor_overhead() * size_t(n) * 12 + ggml_graph_overhead_custom(nodes, false) + 65536;
+        g.ctx = ggml_init({ mem, nullptr, true });
+        if (!g.ctx) { return nullptr; }
+        g.input = ggml_new_tensor_2d(g.ctx, GGML_TYPE_F32, batch->latent, 1);
+        const size_t alignment = std::max<size_t>(ggml_backend_buft_get_alignment(buft), k_align);
+        size_t cursor = 0;
+        std::vector<std::pair<ggml_tensor *, size_t>> placed;
+        auto take = [&](ggml_tensor * tensor) -> bool {
+            if (!tensor) { return false; }
+            cursor = align_up(cursor, alignment);
+            placed.push_back({ tensor, cursor });
+            cursor += ggml_backend_buft_get_alloc_size(buft, tensor);
+            return true;
+        };
+        if (!take(g.input)) { ggml_free(g.ctx); return nullptr; }
+        g.up_w.resize(size_t(n));
+        g.gate_w.resize(size_t(n));
+        g.down_w.resize(size_t(n));
+        g.down_out.resize(size_t(n));
+        for (int i = 0; i < n; ++i) {
+            ggml_tensor * up_w = ggml_new_tensor_2d(g.ctx, ggml_type(batch->up_type), batch->latent, batch->hidden);
+            ggml_tensor * gate_w = ggml_new_tensor_2d(g.ctx, ggml_type(batch->up_type), batch->latent, batch->hidden);
+            ggml_tensor * up_out = up_w && g.input ? ggml_mul_mat(g.ctx, up_w, g.input) : nullptr;
+            ggml_tensor * gate_out = gate_w && g.input ? ggml_mul_mat(g.ctx, gate_w, g.input) : nullptr;
+            ggml_tensor * hidden = up_out && gate_out ? ggml_swiglu_split(g.ctx, gate_out, up_out) : nullptr;
+            ggml_tensor * down_w = ggml_new_tensor_2d(g.ctx, ggml_type(batch->down_type), batch->hidden, batch->latent);
+            ggml_tensor * down_out = down_w && hidden ? ggml_mul_mat(g.ctx, down_w, hidden) : nullptr;
+            if (!down_out || ggml_nbytes(up_w) != batch->up_bytes || ggml_nbytes(down_w) != batch->down_bytes) {
+                ggml_free(g.ctx);
+                return nullptr;
+            }
+            if (!take(up_out) || !take(gate_out) || !take(hidden) || !take(down_out)) {
+                ggml_free(g.ctx);
+                return nullptr;
+            }
+            g.up_w[size_t(i)] = up_w;
+            g.gate_w[size_t(i)] = gate_w;
+            g.down_w[size_t(i)] = down_w;
+            g.down_out[size_t(i)] = down_out;
+        }
+        g.scratch = ggml_backend_buft_alloc_buffer(buft, cursor);
+        g.mapped = nullptr;
+        if (!g.scratch) { ggml_free(g.ctx); return nullptr; }
+        void * base = ggml_backend_buffer_get_base(g.scratch);
+        for (const auto & item : placed) {
+            if (ggml_backend_tensor_alloc(g.scratch, item.first, static_cast<char *>(base) + item.second) != GGML_STATUS_SUCCESS) {
+                ggml_backend_buffer_free(g.scratch);
+                ggml_free(g.ctx);
+                return nullptr;
+            }
+        }
+        void * weight_base = ggml_backend_buffer_get_base(slabs[0].buffer);
+        for (int i = 0; i < n; ++i) {
+            if (ggml_backend_tensor_alloc(slabs[0].buffer, g.up_w[size_t(i)], weight_base) != GGML_STATUS_SUCCESS ||
+                    ggml_backend_tensor_alloc(slabs[0].buffer, g.gate_w[size_t(i)], weight_base) != GGML_STATUS_SUCCESS ||
+                    ggml_backend_tensor_alloc(slabs[0].buffer, g.down_w[size_t(i)], weight_base) != GGML_STATUS_SUCCESS) {
+                ggml_backend_buffer_free(g.scratch);
+                ggml_free(g.ctx);
+                return nullptr;
+            }
+        }
+        g.gf = ggml_new_graph_custom(g.ctx, nodes, false);
+        if (!g.gf) {
+            ggml_backend_buffer_free(g.scratch);
+            ggml_free(g.ctx);
+            return nullptr;
+        }
+        for (int i = 0; i < n; ++i) { ggml_build_forward_expand(g.gf, g.down_out[size_t(i)]); }
+        graphs.push_back(std::move(g));
+        return &graphs.back();
+    }
+
+    void note(int hits, int n, double record, double wait, double copy) {
+        stat_hits += hits;
+        stat_n += n;
+        stat_record += record;
+        stat_wait += wait;
+        stat_copy += copy;
+        if (++window_layers < k_layers) { return; }
+        const int up_n = stat_upload_n.exchange(0, std::memory_order_relaxed);
+        const int64_t up_us = stat_upload_us.exchange(0, std::memory_order_relaxed);
+        const int up_late = stat_upload_late.exchange(0, std::memory_order_relaxed);
+        std::fprintf(stderr, "[kimi_vk_decode] hits=%d/%d import=%d record_us=%.0f wait_us=%.0f copy_us=%.0f slots=%zu/%zu reuse=%d build=%d pool=%zu cold=%d full=%d reclaim=%d pending=%d chains=%d multi=%d upload=%d upload_us=%.0f late=%d\n",
+                stat_hits, stat_n, stat_import, stat_record, stat_wait, stat_copy, at.size(), slots.size(),
+                stat_reuse, stat_build, inplace_pool.size(), stat_cold, stat_full, stat_reclaim, stat_pending, stat_chains, stat_multi,
+                up_n, double(up_us), up_late);
+        stat_hits = stat_n = stat_import = stat_reuse = stat_build = 0;
+        stat_cold = stat_full = stat_reclaim = stat_pending = stat_chains = stat_multi = 0;
+        stat_record = stat_wait = stat_copy = 0;
+        window_layers = 0;
+        admits_window = 0;
+        evicts_window = 0;
+    }
+};
+
+expert_session::~expert_session() {
+    delete decode;
+    decode = nullptr;
+    join_ahead();
+    drop_graph();
+    if (buffer) { ggml_backend_buffer_free(buffer); }
+    if (batch_buffer) { ggml_backend_buffer_free(batch_buffer); }
+    for (auto & slot : ahead_slots) {
+        if (slot.buffer) { ggml_backend_buffer_free(slot.buffer); }
+    }
+    for (auto & buf : slot_buf) {
+        if (buf) { ggml_backend_buffer_free(buf); }
+    }
+}
+
+bool decode_prepare(void * raw, ggml_vk_decode_batch * batch) {
+    auto * session = static_cast<expert_session *>(raw);
+    if (!session || !batch || !batch->experts || !batch->ran || batch->n_experts < 1 || batch->n_experts > 1024 ||
+            !batch->input || batch->latent < 1 || batch->hidden < 1) {
+        return false;
+    }
+    if (!expert_supports(batch->up_type) || !expert_supports(batch->down_type) ||
+            batch->up_bytes == 0 || batch->up_bytes > decode_cache::k_max_up ||
+            batch->down_bytes == 0 || batch->down_bytes > decode_cache::k_max_down) {
+        return false;
+    }
+    if (!session->decode) { session->decode = new (std::nothrow) decode_cache; }
+    if (!session->decode || !session->decode->ensure(session)) { return false; }
+    auto * cache = session->decode;
+    if (cache->launched) { return false; }
+    // Once a token, while the compute queue is idle. Uploads from the previous
+    // token become hits before this layer's plan. Doing it every layer put a
+    // barrier in front of the dense sync.
+    static int prepare_i = 0;
+    if ((prepare_i++ % decode_cache::k_layers) == 0) {
+        const int acquired = ggml_vk_decode_upload_acquire();
+        std::lock_guard<std::mutex> lock(cache->mu);
+        for (int index : cache->pending_ready) {
+            if (index < 0 || index >= int(cache->slots.size())) { continue; }
+            auto & slot = cache->slots[size_t(index)];
+            if (!slot.busy) { continue; }
+            __atomic_store_n(&slot.acquire_done, acquired ? 1 : -1, __ATOMIC_RELEASE);
+        }
+        cache->pending_ready.clear();
+    }
+    {
+        std::lock_guard<std::mutex> lock(cache->mu);
+        for (auto & slot : cache->slots) {
+            if (!slot.busy) { continue; }
+            const int state = __atomic_load_n(&slot.acquire_done, __ATOMIC_ACQUIRE);
+            if (state == 0) { continue; }
+            slot.busy = false;
+            if (state > 0 && slot.key >= 0) {
+                slot.ready = true;
+            } else if (slot.key >= 0) {
+                cache->at.erase(slot.key);
+                slot.key = -1;
+                slot.ready = false;
+            }
+        }
+    }
+    std::fill(batch->ran, batch->ran + batch->n_experts, 0);
+    cache->held = batch;
+    cache->hit_of.clear();
+    cache->plan.clear();
+    cache->plan_imports = false;
+    const int n = std::min(batch->n_experts, decode_cache::k_max_n);
+    struct miss { int index; const void * up; const void * gate; const void * down; };
+    std::vector<miss> misses;
+    // Set before the admit notify. A worker that wakes inside this lock must
+    // not memcpy until decode_wait clears the flag.
+    decode_walk_active.store(1, std::memory_order_release);
+    {
+        std::lock_guard<std::mutex> lock(cache->mu);
+        ++cache->stamp;
+        for (int i = 0; i < n; ++i) {
+            const auto & expert = batch->experts[i];
+            if (expert.layer < 0 || expert.layer >= decode_cache::k_layers || expert.id < 0 ||
+                    expert.id >= decode_cache::k_experts || !expert.up || !expert.gate || !expert.down || !expert.output) {
+                continue;
+            }
+            const int32_t key = expert.layer * decode_cache::k_experts + expert.id;
+            auto & freq = cache->seen[size_t(key)];
+            if (freq < 65535) { ++freq; }
+            const auto found = cache->at.find(key);
+            if (found != cache->at.end()) {
+                auto & slot = cache->slots[size_t(found->second)];
+                slot.freq = freq;
+                slot.stamp = cache->stamp;
+                if (!slot.ready || slot.busy) { ++cache->stat_pending; }
+                if (slot.ready && !slot.busy && !cache->inplace_broken &&
+                        decode_cache::stride_fits(batch->up_type) &&
+                        decode_cache::stride_fits(batch->down_type)) {
+                    const int local = int(slot.offset / decode_cache::k_stride);
+                    if (slot.slab < 0 || slot.slab >= int(cache->slabs.size()) || local < 0 ||
+                            local >= cache->slabs[size_t(slot.slab)].nslots) {
+                        continue;
+                    }
+                    decode_cache::gpu_piece piece;
+                    piece.index = i;
+                    piece.slab = slot.slab;
+                    piece.local = local;
+                    piece.up = { cache->slabs[size_t(slot.slab)].buffer, slot.offset };
+                    piece.gate = { piece.up.buffer, slot.offset + decode_cache::k_gate_off };
+                    piece.down = { piece.up.buffer, slot.offset + decode_cache::k_down_off };
+                    cache->plan.push_back(piece);
+                    batch->ran[i] = 1;
+                    cache->hit_of.push_back(i);
+                }
+                continue;
+            }
+            misses.push_back({ i, expert.up, expert.gate, expert.down });
+            if (freq < 2) { ++cache->stat_cold; }
+            else if (!cache->admit_locked(key, freq, expert.up, expert.gate, expert.down, batch->up_bytes, batch->down_bytes)) {
+                ++cache->stat_full;
+            }
+        }
+    }
+    // Misses stay on the CPU walk. Importing them copies about a gigabyte of
+    // tiny regions and makes a token take seconds.
+    (void) misses;
+    return true;
+}
+
+bool decode_launch(void * raw) {
+    auto * session = static_cast<expert_session *>(raw);
+    auto * cache = session ? session->decode : nullptr;
+    if (!cache || !cache->held || cache->plan.empty()) { return true; }
+    if (cache->launched) { return true; }
+    if (cache->inplace_broken) { return false; }
+    const auto t0 = std::chrono::steady_clock::now();
+    std::vector<decode_cache::slab_group> groups;
+    for (const auto & piece : cache->plan) {
+        if (piece.slab < 0 || piece.local < 0) { continue; }
+        const int base = (piece.local / decode_cache::k_window) * decode_cache::k_window;
+        decode_cache::slab_group * group = nullptr;
+        for (auto & existing : groups) {
+            if (existing.slab == piece.slab && existing.base == base) { group = &existing; break; }
+        }
+        if (!group) {
+            groups.push_back({});
+            group = &groups.back();
+            group->slab = piece.slab;
+            group->base = base;
+        }
+        group->local.push_back(int32_t(piece.local - base));
+        group->hit.push_back(piece.index);
+    }
+    if (groups.empty()) { return false; }
+    std::sort(groups.begin(), groups.end(), [](const decode_cache::slab_group & a, const decode_cache::slab_group & b) {
+        return a.slab < b.slab || (a.slab == b.slab && a.base < b.base);
+    });
+    cache->stat_chains += int(groups.size());
+    if (groups.size() > 1) { ++cache->stat_multi; }
+    cache->hit_of.clear();
+    cache->launched_real.clear();
+    // One chain, padded to a fixed count, is one graph shape. Hit-count changes
+    // were rebuilding ~35 graphs a token, and that record was the expert phase.
+    // Padding every chain out to the 28-slot window made recording slower.
+    // Two windows pad to 4/8/16, not to the window, so the overflow chain stays
+    // one reused shape instead of a new graph per hit count.
+    const bool bucket_chain = groups.size() == 1 || groups.size() == 2;
+    for (auto & group : groups) {
+        const int real = int(group.local.size());
+        cache->hit_of.insert(cache->hit_of.end(), group.hit.begin(), group.hit.end());
+        cache->launched_real.push_back(real);
+        if (!bucket_chain || real < 1 || group.slab < 0 || group.slab >= int(cache->slabs.size())) { continue; }
+        const int span = std::min(decode_cache::k_window, cache->slabs[size_t(group.slab)].nslots - group.base);
+        int bucket = real <= 4 ? 4 : real <= 8 ? 8 : 16;
+        if (bucket > span) { bucket = span; }
+        if (bucket <= real) { continue; }
+        const int32_t pad = group.local.front();
+        group.local.reserve(size_t(bucket));
+        while (int(group.local.size()) < bucket) { group.local.push_back(pad); }
+    }
+    cache->vulkan_busy.store(1, std::memory_order_release);
+    auto * graph = cache->ensure_inplace(cache->held, groups);
+    if (!graph) {
+        cache->vulkan_busy.store(0, std::memory_order_release);
+        cache->inplace_broken = true;
+        return false;
+    }
+    bool ids_ok = true;
+    for (size_t c = 0; c < groups.size() && c < graph->chains.size(); ++c) {
+        const auto & group = groups[c];
+        auto & chain = graph->chains[c];
+        if (!chain.ids || chain.n != int(group.local.size())) { ids_ok = false; break; }
+        ggml_backend_tensor_set(chain.ids, group.local.data(), 0, group.local.size() * sizeof(int32_t));
+    }
+    if (ids_ok && graph->input) {
+        ggml_backend_tensor_set(graph->input, cache->held->input, 0, size_t(cache->held->latent) * sizeof(float));
+    } else {
+        ids_ok = false;
+    }
+    std::vector<const ggml_tensor *> suffix_tensors;
+    std::vector<size_t> suffix_sizes;
+    if (ids_ok && graph->inplace && !graph->chains.empty() && cache->held->latent > 0) {
+        const size_t row = size_t(cache->held->latent);
+        for (size_t c = 0; c < graph->chains.size(); ++c) {
+            const auto & chain = graph->chains[c];
+            const int real = c < cache->launched_real.size() && cache->launched_real[c] > 0 ?
+                cache->launched_real[c] : chain.n;
+            if (!chain.down || chain.n < 1 || real < 1 || real > chain.n) {
+                suffix_tensors.clear();
+                suffix_sizes.clear();
+                break;
+            }
+            suffix_tensors.push_back(chain.down);
+            suffix_sizes.push_back(size_t(real) * row * sizeof(float));
+        }
+    }
+    // The output copy is recorded at the end of this command buffer. decode_wait
+    // memcpys after the sync instead of submitting a second fence.
+    const enum ggml_status computed = ids_ok ? ggml_vk_graph_compute_suffix(session->backend, graph->gf,
+            suffix_tensors.empty() ? nullptr : suffix_tensors.data(),
+            suffix_sizes.empty() ? nullptr : suffix_sizes.data(),
+            int(suffix_tensors.size())) : GGML_STATUS_FAILED;
+    cache->vulkan_busy.store(0, std::memory_order_release);
+    if (computed != GGML_STATUS_SUCCESS) {
+        std::fprintf(stderr, "[kimi_vk_decode] inplace compute failed\n");
+        cache->inplace_broken = true;
+        return false;
+    }
+    cache->launched = true;
+    cache->launched_inplace = true;
+    cache->stat_record += std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count();
+    return true;
+}
+
+bool decode_wait(void * raw, ggml_vk_decode_batch * batch) {
+    decode_walk_active.store(0, std::memory_order_release);
+    auto * session = static_cast<expert_session *>(raw);
+    auto * cache = session ? session->decode : nullptr;
+    if (!cache) { return true; }
+    const int hits = cache->launched ? int(cache->hit_of.size()) : 0;
+    const int n = batch ? batch->n_experts : 0;
+    double wait_us = 0, copy_us = 0;
+    bool ok = true;
+    if (cache->launched) {
+        cache->launched = false;
+        const auto t0 = std::chrono::steady_clock::now();
+        cache->vulkan_busy.store(1, std::memory_order_release);
+        ggml_backend_synchronize(session->backend);
+        wait_us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count();
+        const int count = int(cache->hit_of.size());
+        const bool pooled = cache->launched_inplace && cache->active_inplace >= 0 &&
+            cache->active_inplace < int(cache->inplace_pool.size());
+        const bool have_graph = pooled ||
+            (cache->graph_index >= 0 && cache->graph_index < int(cache->graphs.size()));
+        if (!batch || !have_graph || count < 1 || batch->latent < 1) {
+            ok = false;
+        } else {
+            auto & graph = pooled ? cache->inplace_pool[size_t(cache->active_inplace)] : cache->graphs[size_t(cache->graph_index)];
+            cache->raw.resize(size_t(count) * size_t(batch->latent));
+            const auto t1 = std::chrono::steady_clock::now();
+            if (graph.inplace && !graph.chains.empty()) {
+                std::vector<const ggml_tensor *> tensors;
+                std::vector<void *> dsts;
+                std::vector<size_t> sizes;
+                size_t at = 0;
+                const size_t row = size_t(batch->latent);
+                for (size_t c = 0; c < graph.chains.size(); ++c) {
+                    const auto & chain = graph.chains[c];
+                    const int real = c < cache->launched_real.size() && cache->launched_real[c] > 0 ?
+                        cache->launched_real[c] : chain.n;
+                    if (!chain.down || chain.n < 1 || real < 1 || real > chain.n) { ok = false; break; }
+                    tensors.push_back(chain.down);
+                    dsts.push_back(cache->raw.data() + at);
+                    sizes.push_back(size_t(real) * row * sizeof(float));
+                    at += size_t(real) * row;
+                }
+                ok = ok && at == size_t(count) * row && (
+                    ggml_vk_take_suffix_reads(session->backend, dsts.data(), sizes.data(), int(tensors.size())) ||
+                    ggml_vk_copy_tensors_fenced(tensors.data(), dsts.data(), sizes.data(), int(tensors.size())));
+            } else if (graph.batched && graph.down_batched) {
+                const ggml_tensor * one = graph.down_batched;
+                void * dst = cache->raw.data();
+                const size_t bytes = size_t(count) * size_t(batch->latent) * sizeof(float);
+                ok = ggml_vk_copy_tensors_fenced(&one, &dst, &bytes, 1);
+            } else {
+                std::vector<const ggml_tensor *> tensors(size_t(count), nullptr);
+                std::vector<void *> dsts(size_t(count), nullptr);
+                std::vector<size_t> sizes(size_t(count), size_t(batch->latent) * sizeof(float));
+                for (int j = 0; j < count; ++j) {
+                    tensors[size_t(j)] = graph.down_out[size_t(j)];
+                    dsts[size_t(j)] = cache->raw.data() + size_t(j) * size_t(batch->latent);
+                }
+                ok = ggml_vk_copy_tensors_fenced(tensors.data(), dsts.data(), sizes.data(), count);
+            }
+            copy_us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t1).count();
+            if (ok) {
+                for (int j = 0; j < count && ok; ++j) {
+                    const float * src = cache->raw.data() + size_t(j) * size_t(batch->latent);
+                    for (int64_t row = 0; row < batch->latent; ++row) {
+                        if (!std::isfinite(src[row])) {
+                            const int index = size_t(j) < cache->hit_of.size() ? cache->hit_of[size_t(j)] : -1;
+                            const int id = index >= 0 && index < batch->n_experts ? batch->experts[index].id : -1;
+                            const int layer = index >= 0 && index < batch->n_experts ? batch->experts[index].layer : -1;
+                            std::fprintf(stderr, "[kimi_vk_decode] non-finite output j=%d layer=%d id=%d row=%lld value=%g\n",
+                                j, layer, id, static_cast<long long>(row), static_cast<double>(src[row]));
+                            ok = false;
+                            break;
+                        }
+                    }
+                }
+            }
+            if (ok) {
+                for (int j = 0; j < count; ++j) {
+                    const int index = cache->hit_of[size_t(j)];
+                    if (index < 0 || index >= batch->n_experts || !batch->experts[index].output) { ok = false; break; }
+                    float * dst = batch->experts[index].output;
+                    const float weight = batch->experts[index].weight;
+                    const float * src = cache->raw.data() + size_t(j) * size_t(batch->latent);
+                    for (int64_t row = 0; row < batch->latent; ++row) {
+                        volatile float scaled = src[row] * weight;
+                        dst[row] = scaled;
+                    }
+                }
+            }
+        }
+        cache->vulkan_busy.store(0, std::memory_order_release);
+    }
+    if (cache->live) { cache->note(hits, n, 0, wait_us, copy_us); }
+    cache->held = nullptr;
+    cache->hit_of.clear();
+    cache->plan.clear();
+    cache->plan_imports = false;
+    cache->launched_inplace = false;
+    return ok;
+}
+
 }  // namespace
+
+extern "C" void ggml_vk_decode_upload_window(int open) {
+    decode_cache * cache = live_cache.load(std::memory_order_acquire);
+    if (cache) {
+        std::lock_guard<std::mutex> lock(cache->mu);
+        upload_window_flag.store(open ? 1 : 0, std::memory_order_release);
+        if (open) {
+            cache->cv.notify_one();
+        } else {
+            cache->cv.notify_all();
+            cache->idle_cv.notify_all();
+        }
+    } else {
+        upload_window_flag.store(open ? 1 : 0, std::memory_order_release);
+    }
+    if (!open && cache) {
+        std::unique_lock<std::mutex> lock(cache->mu);
+        cache->idle_cv.wait(lock, [&] {
+            return cache->upload_busy.load(std::memory_order_acquire) == 0;
+        });
+    }
+}
+
+extern "C" int ggml_vk_decode_upload_window_open(void) {
+    return upload_window_flag.load(std::memory_order_acquire);
+}
 
 extern "C" const ggml_vk_expert_api_v1 * ggml_backend_vk_expert_api_v1(void) {
     static const ggml_vk_expert_api_v1 api = {
@@ -1031,6 +2555,9 @@ extern "C" const ggml_vk_expert_api_v1 * ggml_backend_vk_expert_api_v1(void) {
         reinterpret_cast<bool (*)(void *, const ggml_vk_expert_matmul *, int, char *, size_t)>(expert_mul_mat_batch),
         reinterpret_cast<bool (*)(void *, const ggml_vk_expert_ahead *, int)>(expert_ahead),
         reinterpret_cast<bool (*)(void *, const ggml_tensor *, int32_t, int32_t, int64_t, int64_t, size_t, size_t, const ggml_vk_device_expert *, int, const ggml_vk_device_route *, int, int, int, float *, char *, size_t)>(expert_device_layer),
+        reinterpret_cast<bool (*)(void *, ggml_vk_decode_batch *)>(decode_prepare),
+        reinterpret_cast<bool (*)(void *)>(decode_launch),
+        reinterpret_cast<bool (*)(void *, ggml_vk_decode_batch *)>(decode_wait),
     };
     return &api;
 }

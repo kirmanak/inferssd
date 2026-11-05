@@ -1,15 +1,43 @@
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
 
-// Vulkan prompt-expert matmul. The CPU sink decides which experts fit in the
-// device budget and calls mul_mat for those weights. This is not the CUDA
-// provider table: no residency, MXFP4, or deferred upload.
+// Vulkan prompt-expert matmul, plus a decode-only device weight cache.
+// The CPU sink decides which experts fit in the prompt budget and calls
+// mul_mat for those weights. Decode keeps hot experts in device memory and
+// computes them without a fresh upload. This is not the CUDA provider table:
+// no MXFP4, and the cache does not outlive the Vulkan expert session.
 #include "ggml.h"
 #include "ggml-backend.h"
 
 #ifdef __cplusplus
 extern "C" {
 #endif
+
+// One decode expert. On a hit, output receives the weighted down row, the same
+// rounded multiply the CPU resident path stores before the slot-order sum.
+struct ggml_vk_decode_expert {
+    int32_t layer;
+    int32_t id;
+    const void * up;
+    const void * gate;
+    const void * down;
+    float weight;
+    float * output;
+};
+
+struct ggml_vk_decode_batch {
+    int32_t up_type;
+    int32_t down_type;
+    int64_t latent;
+    int64_t hidden;
+    size_t up_bytes;
+    size_t down_bytes;
+    const float * input;
+    struct ggml_vk_decode_expert * experts;
+    int n_experts;
+    // n_experts bytes. prepare sets 1 for a device hit. Misses stay 0.
+    uint8_t * ran;
+};
 
 struct ggml_vk_expert_api_v1 {
     uint32_t abi;  // 1
@@ -43,6 +71,13 @@ struct ggml_vk_expert_api_v1 {
             const struct ggml_vk_device_expert * experts, int n_experts,
             const struct ggml_vk_device_route * routes, int n_routes,
             int nslots, int ntokens, float * output, char * error, size_t error_size);
+    // Decode weight cache. prepare marks device hits and queues uploads of the
+    // rest; it does not submit compute. launch records that compute. wait writes
+    // the weighted down rows. A false prepare leaves ran untouched. A false wait
+    // leaves output untouched.
+    bool (*decode_prepare)(void * session, struct ggml_vk_decode_batch * batch);
+    bool (*decode_launch)(void * session);
+    bool (*decode_wait)(void * session, struct ggml_vk_decode_batch * batch);
 };
 
 struct ggml_vk_device_expert {
