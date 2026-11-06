@@ -1464,8 +1464,12 @@ struct decode_cache {
         const char * imp = std::getenv("INFERSSD_DECODE_IMPORT");
         if (imp && imp[0] == '1' && imp[1] == '\0') { import_off = false; }
         session->join_ahead();
-        // These slots are device-local. The budget query can still report them
-        // after the free, and the cache then stays 3 GB small for the whole decode.
+        // These slots are device-local. Some drivers still report them in the
+        // budget query after the free, which left the decode cache 3 GB small.
+        // A driver that updates immediately must not be credited twice.
+        backend = session->backend;
+        size_t before_free = 0, total = 0;
+        ggml_backend_dev_memory(ggml_backend_get_device(backend), &before_free, &total);
         size_t returned = 0;
         for (auto & ahead : session->ahead_slots) {
             if (ahead.buffer) {
@@ -1480,11 +1484,10 @@ struct decode_cache {
         session->ahead_buffer = nullptr;
         session->ahead_at.clear();
         session->ahead_bytes.clear();
-        backend = session->backend;
         buft = ggml_backend_get_default_buffer_type(backend);
-        size_t free_bytes = 0, total = 0;
+        size_t free_bytes = 0;
         ggml_backend_dev_memory(ggml_backend_get_device(backend), &free_bytes, &total);
-        free_bytes += returned;
+        if (free_bytes < before_free + returned) { free_bytes = before_free + returned; }
         constexpr size_t reserve = 256ull << 20;
         size_t budget = free_bytes > reserve ? free_bytes - reserve : 0;
         if (budget > (10ull << 30)) { budget = 10ull << 30; }

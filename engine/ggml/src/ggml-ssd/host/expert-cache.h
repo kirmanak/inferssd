@@ -1042,8 +1042,11 @@ struct expert_cache {
         const auto found = std::find_if(layers.begin(), layers.end(), [&](const layer & l) { return l.id == layer_id; });
         if (found == layers.end()) { return; }
         const size_t layer_index = size_t(found - layers.begin());
-        for (size_t i = found->begin; i < found->begin + found->count && i < entries.size(); ++i) {
-            if (entries[i].layer_index == layer_index && entries[i].resident) { entries[i].protected_now = on; }
+        // Prefill admission may borrow a free slot from another layer's slice.
+        // The ahead copy reads every resident entry of this layer, so the pin
+        // has to cover those borrowed slots too.
+        for (auto & e : entries) {
+            if (e.layer_index == layer_index && e.resident) { e.protected_now = on; }
         }
     }
     void cached_weights(int32_t layer_id, std::vector<cached_weight> & out) const {

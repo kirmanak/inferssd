@@ -3289,8 +3289,11 @@ bool kimi_cpu_sink_stream_hybrid(struct kimi_cpu_sink * sink,
                         for (size_t i = 0; i < cached.size(); ++i) {
                             items[i] = { cached[i].key, cached[i].data, cached[i].bytes };
                         }
-                        sink->vulkan_api->ahead(sink->vulkan_session, items.data(), int(items.size()));
-                        filled_next = true;
+                        if (sink->vulkan_api->ahead(sink->vulkan_session, items.data(), int(items.size()))) {
+                            filled_next = true;
+                        } else {
+                            sink->cache.protect_layer(layer + 1, false);
+                        }
                     } else {
                         sink->cache.protect_layer(layer + 1, false);
                     }
@@ -3308,9 +3311,13 @@ bool kimi_cpu_sink_stream_hybrid(struct kimi_cpu_sink * sink,
                         }
                         if (sink->vulkan_api->ahead(sink->vulkan_session, prime.data(), int(prime.size()))) {
                             join_layer0 = true;
+                            std::fprintf(stderr, "[kimi_vk_prime] layer0=%zu ntokens=%d\n",
+                                    cached.size(), batch ? batch->ntokens : -1);
+                        } else {
+                            sink->cache.protect_layer(0, false);
+                            std::fprintf(stderr, "[kimi_vk_prime] layer0=failed ntokens=%d\n",
+                                    batch ? batch->ntokens : -1);
                         }
-                        std::fprintf(stderr, "[kimi_vk_prime] layer0=%zu ntokens=%d\n",
-                                cached.size(), batch ? batch->ntokens : -1);
                     } else {
                         sink->cache.protect_layer(0, false);
                         std::fprintf(stderr, "[kimi_vk_prime] layer0=0 ntokens=%d last=%d\n",
