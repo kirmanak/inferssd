@@ -1033,6 +1033,11 @@ struct expert_cache {
         const void * data = nullptr;
         size_t bytes = 0;
     };
+    int32_t last_layer_id() const {
+        int32_t id = -1;
+        for (const auto & l : layers) { id = std::max(id, l.id); }
+        return id;
+    }
     void protect_layer(int32_t layer_id, bool on) {
         const auto found = std::find_if(layers.begin(), layers.end(), [&](const layer & l) { return l.id == layer_id; });
         if (found == layers.end()) { return; }

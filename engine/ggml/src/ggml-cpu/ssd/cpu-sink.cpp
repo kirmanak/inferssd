@@ -3261,23 +3261,61 @@ bool kimi_cpu_sink_stream_hybrid(struct kimi_cpu_sink * sink,
     if (stats) { *stats = {}; }
     if (!sink) { sink_error(error, error_size, "null CPU sink"); return false; }
     std::lock_guard<sink_run_mutex> serial(sink->run_mutex); sink->prefetch_drain();
+    // The last expert layer can be a short route set. Its copy of layer 0 has to
+    // finish before this call returns, or the next request waits on it.
+    bool join_layer0 = false;
+    auto join_primed = [&]() {
+        if (!join_layer0) { return; }
+        join_layer0 = false;
+        if (sink->vulkan_api && sink->vulkan_api->ahead && sink->vulkan_session) {
+            sink->vulkan_api->ahead(sink->vulkan_session, nullptr, 0);
+        }
+        // The copy has its own bytes. Do not keep layer 0 pinned for decode.
+        sink->cache.protect_layer(0, false);
+    };
     if (sink->vulkan_api && sink->vulkan_api->ahead && sink->vulkan_session) {
         sink->vulkan_api->ahead(sink->vulkan_session, nullptr, 0);
-        if (batch && batch->ntokens > 32 && up) {
+        if (up) {
             int layer = -1, consumed = 0;
             if (std::sscanf(up->name, "blk.%d.ffn_up_exps.weight%n", &layer, &consumed) == 1 &&
                     consumed && !up->name[consumed]) {
-                sink->cache.protect_layer(layer + 1, true);
-                std::vector<sink_cache::cached_weight> cached;
-                sink->cache.cached_weights(layer + 1, cached);
-                if (!cached.empty()) {
-                    std::vector<ggml_vk_expert_ahead> items(cached.size());
-                    for (size_t i = 0; i < cached.size(); ++i) {
-                        items[i] = { cached[i].key, cached[i].data, cached[i].bytes };
+                bool filled_next = false;
+                if (batch && batch->ntokens > 32) {
+                    sink->cache.protect_layer(layer + 1, true);
+                    std::vector<sink_cache::cached_weight> cached;
+                    sink->cache.cached_weights(layer + 1, cached);
+                    if (!cached.empty()) {
+                        std::vector<ggml_vk_expert_ahead> items(cached.size());
+                        for (size_t i = 0; i < cached.size(); ++i) {
+                            items[i] = { cached[i].key, cached[i].data, cached[i].bytes };
+                        }
+                        sink->vulkan_api->ahead(sink->vulkan_session, items.data(), int(items.size()));
+                        filled_next = true;
+                    } else {
+                        sink->cache.protect_layer(layer + 1, false);
                     }
-                    sink->vulkan_api->ahead(sink->vulkan_session, items.data(), int(items.size()));
-                } else {
-                    sink->cache.protect_layer(layer + 1, false);
+                }
+                // blk.47 has ten routes, so the wide-batch fill never sees it.
+                // Copy layer 0 anyway. The join below keeps that upload off the next prompt.
+                if (!filled_next && layer > 0 && layer == sink->cache.last_layer_id()) {
+                    sink->cache.protect_layer(0, true);
+                    std::vector<sink_cache::cached_weight> cached;
+                    sink->cache.cached_weights(0, cached);
+                    if (!cached.empty()) {
+                        std::vector<ggml_vk_expert_ahead> prime(cached.size());
+                        for (size_t i = 0; i < cached.size(); ++i) {
+                            prime[i] = { cached[i].key, cached[i].data, cached[i].bytes };
+                        }
+                        if (sink->vulkan_api->ahead(sink->vulkan_session, prime.data(), int(prime.size()))) {
+                            join_layer0 = true;
+                        }
+                        std::fprintf(stderr, "[kimi_vk_prime] layer0=%zu ntokens=%d\n",
+                                cached.size(), batch ? batch->ntokens : -1);
+                    } else {
+                        sink->cache.protect_layer(0, false);
+                        std::fprintf(stderr, "[kimi_vk_prime] layer0=0 ntokens=%d last=%d\n",
+                                batch ? batch->ntokens : -1, sink->cache.last_layer_id());
+                    }
                 }
             }
         }
@@ -3723,9 +3761,12 @@ bool kimi_cpu_sink_stream_hybrid(struct kimi_cpu_sink * sink,
         if (stats) { *stats = sink->current; }
         sink->print_observation(true);
         const auto published = sink->publish_observation(true);
+        join_primed();
         if (!published) { sink_error(error, error_size, published.error.c_str()); return false; }
         return true;
     } catch (const std::exception & e) {
+        // The layer-0 copy reads cache pointers. Join it before release unmaps them.
+        join_primed();
         // Stop new submissions and drain before returning, including an
         // unexpected exception in a consumer. No user buffer may outlive I/O.
         sink->cancel_and_wait();

@@ -1242,3 +1242,33 @@ the completion. Repeat with `INFERSSD_DECODE_GPU=0` for the text reference.
 For the warm prompt check, use the same model/settings with
 `inferssd-server`, then send the prompt twice to `/completion` with
 `n_predict=1`, `temperature=0`, and `cache_prompt=false`.
+
+## Layer 0 prime clears 300
+
+The last expert layer is a one-token node (`blk.47`, ten routes). The
+ahead fill was gated on `ntokens > 32`, so it never copied layer 0.
+Prefault both 1536 MB slots, copy layer 0 after that layer, and join
+before the call returns. Warm pass, 2026-11-06:
+
+```text
+pass 2 prompt_ms=1649.322 prompt_per_second=303.15 content=</think>
+[kimi_vk_prime] layer0=1014 ntokens=1
+bucket layer 0 misses=0 pack_us=7266
+```
+
+Cold stayed 61.6 tok/s. A cold prompt still reads about 40 GB. Not chased.
+
+The ahead slots are device-local. The decode cache sizes itself from the
+budget query after freeing them. That query still counted the freed
+buffers, so the cache stayed 3 GB small (1438 slots, 14.95 tok/s).
+Crediting the freed bytes restores 2188 slots.
+
+```text
+llama-completion -n 256 --ignore-eos --temp 0
+last-128 splits=98 mean=66.297 ms (15.084 tok/s)
+sample ends "EOF by user"
+[kimi_vk_decode] cache slots=2188
+```
+
+Same-day HEAD without the prime was 63.942 ms (15.639 tok/s). The CPU
+expert body stays about 2 ms slower. The 15 tok/s bar holds. Kept.

@@ -478,13 +478,44 @@ bool expert_ahead(void * raw, const ggml_vk_expert_ahead * items, int count) {
         cursor = off + items[i].bytes;
     }
     if (plan.empty()) { return false; }
-    if (!slot.buffer || slot.cap < cursor) {
-        if (slot.buffer) { ggml_backend_buffer_free(slot.buffer); }
-        slot.buffer = ggml_backend_buft_alloc_buffer(buft, cursor);
-        slot.cap = slot.buffer ? ggml_backend_buffer_get_size(slot.buffer) : 0;
-        if (!slot.buffer) { return false; }
-        if (dest == session->ahead_shown) { session->ahead_buffer = slot.buffer; }
+    // A growing host-visible slot minor-faults the new mapping, and those fills
+    // ran at 5–8 GB/s. Both slots are allocated once and touched before the copy.
+    auto prefault_slot = [&](int index) {
+        auto & held = session->ahead_slots[index];
+        if (held.buffer && held.cap >= k_ahead_cap) { return true; }
+        if (held.buffer) {
+            ggml_backend_buffer_free(held.buffer);
+            held.buffer = nullptr;
+            held.cap = 0;
+            held.at.clear();
+            held.bytes.clear();
+        }
+        try { held.buffer = ggml_backend_buft_alloc_buffer(buft, k_ahead_cap); }
+        catch (...) { held.buffer = nullptr; }
+        if (!held.buffer) { return false; }
+        held.cap = ggml_backend_buffer_get_size(held.buffer);
+        void * mapped = ggml_vk_mapped_ptr(held.buffer);
+        const auto t0 = std::chrono::steady_clock::now();
+        if (mapped && held.cap) {
+            auto * bytes = static_cast<volatile char *>(mapped);
+            for (size_t off = 0; off < held.cap; off += 4096) { bytes[off] = 0; }
+        }
+        std::fprintf(stderr, "[kimi_vk_ahead] prefault slot=%d bytes=%zu us=%.0f mapped=%d\n",
+                index, held.cap,
+                std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count(),
+                mapped ? 1 : 0);
+        return true;
+    };
+    if (!prefault_slot(0) || !prefault_slot(1)) {
+        if (!slot.buffer || slot.cap < cursor) {
+            if (slot.buffer) { ggml_backend_buffer_free(slot.buffer); }
+            try { slot.buffer = ggml_backend_buft_alloc_buffer(buft, cursor); }
+            catch (...) { slot.buffer = nullptr; }
+            slot.cap = slot.buffer ? ggml_backend_buffer_get_size(slot.buffer) : 0;
+            if (!slot.buffer) { return false; }
+        }
     }
+    if (dest == session->ahead_shown) { session->ahead_buffer = slot.buffer; }
     slot.at.clear();
     slot.bytes.clear();
     session->ahead_filling = dest;
@@ -1433,8 +1464,16 @@ struct decode_cache {
         const char * imp = std::getenv("INFERSSD_DECODE_IMPORT");
         if (imp && imp[0] == '1' && imp[1] == '\0') { import_off = false; }
         session->join_ahead();
+        // These slots are device-local. The budget query can still report them
+        // after the free, and the cache then stays 3 GB small for the whole decode.
+        size_t returned = 0;
         for (auto & ahead : session->ahead_slots) {
-            if (ahead.buffer) { ggml_backend_buffer_free(ahead.buffer); ahead.buffer = nullptr; ahead.cap = 0; }
+            if (ahead.buffer) {
+                returned += ggml_backend_buffer_get_size(ahead.buffer);
+                ggml_backend_buffer_free(ahead.buffer);
+                ahead.buffer = nullptr;
+                ahead.cap = 0;
+            }
             ahead.at.clear();
             ahead.bytes.clear();
         }
@@ -1445,6 +1484,7 @@ struct decode_cache {
         buft = ggml_backend_get_default_buffer_type(backend);
         size_t free_bytes = 0, total = 0;
         ggml_backend_dev_memory(ggml_backend_get_device(backend), &free_bytes, &total);
+        free_bytes += returned;
         constexpr size_t reserve = 256ull << 20;
         size_t budget = free_bytes > reserve ? free_bytes - reserve : 0;
         if (budget > (10ull << 30)) { budget = 10ull << 30; }
