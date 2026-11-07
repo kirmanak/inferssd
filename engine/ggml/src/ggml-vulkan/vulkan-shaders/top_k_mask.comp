@@ -1,0 +1,81 @@
+#version 450
+
+#include "types.glsl"
+
+// GGML_OP_TOP_K_MASK: one workgroup per row. The row is filled with -inf, then the mask cells of the live picks and
+// the extra cells are copied over it; a cell kept twice gets the same value. Strides and offsets are in elements.
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout (push_constant) uniform parameter
+{
+    uint n_kv; uint ne1; uint ne2;
+    uint m1; uint m2; uint m3;
+    uint n_top; uint n_pick; uint n_blk; uint n_extra;
+    uint sm1; uint sm2; uint sm3;
+    uint sk1; uint sk2; uint sk3;
+    uint ss1; uint ss2; uint ss3;
+    uint sb1;
+    uint se1; uint se2; uint se3;
+    // bit 0: score bound, bit 1: blocks bound, bit 2: extra bound
+    uint flags;
+    uint offs_m; uint offs_k; uint offs_s; uint offs_b; uint offs_e; uint offs_d;
+} p;
+
+layout (binding = 0) readonly buffer M {D_TYPE data_m[];};
+layout (binding = 1) readonly buffer K {int data_k[];};
+layout (binding = 2) readonly buffer S {float data_s[];};
+layout (binding = 3) readonly buffer B {int data_b[];};
+layout (binding = 4) readonly buffer E {int data_e[];};
+layout (binding = 5) buffer D {D_TYPE data_d[];};
+
+void main() {
+    const uint ir = gl_WorkGroupID.x;
+    const uint i1 = ir % p.ne1;
+    const uint i2 = (ir / p.ne1) % p.ne2;
+    const uint i3 = ir / (p.ne1*p.ne2);
+    const uint tid = gl_LocalInvocationID.x;
+
+    const uint m_row = p.offs_m + (i1 % p.m1)*p.sm1 + (i2 % p.m2)*p.sm2 + (i3 % p.m3)*p.sm3;
+    const uint d_row = p.offs_d + ir*p.n_kv;
+
+    const float ninf = uintBitsToFloat(0xff800000u);
+    for (uint c = tid; c < p.n_kv; c += gl_WorkGroupSize.x) {
+        data_d[d_row + c] = D_TYPE(ninf);
+    }
+
+    // the kept cells overwrite the fill of other invocations of this workgroup
+    memoryBarrierBuffer();
+    barrier();
+
+    const bool has_score = (p.flags & 1u) != 0;
+    const bool has_blocks = (p.flags & 2u) != 0;
+    for (uint i = tid; i < p.n_top + p.n_extra; i += gl_WorkGroupSize.x) {
+        if (i >= p.n_top) {
+            const int c = data_e[p.offs_e + (i - p.n_top) + i1*p.se1 + i2*p.se2 + i3*p.se3];
+            if (c >= 0 && uint(c) < p.n_kv) {
+                data_d[d_row + c] = data_m[m_row + c];
+            }
+            continue;
+        }
+
+        const int pick = data_k[p.offs_k + i + i1*p.sk1 + i2*p.sk2 + i3*p.sk3];
+        if (pick < 0 || uint(pick) >= p.n_pick) {
+            continue;
+        }
+        if (has_score && !(data_s[p.offs_s + pick + i1*p.ss1 + i2*p.ss2 + i3*p.ss3] > ninf)) {
+            continue;
+        }
+        if (!has_blocks) {
+            if (uint(pick) < p.n_kv) {
+                data_d[d_row + pick] = data_m[m_row + pick];
+            }
+            continue;
+        }
+        for (uint k = 0; k < p.n_blk; ++k) {
+            const int c = data_b[p.offs_b + k + pick*p.sb1];
+            if (c >= 0 && uint(c) < p.n_kv) {
+                data_d[d_row + c] = data_m[m_row + c];
+            }
+        }
+    }
+}

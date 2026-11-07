@@ -756,6 +756,7 @@ struct vk_device_struct {
     vk_pipeline pipeline_pad_f32;
     vk_pipeline pipeline_roll_f32;
     vk_pipeline pipeline_dsv4_hc_comb_f32, pipeline_dsv4_hc_pre_f32, pipeline_dsv4_hc_post_f32;
+    vk_pipeline pipeline_top_k_mask_f16, pipeline_top_k_mask_f32;
     vk_pipeline pipeline_repeat_f32, pipeline_repeat_back_f32;
     vk_pipeline pipeline_cpy_f32_f32, pipeline_cpy_f32_f16, pipeline_cpy_f16_f16, pipeline_cpy_f16_f32, pipeline_cpy_f32_bf16, pipeline_cpy_f32_i32, pipeline_cpy_i32_f32;
     vk_pipeline pipeline_contig_cpy_f32_f32, pipeline_contig_cpy_f32_f16, pipeline_contig_cpy_f16_f16, pipeline_contig_cpy_f16_f32, pipeline_contig_cpy_f32_bf16, pipeline_contig_cpy_f32_i32, pipeline_contig_cpy_i32_f32;
@@ -1295,6 +1296,21 @@ struct vk_op_dsv4_hc_push_constants {
     uint32_t nb[5][3];
     float param2;
 };
+
+// GGML_OP_TOP_K_MASK: strides and offsets in elements; dst is contiguous
+struct vk_op_top_k_mask_push_constants {
+    uint32_t n_kv, ne1, ne2;
+    uint32_t m1, m2, m3;
+    uint32_t n_top, n_pick, n_blk, n_extra;
+    uint32_t sm1, sm2, sm3;
+    uint32_t sk1, sk2, sk3;
+    uint32_t ss1, ss2, ss3;
+    uint32_t sb1;
+    uint32_t se1, se2, se3;
+    uint32_t flags;
+    uint32_t offs_m, offs_k, offs_s, offs_b, offs_e, offs_d;
+};
+static_assert(sizeof(vk_op_top_k_mask_push_constants) <= 128, "the guaranteed push constant size");
 
 struct vk_op_multi_add_push_constants {
     // shape for dst
@@ -4618,6 +4634,8 @@ static void ggml_vk_load_shaders(vk_device& device) {
     ggml_vk_create_pipeline(device, device->pipeline_dsv4_hc_comb_f32, "dsv4_hc_comb_f32", dsv4_hc_comb_f32_len, dsv4_hc_comb_f32_data, "main", 4, sizeof(vk_op_dsv4_hc_push_constants), {64, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_dsv4_hc_pre_f32, "dsv4_hc_pre_f32", dsv4_hc_pre_f32_len, dsv4_hc_pre_f32_data, "main", 3, sizeof(vk_op_dsv4_hc_push_constants), {512, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_dsv4_hc_post_f32, "dsv4_hc_post_f32", dsv4_hc_post_f32_len, dsv4_hc_post_f32_data, "main", 5, sizeof(vk_op_dsv4_hc_push_constants), {512, 1, 1}, {}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_top_k_mask_f16, "top_k_mask_f16", top_k_mask_f16_len, top_k_mask_f16_data, "main", 6, sizeof(vk_op_top_k_mask_push_constants), {1, 1, 1}, {}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_top_k_mask_f32, "top_k_mask_f32", top_k_mask_f32_len, top_k_mask_f32_data, "main", 6, sizeof(vk_op_top_k_mask_push_constants), {1, 1, 1}, {}, 1);
 
     ggml_vk_create_pipeline(device, device->pipeline_repeat_f32, "repeat_f32", repeat_f32_len, repeat_f32_data, "main", 2, sizeof(vk_op_unary_push_constants), {512, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_repeat_back_f32, "repeat_back_f32", repeat_back_f32_len, repeat_back_f32_data, "main", 2, sizeof(vk_op_unary_push_constants), {512, 1, 1}, {}, 1);
@@ -11129,6 +11147,63 @@ static void ggml_vk_dsv4_hc(ggml_backend_vk_context * ctx, vk_context& subctx, g
     ggml_vk_op_f32(ctx, subctx, src0, src1, src2, src3, dst, dst->op, std::move(p));
 }
 
+// One workgroup per destination row; see top_k_mask.comp.
+static void ggml_vk_top_k_mask(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_tensor * dst) {
+    const ggml_tensor * mask   = dst->src[0];
+    const ggml_tensor * top_k  = dst->src[1];
+    const ggml_tensor * score  = dst->src[2];
+    const ggml_tensor * blocks = dst->src[3];
+    const ggml_tensor * extra  = dst->src[4];
+
+    vk_pipeline pipeline = dst->type == GGML_TYPE_F16 ? ctx->device->pipeline_top_k_mask_f16 : ctx->device->pipeline_top_k_mask_f32;
+    ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
+
+    // a binding starts at an aligned offset; the elements before the tensor go to the shader
+    const auto sub = [&](const ggml_tensor * t, uint32_t & offs) {
+        const vk_subbuffer b = ggml_vk_tensor_subbuffer(ctx, t, true);
+        offs = (uint32_t)((b.size - ggml_nbytes(t)) / ggml_type_size(t->type));
+        return b;
+    };
+
+    vk_op_top_k_mask_push_constants pc {};
+    const vk_subbuffer m_buf = sub(mask, pc.offs_m);
+    const vk_subbuffer k_buf = sub(top_k, pc.offs_k);
+    const vk_subbuffer d_buf = sub(dst, pc.offs_d);
+    // an unbound source reads the picks' buffer, which the shader then never indexes
+    uint32_t unused = 0;
+    const vk_subbuffer s_buf = score  ? sub(score, pc.offs_s)  : sub(top_k, unused);
+    const vk_subbuffer b_buf = blocks ? sub(blocks, pc.offs_b) : sub(top_k, unused);
+    const vk_subbuffer e_buf = extra  ? sub(extra, pc.offs_e)  : sub(top_k, unused);
+
+    const size_t ts = ggml_type_size(mask->type);
+    const size_t si = sizeof(int32_t);
+    pc.n_kv = (uint32_t)mask->ne[0];
+    pc.ne1 = (uint32_t)dst->ne[1];
+    pc.ne2 = (uint32_t)dst->ne[2];
+    pc.m1 = (uint32_t)mask->ne[1];
+    pc.m2 = (uint32_t)mask->ne[2];
+    pc.m3 = (uint32_t)mask->ne[3];
+    pc.n_top = (uint32_t)top_k->ne[0];
+    pc.n_pick = (uint32_t)(blocks ? blocks->ne[1] : score ? score->ne[0] : mask->ne[0]);
+    pc.n_blk = (uint32_t)(blocks ? blocks->ne[0] : 1);
+    pc.n_extra = (uint32_t)(extra ? extra->ne[0] : 0);
+    pc.sm1 = (uint32_t)(mask->nb[1]/ts); pc.sm2 = (uint32_t)(mask->nb[2]/ts); pc.sm3 = (uint32_t)(mask->nb[3]/ts);
+    pc.sk1 = (uint32_t)(top_k->nb[1]/si); pc.sk2 = (uint32_t)(top_k->nb[2]/si); pc.sk3 = (uint32_t)(top_k->nb[3]/si);
+    if (score) {
+        pc.ss1 = (uint32_t)(score->nb[1]/sizeof(float)); pc.ss2 = (uint32_t)(score->nb[2]/sizeof(float)); pc.ss3 = (uint32_t)(score->nb[3]/sizeof(float));
+    }
+    if (blocks) {
+        pc.sb1 = (uint32_t)(blocks->nb[1]/si);
+    }
+    if (extra) {
+        pc.se1 = (uint32_t)(extra->nb[1]/si); pc.se2 = (uint32_t)(extra->nb[2]/si); pc.se3 = (uint32_t)(extra->nb[3]/si);
+    }
+    pc.flags = (score ? 1u : 0u) | (blocks ? 2u : 0u) | (extra ? 4u : 0u);
+
+    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { m_buf, k_buf, s_buf, b_buf, e_buf, d_buf }, pc,
+        { (uint32_t)ggml_nrows(dst), 1, 1 });
+}
+
 static void ggml_vk_roll(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, ggml_tensor * dst) {
     const int32_t s0 = ggml_get_op_params_i32(dst, 0);
     const int32_t s1 = ggml_get_op_params_i32(dst, 1);
@@ -13411,6 +13486,10 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
     case GGML_OP_DSV4_HC_PRE:
     case GGML_OP_DSV4_HC_POST:
         ggml_vk_dsv4_hc(ctx, compute_ctx, node);
+
+        break;
+    case GGML_OP_TOP_K_MASK:
+        ggml_vk_top_k_mask(ctx, compute_ctx, node);
 
         break;
     case GGML_OP_CPY:
@@ -17588,6 +17667,23 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
             return op->src[0]->type == GGML_TYPE_F32;
         case GGML_OP_DSV4_HC_COMB:
             return false;
+        case GGML_OP_TOP_K_MASK:
+            {
+                // element strides throughout, a contiguous destination, and index rows read element by element
+                if ((op->type != GGML_TYPE_F16 && op->type != GGML_TYPE_F32) || op->src[0]->type != op->type ||
+                        !ggml_is_contiguous(op) || op->src[0]->nb[0] != ggml_type_size(op->type) ||
+                        op->src[0]->nb[1] % ggml_type_size(op->type) != 0 ||
+                        ggml_nrows(op) > (int64_t) device->properties.limits.maxComputeWorkGroupCount[0]) {
+                    return false;
+                }
+                for (int i = 1; i < 5; ++i) {
+                    const ggml_tensor * t = op->src[i];
+                    if (t && (t->nb[0] != ggml_type_size(t->type) || t->nb[1] % ggml_type_size(t->type) != 0)) {
+                        return false;
+                    }
+                }
+                return true;
+            }
         case GGML_OP_DSV4_HC_PRE:
         case GGML_OP_DSV4_HC_POST:
             // Off before only because it moved a near-tie first token. Against

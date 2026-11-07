@@ -1019,6 +1019,8 @@ void process_shaders() {
     string_to_spv("dsv4_hc_comb_f32", "dsv4_hc_comb.comp", {});
     string_to_spv("dsv4_hc_pre_f32", "dsv4_hc_pre.comp", {});
     string_to_spv("dsv4_hc_post_f32", "dsv4_hc_post.comp", {});
+    string_to_spv("top_k_mask_f16", "top_k_mask.comp", {{"D_TYPE", "float16_t"}});
+    string_to_spv("top_k_mask_f32", "top_k_mask.comp", {{"D_TYPE", "float"}});
 
     string_to_spv("add_id_f32", "add_id.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"B_TYPE", "float"}, {"D_TYPE", "float"}}));
 
