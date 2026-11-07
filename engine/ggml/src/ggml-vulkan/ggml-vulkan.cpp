@@ -10663,7 +10663,8 @@ static void ggml_vk_sub(ggml_backend_vk_context * ctx, vk_context& subctx, const
     });
 }
 
-static void ggml_vk_mul(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+// sigmoid_b: src1 is the source of a fused SIGMOID whose result the MUL takes
+static void ggml_vk_mul(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst, bool sigmoid_b = false) {
     const uint32_t src0_type_size = ggml_type_size(src0->type);
     const uint32_t src1_type_size = ggml_type_size(src1->type);
     const uint32_t dst_type_size = ggml_type_size(dst->type);
@@ -10674,7 +10675,7 @@ static void ggml_vk_mul(ggml_backend_vk_context * ctx, vk_context& subctx, const
         (uint32_t)src1->ne[0], (uint32_t)src1->ne[1], (uint32_t)src1->ne[2],(uint32_t)src1->ne[3], (uint32_t)src1->nb[0] / src1_type_size, (uint32_t)src1->nb[1] / src1_type_size, (uint32_t)src1->nb[2] / src1_type_size, (uint32_t)src1->nb[3] / src1_type_size,
         (uint32_t) dst->ne[0], (uint32_t) dst->ne[1], (uint32_t) dst->ne[2],(uint32_t) dst->ne[3], (uint32_t) dst->nb[0] /  dst_type_size, (uint32_t) dst->nb[1] /  dst_type_size, (uint32_t) dst->nb[2] /  dst_type_size, (uint32_t) dst->nb[3] /  dst_type_size,
         0,
-        0.0f, 0.0f, 0,
+        0.0f, 0.0f, sigmoid_b ? 1 : 0,
     });
 }
 
@@ -13586,6 +13587,12 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
             ggml_vk_topk_moe(ctx, compute_ctx, cgraph, node_idx);
             break;
         }
+        if (ctx->num_additional_fused_ops == 1 && ggml_get_unary_op(node) == GGML_UNARY_OP_SIGMOID) {
+            // SIGMOID_MUL: the MUL after it reads the sigmoid's source
+            ggml_tensor * mul = cgraph->nodes[node_idx + 1];
+            ggml_vk_mul(ctx, compute_ctx, mul->src[0], src0, mul, true);
+            break;
+        }
 
         switch (ggml_get_unary_op(node)) {
         case GGML_UNARY_OP_ELU:
@@ -15921,6 +15928,25 @@ static bool ggml_vk_can_fuse_scale_silu(const struct ggml_cgraph * cgraph, int n
            ggml_is_contiguous(scale->src[0]) && ggml_is_contiguous(silu);
 }
 
+// A SIGMOID whose only use is the second source of the MUL after it: the MUL shader applies it. Unlike
+// ggml_can_fuse this lets the MUL broadcast the sigmoid, as the binary shader does with its second source.
+static bool ggml_vk_can_fuse_sigmoid_mul(const struct ggml_cgraph * cgraph, int node_idx) {
+    if (node_idx + 1 >= cgraph->n_nodes) {
+        return false;
+    }
+    const ggml_tensor * sig = cgraph->nodes[node_idx];
+    const ggml_tensor * mul = cgraph->nodes[node_idx + 1];
+    if (sig->op != GGML_OP_UNARY || mul->op != GGML_OP_MUL ||
+            !(sig->flags & GGML_TENSOR_FLAG_COMPUTE) || !(mul->flags & GGML_TENSOR_FLAG_COMPUTE) ||
+            !ggml_node_has_n_uses(cgraph, node_idx, 1)) {
+        return false;
+    }
+    return ggml_get_unary_op(sig) == GGML_UNARY_OP_SIGMOID && mul->src[1] == sig && mul->src[0] != sig &&
+           ggml_are_same_shape(mul->src[0], mul) && ggml_can_repeat(sig, mul) &&
+           sig->src[0]->type == GGML_TYPE_F32 && sig->type == GGML_TYPE_F32 && ggml_is_contiguous(sig->src[0]) &&
+           ggml_is_contiguous(sig) && mul->src[0]->type == GGML_TYPE_F32 && mul->type == GGML_TYPE_F32;
+}
+
 static bool ggml_vk_can_fuse_rms_norm_mul_rope(ggml_backend_vk_context * ctx, const struct ggml_cgraph * cgraph,
                                                int node_idx) {
     GGML_UNUSED(ctx);
@@ -16215,6 +16241,12 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 ctx->num_additional_fused_ops = 1;
                 fusion_string = "SCALE_SILU";
                 op_srcs_fused_elementwise[0] = true;
+                op_srcs_fused_elementwise[1] = true;
+            } else if (ggml_vk_can_fuse_sigmoid_mul(cgraph, i)) {
+                ctx->num_additional_fused_ops = 1;
+                fusion_string = "SIGMOID_MUL";
+                // the sigmoid's source is read elementwise only when the MUL does not broadcast it
+                op_srcs_fused_elementwise[0] = ggml_are_same_shape(cgraph->nodes[i], cgraph->nodes[i + 1]);
                 op_srcs_fused_elementwise[1] = true;
             } else if (ggml_vk_can_fuse(ctx, cgraph, i, { GGML_OP_MUL_MAT_ID, GGML_OP_ADD_ID })) {
                 ctx->num_additional_fused_ops = 1;
@@ -16913,12 +16945,20 @@ static void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * 
                 match_pattern(topk_moe_late_softmax, j)) {
                 continue;
             }
+            // Don't pull a SIGMOID away from the MUL after it that takes it, see SIGMOID_MUL
+            if (j + 1 < graph->n_nodes && graph->nodes[j]->op == GGML_OP_UNARY &&
+                ggml_get_unary_op(graph->nodes[j]) == GGML_UNARY_OP_SIGMOID &&
+                graph->nodes[j + 1]->op == GGML_OP_MUL && graph->nodes[j + 1]->src[1] == graph->nodes[j]) {
+                continue;
+            }
             bool ok = true;
             for (int c = first_unused; c < j; ++c) {
                 if (!used[c] &&
                     is_src_of(graph->nodes[j], graph->nodes[c]) &&
                     !(j == c+1 && c == current_set.back() && graph->nodes[c]->op == GGML_OP_RMS_NORM && graph->nodes[j]->op == GGML_OP_MUL) &&
                     !(j == c+1 && c == current_set.back() && graph->nodes[c]->op == GGML_OP_RMS_NORM && graph->nodes[j]->op == GGML_OP_SCALE) &&
+                    !(j == c+1 && c == current_set.back() && graph->nodes[c]->op == GGML_OP_UNARY && graph->nodes[j]->op == GGML_OP_MUL &&
+                      ggml_get_unary_op(graph->nodes[c]) == GGML_UNARY_OP_SIGMOID && graph->nodes[j]->src[1] == graph->nodes[c]) &&
                     !(j == c+1 && c == current_set.back() && graph->nodes[c]->op == GGML_OP_MUL_MAT && graph->nodes[j]->op == GGML_OP_ADD) &&
                     !(j == c+1 && c == current_set.back() && graph->nodes[c]->op == GGML_OP_MUL_MAT_ID && graph->nodes[j]->op == GGML_OP_ADD_ID) &&
                     !(j == c+1 && c == current_set.back() && graph->nodes[c]->op == GGML_OP_MUL_MAT_ID && graph->nodes[j]->op == GGML_OP_MUL) &&

@@ -3545,6 +3545,52 @@ struct test_scale_silu : public test_case {
     }
 };
 
+// GGML_OP_UNARY(SIGMOID) + GGML_OP_MUL taking it as the second source, which a backend may fuse
+struct test_sigmoid_mul : public test_case {
+    const std::array<int64_t, 4> ne_a;
+    const std::array<int64_t, 4> ne_g;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "SIGMOID_MUL";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    std::string vars() override {
+        return VARS_TO_STR2(ne_a, ne_g);
+    }
+
+    test_sigmoid_mul(std::array<int64_t, 4> ne_a = {2560, 1, 1, 1}, std::array<int64_t, 4> ne_g = {1, 1, 1, 1})
+        : ne_a(ne_a), ne_g(ne_g) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * a = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne_a.data());
+        ggml_tensor * b = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne_a.data());
+        ggml_tensor * g = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne_g.data());
+        ggml_tensor * c = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne_g.data());
+        ggml_set_name(a, "a");
+        ggml_set_name(b, "b");
+        ggml_set_name(g, "g");
+        ggml_set_name(c, "c");
+        // computed inputs, as in a model graph; a chain of them, as a backend may fuse only in graphs of more than a
+        // few nodes
+        ggml_tensor * x = a;
+        for (int i = 0; i < 40; ++i) {
+            x = ggml_add(ctx, x, b);
+        }
+        ggml_tensor * out = ggml_mul(ctx, x, ggml_sigmoid(ctx, ggml_add(ctx, g, c)));
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            init_tensor_uniform(t, -4.0f, 4.0f);
+        }
+    }
+};
+
 // GGML_OP_RMS_NORM + GGML_OP_SCALE, which a backend may fuse
 struct test_rms_norm_scale : public test_case {
     const std::array<int64_t, 4> ne;
@@ -8573,6 +8619,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_rms_norm(GGML_TYPE_F32, {64, 5, 4, 3}, false, 1e-6f, true));
 
     test_cases.emplace_back(new test_scale_silu({ 320, 1, 1, 1 }, 0.25f, 0.0f));
+    test_cases.emplace_back(new test_sigmoid_mul({ 2560, 1, 1, 1 }, { 1, 1, 1, 1 }));
+    test_cases.emplace_back(new test_sigmoid_mul({ 128, 48, 1, 1 }, { 128, 48, 1, 1 }));
+    test_cases.emplace_back(new test_sigmoid_mul({ 6144, 3, 1, 1 }, { 6144, 3, 1, 1 }));
+    test_cases.emplace_back(new test_sigmoid_mul({ 1000, 7, 3, 2 }, { 1, 7, 1, 2 }));
     test_cases.emplace_back(new test_rms_norm_scale({ 128, 16, 1, 1 }, 0.0883883f, 0.0f));
     test_cases.emplace_back(new test_rms_norm_scale({ 1000, 7, 3, 2 }, -1.5f, 0.0f));
     test_cases.emplace_back(new test_rms_norm_scale({ 64, 5, 4, 3 }, 2.0f, 0.5f)); // a bias: not fused

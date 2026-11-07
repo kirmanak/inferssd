@@ -20,7 +20,12 @@ void main() {
         uint i00, i01, i02, i03;
         get_indices(idx, i00, i01, i02, i03);
 
-        data_d[get_doffset() + dst_idx(i00, i01, i02, i03)] = D_TYPE(FLOAT_TYPE(data_a[get_aoffset() + src0_idx(i00, i01, i02, i03)]) * FLOAT_TYPE(data_b[get_boffset() + src1_idx(i00, i01, i02, i03)]));
+        FLOAT_TYPE b = FLOAT_TYPE(data_b[get_boffset() + src1_idx(i00, i01, i02, i03)]);
+        // param3 set: b is the source of a fused SIGMOID, computed as sigmoid.comp does
+        if (p.param3 != 0) {
+            b = FLOAT_TYPE(1. / (1 + exp(-1. * float(b))));
+        }
+        data_d[get_doffset() + dst_idx(i00, i01, i02, i03)] = D_TYPE(FLOAT_TYPE(data_a[get_aoffset() + src0_idx(i00, i01, i02, i03)]) * b);
 
         idx += num_threads;
     }
