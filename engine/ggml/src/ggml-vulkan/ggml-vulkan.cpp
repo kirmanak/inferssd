@@ -859,6 +859,7 @@ struct vk_device_struct {
     vk_pipeline pipeline_ssm_scan_f32_d256;
     vk_pipeline pipeline_ssm_conv_f32;
     vk_pipeline pipeline_add_softplus_mul_f32;
+    vk_pipeline pipeline_sigmoid_mul_add_f32;
     vk_pipeline pipeline_opt_step_adamw_f32;
     vk_pipeline pipeline_opt_step_sgd_f32;
     std::map<vk_conv2d_pipeline_state, vk_pipeline> pipeline_conv2d_f32[CONV_SHAPE_COUNT];
@@ -1566,6 +1567,12 @@ struct vk_op_ssm_conv_push_constants {
     uint32_t apply_silu;
     uint32_t offs0, offs1, offs_d;
     uint32_t state_mode, state_row, offs_ids, offs_x, sx1, offs_out;
+};
+
+// SIGMOID + MUL + ADD; see sigmoid_mul_add.comp
+struct vk_op_sigmoid_mul_add_push_constants {
+    uint32_t ne, g_one;
+    uint32_t offs_a, offs_g, offs_c, offs_d;
 };
 
 // ADD + SOFTPLUS + MUL; see add_softplus_mul.comp
@@ -4898,6 +4905,7 @@ static void ggml_vk_load_shaders(vk_device& device) {
 
     ggml_vk_create_pipeline(device, device->pipeline_ssm_conv_f32, "ssm_conv_f32", ssm_conv_f32_len, ssm_conv_f32_data, "main", 6, sizeof(vk_op_ssm_conv_push_constants), {32, 16, 1}, {32, 16}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_add_softplus_mul_f32, "add_softplus_mul_f32", add_softplus_mul_f32_len, add_softplus_mul_f32_data, "main", 4, sizeof(vk_op_add_softplus_mul_push_constants), {256, 1, 1}, {}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_sigmoid_mul_add_f32, "sigmoid_mul_add_f32", sigmoid_mul_add_f32_len, sigmoid_mul_add_f32_data, "main", 4, sizeof(vk_op_sigmoid_mul_add_push_constants), {256, 1, 1}, {}, 1);
 
     ggml_vk_create_pipeline(device, device->pipeline_opt_step_adamw_f32, "opt_step_adamw_f32", opt_step_adamw_f32_len, opt_step_adamw_f32_data, "main", 5, sizeof(vk_op_push_constants), {512, 1, 1}, {}, 1);
 
@@ -11008,6 +11016,34 @@ static void ggml_vk_ssm_conv(ggml_backend_vk_context * ctx, vk_context& subctx, 
                               { pc.nr, pc.n_t, pc.n_s });
 }
 
+// SIGMOID, MUL and ADD, the ADD the last of the fused nodes; see sigmoid_mul_add.comp
+static void ggml_vk_sigmoid_mul_add(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_cgraph * cgraph, int node_idx) {
+    const ggml_tensor * sig = cgraph->nodes[node_idx];
+    const ggml_tensor * mul = cgraph->nodes[node_idx + 1];
+    const ggml_tensor * add = cgraph->nodes[node_idx + 2];
+    const ggml_tensor * a = mul->src[0];
+    const ggml_tensor * g = sig->src[0];
+    const ggml_tensor * c = add->src[0] == mul ? add->src[1] : add->src[0];
+
+    vk_pipeline pipeline = ctx->device->pipeline_sigmoid_mul_add_f32;
+    ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
+
+    const auto sub = [&](const ggml_tensor * t, uint32_t & offs) {
+        const vk_subbuffer buf = ggml_vk_tensor_subbuffer(ctx, t, true);
+        offs = (uint32_t)((buf.size - ggml_nbytes(t)) / sizeof(float));
+        return buf;
+    };
+    vk_op_sigmoid_mul_add_push_constants pc {};
+    const vk_subbuffer a_buf = sub(a, pc.offs_a);
+    const vk_subbuffer g_buf = sub(g, pc.offs_g);
+    const vk_subbuffer c_buf = sub(c, pc.offs_c);
+    const vk_subbuffer d_buf = sub(add, pc.offs_d);
+    pc.ne = (uint32_t)ggml_nelements(add);
+    pc.g_one = ggml_nelements(g) == 1 ? 1u : 0u;
+
+    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { a_buf, g_buf, c_buf, d_buf }, pc, { pc.ne, 1, 1 });
+}
+
 // ADD, SOFTPLUS and MUL as the last of the fused nodes; see add_softplus_mul.comp
 static void ggml_vk_add_softplus_mul(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_cgraph * cgraph, int node_idx) {
     const ggml_tensor * add = cgraph->nodes[node_idx];
@@ -13744,6 +13780,10 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
             ggml_vk_topk_moe(ctx, compute_ctx, cgraph, node_idx);
             break;
         }
+        if (ctx->num_additional_fused_ops == 2 && ggml_get_unary_op(node) == GGML_UNARY_OP_SIGMOID) {
+            ggml_vk_sigmoid_mul_add(ctx, compute_ctx, cgraph, node_idx);
+            break;
+        }
         if (ctx->num_additional_fused_ops == 1 && ggml_get_unary_op(node) == GGML_UNARY_OP_SIGMOID) {
             // SIGMOID_MUL: the MUL after it reads the sigmoid's source
             ggml_tensor * mul = cgraph->nodes[node_idx + 1];
@@ -16130,6 +16170,35 @@ static bool ggml_vk_can_fuse_add_softplus_mul(const struct ggml_cgraph * cgraph,
            sp->type == GGML_TYPE_F32 && mul->type == GGML_TYPE_F32 && ggml_is_contiguous(mul);
 }
 
+// SIGMOID, the MUL that takes it as its second source, and an ADD of that product, all contiguous f32 of one shape
+// but the sigmoid, which may be one value: the shared expert's gated output added to the routed experts'.
+static bool ggml_vk_can_fuse_sigmoid_mul_add(const struct ggml_cgraph * cgraph, int node_idx) {
+    if (node_idx + 2 >= cgraph->n_nodes) {
+        return false;
+    }
+    const ggml_tensor * sig = cgraph->nodes[node_idx];
+    const ggml_tensor * mul = cgraph->nodes[node_idx + 1];
+    const ggml_tensor * add = cgraph->nodes[node_idx + 2];
+    if (sig->op != GGML_OP_UNARY || mul->op != GGML_OP_MUL || add->op != GGML_OP_ADD ||
+            ggml_get_unary_op(sig) != GGML_UNARY_OP_SIGMOID ||
+            !(sig->flags & GGML_TENSOR_FLAG_COMPUTE) || !(mul->flags & GGML_TENSOR_FLAG_COMPUTE) ||
+            !(add->flags & GGML_TENSOR_FLAG_COMPUTE) ||
+            !ggml_node_has_n_uses(cgraph, node_idx, 1) || !ggml_node_has_n_uses(cgraph, node_idx + 1, 1) ||
+            (sig->flags & GGML_TENSOR_FLAG_OUTPUT) || (mul->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+        return false;
+    }
+    if (mul->src[1] != sig || mul->src[0] == sig || (add->src[0] == mul) == (add->src[1] == mul)) {
+        return false;
+    }
+    const ggml_tensor * a = mul->src[0];
+    const ggml_tensor * g = sig->src[0];
+    const ggml_tensor * c = add->src[0] == mul ? add->src[1] : add->src[0];
+    const auto f32 = [](const ggml_tensor * t) { return t->type == GGML_TYPE_F32 && ggml_is_contiguous(t); };
+    return f32(a) && f32(g) && f32(c) && f32(sig) && f32(mul) && f32(add) &&
+           ggml_are_same_shape(a, mul) && ggml_are_same_shape(c, add) && ggml_are_same_shape(mul, add) &&
+           (ggml_nelements(g) == 1 || ggml_are_same_shape(g, mul));
+}
+
 // A SIGMOID whose only use is the second source of the MUL after it: the MUL shader applies it. Unlike
 // ggml_can_fuse this lets the MUL broadcast the sigmoid, as the binary shader does with its second source.
 static bool ggml_vk_can_fuse_sigmoid_mul(const struct ggml_cgraph * cgraph, int node_idx) {
@@ -16706,6 +16775,13 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 op_srcs_fused_elementwise[0] = false;
                 op_srcs_fused_elementwise[1] = true;
                 op_srcs_fused_elementwise[2] = false;
+            } else if (ggml_vk_can_fuse_sigmoid_mul_add(cgraph, i)) {
+                ctx->num_additional_fused_ops = 2;
+                fusion_string = "SIGMOID_MUL_ADD";
+                // a broadcast sigmoid source is read by every element
+                op_srcs_fused_elementwise[0] = ggml_are_same_shape(cgraph->nodes[i], cgraph->nodes[i + 1]);
+                op_srcs_fused_elementwise[1] = true;
+                op_srcs_fused_elementwise[2] = true;
             } else if (ggml_vk_can_fuse_sigmoid_mul(cgraph, i)) {
                 ctx->num_additional_fused_ops = 1;
                 fusion_string = "SIGMOID_MUL";
@@ -17425,6 +17501,9 @@ static void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * 
                       ggml_get_unary_op(graph->nodes[j]) == GGML_UNARY_OP_SILU && graph->nodes[j]->src[0] == graph->nodes[c]) &&
                     !(j == c+1 && c == current_set.back() && graph->nodes[c]->op == GGML_OP_UNARY && graph->nodes[j]->op == GGML_OP_MUL &&
                       ggml_get_unary_op(graph->nodes[c]) == GGML_UNARY_OP_SIGMOID && graph->nodes[j]->src[1] == graph->nodes[c]) &&
+                    !(j == c+1 && c == current_set.back() && graph->nodes[c]->op == GGML_OP_MUL && graph->nodes[j]->op == GGML_OP_ADD &&
+                      graph->nodes[c]->src[1]->op == GGML_OP_UNARY && ggml_get_unary_op(graph->nodes[c]->src[1]) == GGML_UNARY_OP_SIGMOID &&
+                      (graph->nodes[j]->src[0] == graph->nodes[c] || graph->nodes[j]->src[1] == graph->nodes[c])) &&
                     !(j == c+1 && c == current_set.back() && graph->nodes[c]->op == GGML_OP_SSM_CONV && graph->nodes[j]->op == GGML_OP_UNARY &&
                       ggml_get_unary_op(graph->nodes[j]) == GGML_UNARY_OP_SILU && graph->nodes[j]->src[0] == graph->nodes[c]) &&
                     !(j == c+1 && c == current_set.back() && graph->nodes[c]->op == GGML_OP_ADD && graph->nodes[j]->op == GGML_OP_UNARY &&

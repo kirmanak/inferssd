@@ -3679,6 +3679,55 @@ struct test_add_softplus_mul : public test_case {
     }
 };
 
+// GGML_OP_UNARY(SIGMOID) + GGML_OP_MUL taking it + GGML_OP_ADD of the product, which a backend may fuse
+struct test_sigmoid_mul_add : public test_case {
+    const std::array<int64_t, 4> ne_a;
+    const std::array<int64_t, 4> ne_g;
+    const bool product_first;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "SIGMOID_MUL_ADD";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    std::string vars() override {
+        return VARS_TO_STR3(ne_a, ne_g, product_first);
+    }
+
+    test_sigmoid_mul_add(std::array<int64_t, 4> ne_a = {2560, 1, 1, 1}, std::array<int64_t, 4> ne_g = {1, 1, 1, 1},
+            bool product_first = false)
+        : ne_a(ne_a), ne_g(ne_g), product_first(product_first) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * a = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne_a.data());
+        ggml_tensor * b = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne_a.data());
+        ggml_tensor * c = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne_a.data());
+        ggml_tensor * g = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne_g.data());
+        ggml_tensor * h = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne_g.data());
+        ggml_set_name(a, "a");
+        ggml_set_name(c, "c");
+        ggml_set_name(g, "g");
+        // computed inputs and a chain of nodes, as a backend may fuse only in graphs of more than a few nodes
+        ggml_tensor * x = a;
+        for (int i = 0; i < 40; ++i) {
+            x = ggml_add(ctx, x, b);
+        }
+        x = ggml_neg(ctx, x);
+        ggml_tensor * gated = ggml_mul(ctx, x, ggml_sigmoid(ctx, ggml_add(ctx, g, h)));
+        ggml_tensor * out = product_first ? ggml_add(ctx, gated, c) : ggml_add(ctx, c, gated);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            init_tensor_uniform(t, -1.0f, 1.0f);
+        }
+    }
+};
+
 // GGML_OP_RMS_NORM + GGML_OP_SCALE, which a backend may fuse
 struct test_rms_norm_scale : public test_case {
     const std::array<int64_t, 4> ne;
@@ -8845,6 +8894,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_sigmoid_mul({ 128, 48, 1, 1 }, { 128, 48, 1, 1 }));
     test_cases.emplace_back(new test_sigmoid_mul({ 6144, 3, 1, 1 }, { 6144, 3, 1, 1 }));
     test_cases.emplace_back(new test_sigmoid_mul({ 1000, 7, 3, 2 }, { 1, 7, 1, 2 }));
+    test_cases.emplace_back(new test_sigmoid_mul_add({ 2560, 1, 1, 1 }, { 1, 1, 1, 1 }, false));
+    test_cases.emplace_back(new test_sigmoid_mul_add({ 2560, 1, 1, 1 }, { 1, 1, 1, 1 }, true));
+    test_cases.emplace_back(new test_sigmoid_mul_add({ 1000, 7, 3, 1 }, { 1000, 7, 3, 1 }, false));
     test_cases.emplace_back(new test_ssm_conv_silu({ 4, 8192, 1, 1 }, { 4, 8192, 1, 1 }));
     test_cases.emplace_back(new test_ssm_conv_silu({ 3 + 7, 8192, 2, 1 }, { 4, 8192, 1, 1 }));
     test_cases.emplace_back(new test_add_softplus_mul({ 48, 1, 1, 1 }));
