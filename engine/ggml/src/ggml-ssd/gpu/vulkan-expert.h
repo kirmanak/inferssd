@@ -60,7 +60,8 @@ struct ggml_vk_expert_api_v1 {
     // Copy these host weights with the existing per-tensor set, on a background
     // thread. Returns before the copies finish. The next mul_mat_batch joins and
     // skips the upload for a matching weight pointer. Null if this build has no
-    // ahead path. count 0 only joins an earlier call.
+    // ahead path. count 0 only joins an earlier call. A negative count joins and
+    // forgets the shown copy, for when its host bytes change or are unmapped.
     bool (*ahead)(void * session, const struct ggml_vk_expert_ahead * items, int count);
     // Activations already on this device. Gathers rows, runs up/gate/SwiGLU/down,
     // scale-adds into the token output, and writes only that reduced buffer.

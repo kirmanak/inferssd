@@ -1038,6 +1038,29 @@ struct expert_cache {
         for (const auto & l : layers) { id = std::max(id, l.id); }
         return id;
     }
+    // Which slot holds which expert from which file range, for a layer's valid
+    // entries. Equal values mean an address-keyed copy of the layer still holds
+    // the same bytes.
+    uint64_t layer_signature(int32_t layer_id) const {
+        const auto found = std::find_if(layers.begin(), layers.end(), [&](const layer & l) { return l.id == layer_id; });
+        if (found == layers.end() || !arena) { return 0; }
+        const size_t layer_index = size_t(found - layers.begin());
+        uint64_t hash = 1469598103934665603ull;
+        auto mix = [&](uint64_t value) { hash = (hash ^ value) * 1099511628211ull; };
+        mix(uint64_t(reinterpret_cast<uintptr_t>(arena)));
+        for (size_t i = 0; i < entries.size(); ++i) {
+            const auto & e = entries[i];
+            if (!e.valid || !e.resident || e.layer_index != layer_index) { continue; }
+            mix(i);
+            mix(uint64_t(uint32_t(e.id)));
+            for (int role = 0; role < 3; ++role) {
+                mix(e.source[role].inode);
+                mix(e.source[role].offset);
+                mix(e.source[role].bytes);
+            }
+        }
+        return hash;
+    }
     void protect_layer(int32_t layer_id, bool on) {
         const auto found = std::find_if(layers.begin(), layers.end(), [&](const layer & l) { return l.id == layer_id; });
         if (found == layers.end()) { return; }
@@ -1144,6 +1167,7 @@ struct expert_cache {
         stats.valid_bytes += stride;
         return true;
     }
+    std::vector<std::pair<int32_t, int>> prefill_hit_scratch; // (id, entry) of one layer, reused per call
     void prepare_prefill_read(std::vector<expert_request> & requests,
             const ggml_tensor * up, const ggml_tensor * gate, const ggml_tensor * down,
             kimi_cpu_sink_stats & current) {
@@ -1168,14 +1192,26 @@ struct expert_cache {
         }
         if (bytes[0] > role_bytes[0] || bytes[1] > role_bytes[1] || bytes[2] > role_bytes[2]) { return; }
 
+        // A prefill admission may borrow a free slot from another layer, so the
+        // hit search is the whole arena, not this layer's uniform slice. One pass
+        // collects this layer's entries by id; a per-request scan of the arena
+        // was 0.1-0.4 s of every prompt. Leases do not change these fields.
+        auto & by_id = prefill_hit_scratch;
+        by_id.clear();
+        for (size_t index = 0; index < entries.size(); ++index) {
+            const auto & e = entries[index];
+            if (e.enabled && e.valid && e.resident && e.layer_index == layer_index) {
+                by_id.emplace_back(e.id, int(index));
+            }
+        }
+        std::sort(by_id.begin(), by_id.end());
         for (auto & request : requests) {
             if (request.vram_slot >= 0 || request.cache_hit >= 0) { continue; }
-            // A prefill admission may borrow a free slot from another layer, so the
-        // hit search is the whole arena, not this layer's uniform slice.
-        for (size_t index = 0; index < entries.size(); ++index) {
+            for (auto at = std::lower_bound(by_id.begin(), by_id.end(), std::make_pair(request.id, INT_MIN));
+                    at != by_id.end() && at->first == request.id; ++at) {
+                const size_t index = size_t(at->second);
                 auto & e = entries[index];
-                if (!e.enabled || !e.valid || !e.resident || e.layer_index != layer_index ||
-                        e.id != request.id || !matches(e, request)) { continue; }
+                if (!matches(e, request)) { continue; }
                 acquire_lease(int(index), request);
                 request.cache_hit = int(index);
                 request.cache_lease = true;
@@ -1209,6 +1245,9 @@ struct expert_cache {
         if (found == layers.end() || !found->count) { return 0; }
         const size_t layer_index = size_t(found - layers.begin());
         size_t admitted = 0;
+        // Slots before the last one taken were not free and stay that way during
+        // this call, so each search resumes there instead of rescanning the arena.
+        auto next_free = entries.begin();
         for (auto & request : requests) {
             if (request.cache_hit >= 0 || request.cache_admit >= 0 || request.vram_slot >= 0) { continue; }
             bool fits = true;
@@ -1217,13 +1256,14 @@ struct expert_cache {
             }
             if (!fits) { continue; }
             auto free = entries.end();
-            for (auto candidate = entries.begin(); candidate != entries.end(); ++candidate) {
+            for (auto candidate = next_free; candidate != entries.end(); ++candidate) {
                 if (candidate->enabled && candidate->resident && !candidate->valid && !candidate->reserved &&
                         !candidate->inflight) {
                     free = candidate;
                     break;
                 }
             }
+            next_free = free;
             if (free == entries.end()) {
                 ++stats.admission_skips;
                 continue;

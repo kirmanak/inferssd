@@ -3127,12 +3127,14 @@ private:
                         //  - 4 + n_ubatch
                         //  - 4
                         // ref: https://github.com/ggml-org/llama.cpp/pull/20288
-                        // A second batch re-runs every streamed expert. If the rest of the prompt fits in this
-                        // batch, keep it here. The checkpoint is the one taken after the batch, not a reason
-                        // to split a prompt that already fits.
+                        // A second batch re-runs every streamed expert. A request that does not cache its
+                        // prompt keeps a prompt that fits in this batch together. With caching on, this
+                        // split is the only checkpoint a recurrent memory gets, and without it the next
+                        // turn re-processes the whole prompt.
                         const int room = n_batch - batch.n_tokens;
                         const int remaining = slot.task->n_tokens() - slot.prompt.n_tokens();
-                        if (do_checkpoint && remaining > room) {
+                        const bool keep_together = !slot.task->params.cache_prompt && remaining <= room;
+                        if (do_checkpoint && !keep_together) {
                             static const int checkpoint_offsets[] = {4 + n_ubatch, 4};
 
                             bool should_break = false;

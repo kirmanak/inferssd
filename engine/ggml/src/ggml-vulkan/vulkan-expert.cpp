@@ -457,6 +457,11 @@ bool expert_ahead(void * raw, const ggml_vk_expert_ahead * items, int count) {
     if (!session) { return false; }
     if (!items || count <= 0) {
         session->join_ahead();
+        // The host bytes behind the shown copy changed or are going away.
+        if (count < 0) {
+            session->ahead_at.clear();
+            session->ahead_bytes.clear();
+        }
         return true;
     }
     // The batch is reading the shown slot. Fill the other one during this layer's
@@ -483,6 +488,9 @@ bool expert_ahead(void * raw, const ggml_vk_expert_ahead * items, int count) {
     auto prefault_slot = [&](int index) {
         auto & held = session->ahead_slots[index];
         if (held.buffer && held.cap >= k_ahead_cap) { return true; }
+        // The shown slot is what this layer's batch reads. A small one from the
+        // fallback below stays until it is the fill target.
+        if (held.buffer && held.buffer == session->ahead_buffer) { return false; }
         if (held.buffer) {
             ggml_backend_buffer_free(held.buffer);
             held.buffer = nullptr;
@@ -1464,30 +1472,19 @@ struct decode_cache {
         const char * imp = std::getenv("INFERSSD_DECODE_IMPORT");
         if (imp && imp[0] == '1' && imp[1] == '\0') { import_off = false; }
         session->join_ahead();
-        // These slots are device-local. Some drivers still report them in the
-        // budget query after the free, which left the decode cache 3 GB small.
-        // A driver that updates immediately must not be credited twice.
+        // The ahead slots stay. Freed here, the next prompt allocated their 3 GB
+        // again on a card this cache had filled. Kept, the cache was 1798 slots
+        // and decode 15.33 tok/s (last 128 of 256).
         backend = session->backend;
-        size_t before_free = 0, total = 0;
-        ggml_backend_dev_memory(ggml_backend_get_device(backend), &before_free, &total);
-        size_t returned = 0;
-        for (auto & ahead : session->ahead_slots) {
-            if (ahead.buffer) {
-                returned += ggml_backend_buffer_get_size(ahead.buffer);
-                ggml_backend_buffer_free(ahead.buffer);
-                ahead.buffer = nullptr;
-                ahead.cap = 0;
-            }
-            ahead.at.clear();
-            ahead.bytes.clear();
-        }
-        session->ahead_buffer = nullptr;
-        session->ahead_at.clear();
-        session->ahead_bytes.clear();
         buft = ggml_backend_get_default_buffer_type(backend);
-        size_t free_bytes = 0;
+        size_t free_bytes = 0, total = 0;
         ggml_backend_dev_memory(ggml_backend_get_device(backend), &free_bytes, &total);
-        if (free_bytes < before_free + returned) { free_bytes = before_free + returned; }
+        // A slot no prompt has filled yet is still owed its room.
+        size_t ahead_room = 0;
+        for (const auto & ahead : session->ahead_slots) {
+            if (!ahead.buffer || ahead.cap < k_ahead_cap) { ahead_room += k_ahead_cap - (ahead.buffer ? ahead.cap : 0); }
+        }
+        free_bytes = free_bytes > ahead_room ? free_bytes - ahead_room : 0;
         constexpr size_t reserve = 256ull << 20;
         size_t budget = free_bytes > reserve ? free_bytes - reserve : 0;
         if (budget > (10ull << 30)) { budget = 10ull << 30; }

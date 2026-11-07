@@ -586,6 +586,9 @@ struct kimi_cpu_sink {
     const ggml_tensor * device_input = nullptr;
     bool vulkan_session_failed = false;
     uint64_t vulkan_budget = 0;
+    // Layer 0 as the last prompt's prime copied it. Decode may refill those slots.
+    uint64_t primed_signature = 0;
+    bool primed = false;
     struct {
         bool used = false;
         double us = 0;
@@ -877,7 +880,11 @@ struct kimi_cpu_sink {
             cache.before_release = [](void * p) { static_cast<sink_vram *>(p)->wait_deferred(); };
             cache.before_release_arg = &vram;
         }
-        cache.before_discard = [](void * p, size_t first, size_t count) { static_cast<kimi_cpu_sink *>(p)->host_unlock(first, count); };
+        cache.before_discard = [](void * p, size_t first, size_t count) {
+            auto * sink = static_cast<kimi_cpu_sink *>(p);
+            sink->vulkan_ahead_forget();
+            sink->host_unlock(first, count);
+        };
         cache.before_discard_arg = this;
         vram.ram_slot_locked = [this](int entry) { return entry >= 0 && host_lock.is_locked(size_t(entry)); };
         sink_location_provider_initialize(this);
@@ -1950,6 +1957,11 @@ struct kimi_cpu_sink {
     }
     // sink_cache::before_discard: unlock entries [first, first + count) before their pages go.
     void host_unlock(size_t first, size_t count) { host_lock.unlock(first, count, cache.arena, cache.stride); }
+    // Before those pages go or change hands: the ahead thread may still be copying
+    // them, and the shown device copy is keyed by their address.
+    void vulkan_ahead_forget() {
+        if (vulkan_session && vulkan_api && vulkan_api->ahead) { vulkan_api->ahead(vulkan_session, nullptr, -1); }
+    }
     void host_lock_stop() {
         host_lock.stop();
         if (cache.arena) { host_unlock(0, host_lock.snapshot().size()); }
@@ -3270,7 +3282,10 @@ bool kimi_cpu_sink_stream_hybrid(struct kimi_cpu_sink * sink,
         if (sink->vulkan_api && sink->vulkan_api->ahead && sink->vulkan_session) {
             sink->vulkan_api->ahead(sink->vulkan_session, nullptr, 0);
         }
-        // The copy has its own bytes. Do not keep layer 0 pinned for decode.
+        // The copy has its own bytes. Do not keep layer 0 pinned for decode, but
+        // remember which experts it holds: the next prompt reads it by address.
+        sink->primed_signature = sink->cache.layer_signature(0);
+        sink->primed = true;
         sink->cache.protect_layer(0, false);
     };
     if (sink->vulkan_api && sink->vulkan_api->ahead && sink->vulkan_session) {
@@ -3279,6 +3294,13 @@ bool kimi_cpu_sink_stream_hybrid(struct kimi_cpu_sink * sink,
             int layer = -1, consumed = 0;
             if (std::sscanf(up->name, "blk.%d.ffn_up_exps.weight%n", &layer, &consumed) == 1 &&
                     consumed && !up->name[consumed]) {
+                if (layer == 0 && sink->primed) {
+                    sink->primed = false;
+                    if (sink->cache.layer_signature(0) != sink->primed_signature) {
+                        sink->vulkan_ahead_forget();
+                        std::fprintf(stderr, "[kimi_vk_prime] stale layer0 dropped\n");
+                    }
+                }
                 bool filled_next = false;
                 if (batch && batch->ntokens > 32) {
                     sink->cache.protect_layer(layer + 1, true);
