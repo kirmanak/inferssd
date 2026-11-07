@@ -836,6 +836,8 @@ struct kimi_cpu_sink {
     std::vector<ggml_vk_decode_expert> decode_experts;
     bool decode_prepared = false;
     bool decode_launch_pending = false;
+    // The next unclaimed row of the resident up/gate phase, see resident_up_rows.
+    std::atomic<int> up_rows_next{0};
     bool decode_launch_failed = false;
     const uint8_t * down_quant_data = nullptr;
     size_t quant_hidden_stride = 0;
@@ -2038,9 +2040,6 @@ struct kimi_cpu_sink {
     static void resident_up_rows(void * userdata, int ith, int nth) {
         auto & sink = *static_cast<kimi_cpu_sink *>(userdata);
         const int rows = sink.hidden;
-        const int begin = rows * ith / nth;
-        const int end = rows * (ith + 1) / nth;
-        if (begin >= end) { return; }
         const int n = int(sink.requests.size());
         const size_t stride = sink.row_bytes_up;
         const void * input = sink.quant_input.data();
@@ -2053,21 +2052,28 @@ struct kimi_cpu_sink {
                 sink.decode_launch_failed = true;
             }
         }
-        for (int expert = 0; expert < n; ++expert) {
-            if (expert < int(sink.gpu_hit.size()) && sink.gpu_hit[size_t(expert)]) { continue; }
-            const char * up = sink.resident_up[size_t(expert)];
-            const char * gate = sink.resident_gate[size_t(expert)];
-            float * u = sink.resident_up_act.data() + size_t(expert) * size_t(rows);
-            float * g = sink.resident_gate_act.data() + size_t(expert) * size_t(rows);
-            // One matrix, then the other. Alternating rows jumped between two
-            // distant buffers and cut the stream the dot kernel was already reading.
-            for (int row = begin; row < end; ++row) {
-                if (row + 4 < end) { __builtin_prefetch(up + size_t(row + 4) * stride, 0, 1); }
-                sink.dot_up(k, &u[row], 0, up + size_t(row) * stride, 0, input, 0, 1);
-            }
-            for (int row = begin; row < end; ++row) {
-                if (row + 4 < end) { __builtin_prefetch(gate + size_t(row + 4) * stride, 0, 1); }
-                sink.dot_up(k, &g[row], 0, gate + size_t(row) * stride, 0, input, 0, 1);
+        // Rows are claimed in chunks, so the threads that do not record take thread 0's share while it records.
+        const int chunk = std::max(8, rows / (8 * std::max(nth, 1)));
+        for (;;) {
+            const int begin = sink.up_rows_next.fetch_add(chunk, std::memory_order_relaxed);
+            if (begin >= rows) { break; }
+            const int end = std::min(rows, begin + chunk);
+            for (int expert = 0; expert < n; ++expert) {
+                if (expert < int(sink.gpu_hit.size()) && sink.gpu_hit[size_t(expert)]) { continue; }
+                const char * up = sink.resident_up[size_t(expert)];
+                const char * gate = sink.resident_gate[size_t(expert)];
+                float * u = sink.resident_up_act.data() + size_t(expert) * size_t(rows);
+                float * g = sink.resident_gate_act.data() + size_t(expert) * size_t(rows);
+                // One matrix, then the other. Alternating rows jumped between two
+                // distant buffers and cut the stream the dot kernel was already reading.
+                for (int row = begin; row < end; ++row) {
+                    if (row + 4 < end) { __builtin_prefetch(up + size_t(row + 4) * stride, 0, 1); }
+                    sink.dot_up(k, &u[row], 0, up + size_t(row) * stride, 0, input, 0, 1);
+                }
+                for (int row = begin; row < end; ++row) {
+                    if (row + 4 < end) { __builtin_prefetch(gate + size_t(row + 4) * stride, 0, 1); }
+                    sink.dot_up(k, &g[row], 0, gate + size_t(row) * stride, 0, input, 0, 1);
+                }
             }
         }
     }
@@ -2148,6 +2154,7 @@ struct kimi_cpu_sink {
         decode_launch_failed = false;
         auto cpu_layer = [&] {
             const auto up_start = sink_clock::now();
+            up_rows_next.store(0, std::memory_order_relaxed);
             parallel_phase(resident_up_rows, this, false);
             current.up_gate_us += elapsed_us(up_start);
             const auto quant_start = sink_clock::now();
