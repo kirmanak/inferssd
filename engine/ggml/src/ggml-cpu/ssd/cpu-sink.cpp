@@ -838,6 +838,7 @@ struct kimi_cpu_sink {
     bool decode_launch_pending = false;
     // The next unclaimed row of the resident up/gate phase, see resident_up_rows.
     std::atomic<int> up_rows_next{0};
+    std::atomic<int> down_rows_next{0};
     bool decode_launch_failed = false;
     const uint8_t * down_quant_data = nullptr;
     size_t quant_hidden_stride = 0;
@@ -2080,13 +2081,16 @@ struct kimi_cpu_sink {
 
     static void resident_down_rows(void * userdata, int ith, int nth) {
         auto & sink = *static_cast<kimi_cpu_sink *>(userdata);
+        GGML_UNUSED(ith);
         const int rows = sink.latent;
-        const int begin = rows * ith / nth;
-        const int end = rows * (ith + 1) / nth;
-        if (begin >= end) { return; }
         const int n = int(sink.requests.size());
         const size_t stride = sink.row_bytes_down;
         const int k = sink.hidden;
+        const int chunk = std::max(8, rows / (8 * std::max(nth, 1)));
+        for (;;) {
+        const int begin = sink.down_rows_next.fetch_add(chunk, std::memory_order_relaxed);
+        if (begin >= rows) { break; }
+        const int end = std::min(rows, begin + chunk);
         for (int expert = 0; expert < n; ++expert) {
             if (expert < int(sink.gpu_hit.size()) && sink.gpu_hit[size_t(expert)]) { continue; }
             const char * down = sink.resident_down[size_t(expert)];
@@ -2101,6 +2105,7 @@ struct kimi_cpu_sink {
                 volatile float scaled = value * weight;
                 destination[row] = scaled;
             }
+        }
         }
     }
 
@@ -2167,6 +2172,7 @@ struct kimi_cpu_sink {
             }
             current.hidden_quantize_us += elapsed_us(quant_start);
             const auto down_start = sink_clock::now();
+            down_rows_next.store(0, std::memory_order_relaxed);
             parallel_phase(resident_down_rows, this, true);
             current.down_reduce_us += elapsed_us(down_start);
         };
