@@ -94,6 +94,9 @@ struct expert_session {
     int64_t n = 0;
     int n_tokens = 0;
     decode_cache * decode = nullptr;
+    // The prompt entry points. A prefill worker batches deferred misses while
+    // the stream thread may still run a per-expert matmul or drop the ahead copy.
+    std::mutex api_mutex;
 
     explicit expert_session(ggml_backend_t device) : backend(device) {}
 
@@ -262,6 +265,7 @@ bool expert_mul_mat(void * raw, int32_t type, int64_t k, int64_t n, int n_tokens
         set_error(error, error_size, "vulkan expert matmul is missing buffers");
         return false;
     }
+    std::lock_guard<std::mutex> lock(session->api_mutex);
     if (!expert_supports(type)) {
         set_error(error, error_size, "vulkan expert type has no existing matmul pipeline");
         return false;
@@ -438,6 +442,8 @@ bool expert_batch_chunk(expert_session * session, const ggml_vk_expert_matmul * 
 bool expert_mul_mat_batch(void * raw, const ggml_vk_expert_matmul * items, int count,
         char * error, size_t error_size) {
     auto * session = static_cast<expert_session *>(raw);
+    std::unique_lock<std::mutex> lock;
+    if (session) { lock = std::unique_lock<std::mutex>(session->api_mutex); }
     // The sink already published the finished slot. Joining here would wait for
     // the next layer's fill and then show that slot to this batch.
     if (session) { session->ahead_used = 0; }
@@ -477,6 +483,7 @@ constexpr uint64_t k_ahead_cap = 1536ull << 20;
 bool expert_ahead(void * raw, const ggml_vk_expert_ahead * items, int count) {
     auto * session = static_cast<expert_session *>(raw);
     if (!session) { return false; }
+    std::lock_guard<std::mutex> lock(session->api_mutex);
     // Once per prompt layer, after the scheduler has reserved this phase's graph.
     note_free(session);
     if (!items || count <= 0) {
@@ -797,6 +804,7 @@ bool expert_device_layer(void * raw, const ggml_tensor * activation, int32_t up_
         set_error(error, error_size, "vulkan device layer is missing buffers");
         return false;
     }
+    std::lock_guard<std::mutex> lock(session->api_mutex);
     if (!ggml_vk_tensor_on_device(activation) || activation->ne[0] != latent || activation->ne[1] < ntokens) {
         set_error(error, error_size, "vulkan device layer activation is not a device tensor");
         return false;

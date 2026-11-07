@@ -3655,6 +3655,29 @@ bool kimi_cpu_sink_stream_hybrid(struct kimi_cpu_sink * sink,
             }
             (void) any_miss;
         }
+        // Device-bound misses whose bytes sit in a reserved, unpublished cache
+        // slot. Nothing else writes or evicts that slot before it is admitted.
+        std::vector<size_t> deferred;
+        bool io_failed = false;
+        bool offer_defer = false;
+        if (batch->defer_vulkan && batch->flush_vulkan) {
+            size_t candidates = 0;
+            for (const auto & request : sink->requests) {
+                candidates += request.cache_admit >= 0 && request.cache_hit < 0 && request.vram_slot < 0 &&
+                    !request.vram_transient;
+            }
+            offer_defer = candidates >= batch->defer_min;
+        }
+        auto payload = [&](size_t expert, int role) {
+            const auto & request = sink->requests[expert];
+            return static_cast<const void *>(static_cast<const char *>(request.read_target[role]) +
+                    request.role[role].data_offset);
+        };
+        // The device worker reads those slots. Join it before an error unwinds.
+        struct flush_guard {
+            kimi_cpu_sink_prefill_batch * batch; void * userdata; bool armed = false;
+            ~flush_guard() { if (armed) { batch->flush_vulkan(userdata); } }
+        } joiner{ batch, userdata };
         for (size_t expert = 0; expert < sink->requests.size() && !resident_done; ++expert) {
             auto & request = sink->requests[expert];
             if (request.vram_slot >= 0 || request.vram_transient) { continue; }
@@ -3669,8 +3692,19 @@ bool kimi_cpu_sink_stream_hybrid(struct kimi_cpu_sink * sink,
                             !sink->io_error.empty();
                     });
                     sink->current.wait_io_us += elapsed_us(wait_start);
-                    if (!sink->io_error.empty()) { break; }
+                    if (!sink->io_error.empty()) { io_failed = true; break; }
                 }
+            }
+            if (slot && offer_defer && request.cache_admit >= 0 &&
+                    batch->defer_vulkan(userdata, expert, payload(expert, 0), payload(expert, 1), payload(expert, 2))) {
+                joiner.armed = true;
+                deferred.push_back(expert);
+                {
+                    std::lock_guard<std::mutex> lock(sink->io_mutex);
+                    slot->state = sink_slot::empty;
+                }
+                sink->io_cv.notify_all();
+                continue;
             }
             const auto compute_start = sink_clock::now();
             const double cpu_start = sink->profile_enabled ? sink_thread_cpu_us() : 0.0;
@@ -3704,6 +3738,20 @@ bool kimi_cpu_sink_stream_hybrid(struct kimi_cpu_sink * sink,
             // Every waiter: with streamed GPU transients the tier's worker waits on io_cv for its read beside the
             // I/O thread waiting for this ring slot, and a single wakeup that reached the worker left both asleep.
             if (slot) { sink->io_cv.notify_all(); }
+        }
+        if (joiner.armed) {
+            const auto compute_start = sink_clock::now();
+            joiner.armed = false;
+            const bool flushed = batch->flush_vulkan(userdata);
+            if (!io_failed) {
+                if (!flushed) {
+                    for (size_t expert : deferred) {
+                        consumer(userdata, expert, payload(expert, 0), payload(expert, 1), payload(expert, 2));
+                    }
+                }
+                for (size_t expert : deferred) { sink->cache.admit(sink->requests[expert], sink->current); }
+            }
+            sink->current.compute_us += elapsed_us(compute_start);
         }
         {
             const auto wait_start = sink_clock::now();

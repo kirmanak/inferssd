@@ -14114,6 +14114,15 @@ extern "C" bool ggml_vk_write_ranges(ggml_backend_buffer_t dst, const void ** sr
     }
     if (total == 0) { return true; }
     std::lock_guard<std::recursive_mutex> guard(device->mutex);
+    // A mapped (ReBAR) destination takes the bytes directly: about 24 GB/s, where
+    // the staging memcpy ran at 9.5 GB/s before a 25 GB/s transfer. Callers hold
+    // no GPU work on dst, as for the staged copy.
+    if (dst_buf->ptr && (dst_buf->memory_property_flags & vk::MemoryPropertyFlagBits::eHostCoherent)) {
+        for (int i = 0; i < n; ++i) {
+            std::memcpy(static_cast<char *>(dst_buf->ptr) + dst_offsets[i], srcs[i], sizes[i]);
+        }
+        return true;
+    }
     try {
         ggml_vk_ensure_sync_staging_buffer(device, total);
     } catch (const vk::SystemError & e) {

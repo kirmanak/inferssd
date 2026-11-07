@@ -9,12 +9,14 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <condition_variable>
 #include <cstring>
 #include <exception>
 #include <limits>
 #include <mutex>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace {
@@ -112,7 +114,7 @@ struct kimi_cpu_prefill {
     bool device_reduced = false;
     // activation_up: SWIGLU's u beside g in activation until the chunk is gated
     std::vector<float> activation, activation_up, routed_output, post_exp_output;
-    std::vector<float> batch_inputs, batch_up, batch_gate, batch_down;
+    std::vector<float> batch_inputs, batch_up, batch_gate, batch_down, device_sum;
     std::vector<uint8_t> quant_input, quant_hidden;
     ggml_vec_dot_t dot_up = nullptr, dot_down = nullptr;
     ggml_from_float_t quantize_input = nullptr, quantize_hidden = nullptr;
@@ -150,12 +152,82 @@ struct kimi_cpu_prefill {
     size_t vulkan_up_bytes = 0;
     size_t vulkan_down_bytes = 0;
     std::vector<uint8_t> vulkan_group;
+    bool vulkan_defer = false; // misses in reserved cache slots may go to the device worker
     std::vector<float> vulkan_input, vulkan_up, vulkan_gate, vulkan_down;
     bool vulkan_error_logged = false;
+
+    // Deferred device misses. The worker takes them in chunks while the stream
+    // thread keeps the CPU on the rest; flush_vulkan joins it.
+    struct deferred_expert { size_t expert; const void * up, * gate, * down; };
+    struct deferred_result { int32_t expert; double us; uint64_t routes; };
+    static constexpr size_t k_defer_chunk = 32;
+    static constexpr size_t k_defer_take = 128;
+    std::mutex defer_mutex;
+    std::condition_variable defer_cv;
+    std::vector<deferred_expert> defer_queue;
+    std::vector<deferred_result> defer_results;
+    std::thread defer_thread;
+    bool defer_closing = false;
+    bool defer_failed = false;
 
     explicit kimi_cpu_prefill(kimi_cpu_sink * shared_sink) : sink(shared_sink) {
         group_trace = kimi_cpu_sink_debug(sink).trace;
         if (!sink) { throw std::runtime_error("CPU prefill needs a sink"); }
+    }
+
+    ~kimi_cpu_prefill() { defer_join(); }
+
+    void defer_worker() {
+        std::vector<deferred_expert> taken;
+        std::vector<const void *> ups, gates, downs;
+        for (;;) {
+            {
+                std::unique_lock<std::mutex> lock(defer_mutex);
+                defer_cv.wait(lock, [&] { return defer_closing || defer_queue.size() >= k_defer_chunk; });
+                if (defer_queue.empty()) { return; }
+                taken.clear();
+                // A take stays well under the 1.5 GiB batch buffer.
+                const size_t count = std::min(defer_queue.size(), k_defer_take);
+                taken.assign(defer_queue.begin(), defer_queue.begin() + ptrdiff_t(count));
+                defer_queue.erase(defer_queue.begin(), defer_queue.begin() + ptrdiff_t(count));
+                if (defer_failed) { continue; }
+            }
+            bool ok = false;
+            try {
+                ups.assign(groups.size(), nullptr);
+                gates.assign(groups.size(), nullptr);
+                downs.assign(groups.size(), nullptr);
+                for (const auto & item : taken) {
+                    ups[item.expert] = item.up;
+                    gates[item.expert] = item.gate;
+                    downs[item.expert] = item.down;
+                }
+                ok = run_resident(ups.data(), gates.data(), downs.data(), int(groups.size()), true);
+            } catch (...) {
+                ok = false;
+            }
+            if (!ok) {
+                std::lock_guard<std::mutex> lock(defer_mutex);
+                defer_failed = true;
+            }
+        }
+    }
+
+    // Waits for every taken expert. False if any of them was not computed.
+    bool defer_join() {
+        if (defer_thread.joinable()) {
+            {
+                std::lock_guard<std::mutex> lock(defer_mutex);
+                defer_closing = true;
+            }
+            defer_cv.notify_one();
+            defer_thread.join();
+        }
+        const bool ok = !defer_failed;
+        defer_closing = false;
+        defer_failed = false;
+        defer_queue.clear();
+        return ok;
     }
 
     void prepare(const ggml_tensor * up, const ggml_tensor * gate, const ggml_tensor * down,
@@ -273,6 +345,8 @@ struct kimi_cpu_prefill {
         vulkan_down_bytes = row_bytes_down * size_t(latent);
         vulkan_triplet = uint64_t(up->nb[2]) + uint64_t(gate->nb[2]) + uint64_t(down->nb[2]);
         vulkan_group.assign(groups.size(), 0);
+        vulkan_defer = false;
+        defer_results.clear();
         vulkan_error_logged = false;
         const uint64_t budget = kimi_cpu_sink_vulkan_budget(sink);
         kimi_cpu_sink_vulkan_begin(sink, budget);
@@ -281,6 +355,10 @@ struct kimi_cpu_prefill {
         if (ntokens <= 1 || !swiglu || !api || budget == 0 || vulkan_triplet == 0 || !token_input) { return; }
         if (!api->supports(int32_t(vulkan_up_type)) || !api->supports(int32_t(vulkan_down_type))) { return; }
         if (vulkan_up_bytes == 0 || vulkan_down_bytes == 0) { return; }
+        // A deferred miss goes through the batch buffer, not this budget. On the
+        // cold prompt the device took all of them in 6.4 s; the CPU share at
+        // 256 MiB left it at 7.1 s. Only the device-layer path was measured.
+        vulkan_defer = api->device_layer && ntokens > 32 && !activation_config.post_exp_norm;
         uint64_t remaining = budget;
         for (size_t group = 0; group < groups.size(); ++group) {
             if (vulkan_triplet > remaining) { continue; }
@@ -487,7 +565,52 @@ struct kimi_cpu_prefill {
     // and one down submission replace a synchronized matmul per expert.
     static bool resident_vulkan(void * userdata, const void * const * up, const void * const * gate,
             const void * const * down, int nexperts) {
+        return static_cast<kimi_cpu_prefill *>(userdata)->run_resident(up, gate, down, nexperts, false);
+    }
+
+    // A miss read into a reserved cache slot. The worker sums it on the device
+    // and adds it to what the hits put in output.
+    static bool defer_vulkan(void * userdata, size_t expert, const void * up, const void * gate, const void * down) {
         auto & self = *static_cast<kimi_cpu_prefill *>(userdata);
+        if (!self.vulkan_defer || expert >= self.groups.size() || self.consumed[expert] ||
+                self.device_experts[expert] || !up || !gate || !down ||
+                !kimi_cpu_sink_device_input(self.sink)) { return false; }
+        // Created here, on the stream thread, before the worker asks for it.
+        if (!kimi_cpu_sink_vulkan_session(self.sink)) { return false; }
+        bool wake = false;
+        {
+            std::lock_guard<std::mutex> lock(self.defer_mutex);
+            if (self.defer_failed) { return false; }
+            self.defer_queue.push_back({ expert, up, gate, down });
+            wake = self.defer_queue.size() >= k_defer_chunk;
+        }
+        if (!self.defer_thread.joinable()) { self.defer_thread = std::thread([&self] { self.defer_worker(); }); }
+        if (wake) { self.defer_cv.notify_one(); }
+        return true;
+    }
+
+    static bool flush_vulkan(void * userdata) {
+        auto & self = *static_cast<kimi_cpu_prefill *>(userdata);
+        const bool ok = self.defer_join();
+        for (const auto & result : self.defer_results) {
+            kimi_cpu_sink_vulkan_result(self.sink, 1, result.expert, self.vulkan_triplet, result.us, result.routes);
+        }
+        self.defer_results.clear();
+        return ok;
+    }
+
+    bool run_resident(const void * const * up, const void * const * gate, const void * const * down,
+            int nexperts, bool accumulate) {
+        auto & self = *this;
+        // The worker does not touch the sink's counters; flush_vulkan reports for it.
+        auto report = [&](int32_t expert, double us, uint64_t routes) {
+            if (!accumulate) {
+                kimi_cpu_sink_vulkan_result(sink, 1, expert, vulkan_triplet, us, routes);
+                return;
+            }
+            std::lock_guard<std::mutex> lock(defer_mutex);
+            defer_results.push_back({ expert, us, routes });
+        };
         if (nexperts < 1 || nexperts != int(self.groups.size()) || !up || !gate || !down || !self.token_input) { return false; }
         int live = 0;
         for (int i = 0; i < nexperts; ++i) { live += up[i] && gate[i] && down[i]; }
@@ -537,14 +660,20 @@ struct kimi_cpu_prefill {
                 dev_experts[slot] = { up[i], gate[i], down[i], tokens.data(), ntok[slot] };
             }
             char device_error[256] = {};
+            const size_t out_n = size_t(self.ntokens) * size_t(self.latent);
+            if (accumulate && self.device_sum.size() < out_n) { self.device_sum.resize(out_n); }
+            float * device_out = accumulate ? self.device_sum.data() : self.output;
             if (api->device_layer(session, device_in, int32_t(self.vulkan_up_type), int32_t(self.vulkan_down_type),
                         self.latent, self.hidden, self.vulkan_up_bytes, self.vulkan_down_bytes,
                         dev_experts.data(), int(dev_experts.size()), dev_routes.data(), int(dev_routes.size()),
-                        self.nslots, self.ntokens, self.output, device_error, sizeof(device_error))) {
+                        self.nslots, self.ntokens, device_out, device_error, sizeof(device_error))) {
+                if (accumulate) {
+                    for (size_t at = 0; at < out_n; ++at) { self.output[at] += device_out[at]; }
+                }
                 for (size_t slot = 0; slot < which.size(); ++slot) {
                     self.device_experts[size_t(which[slot])] = 1;
-                    kimi_cpu_sink_vulkan_result(self.sink, 1, self.groups[size_t(which[slot])].expert, self.vulkan_triplet,
-                            slot == 0 ? 1 : 0, slot == 0 ? uint64_t(dev_routes.size()) : 0);
+                    report(self.groups[size_t(which[slot])].expert, slot == 0 ? 1 : 0,
+                            slot == 0 ? uint64_t(dev_routes.size()) : 0);
                 }
                 self.device_reduced = true;
                 std::fprintf(stderr, "[kimi_vulkan_resident] device experts=%zu routes=%zu\n",
@@ -652,8 +781,7 @@ struct kimi_cpu_prefill {
         const double us = elapsed_us(started);
         for (size_t slot = 0; slot < which.size(); ++slot) {
             const int i = which[slot];
-            kimi_cpu_sink_vulkan_result(self.sink, 1, self.groups[size_t(i)].expert, self.vulkan_triplet,
-                    slot == 0 ? us : 0, slot == 0 ? routes : 0);
+            report(self.groups[size_t(i)].expert, slot == 0 ? us : 0, slot == 0 ? routes : 0);
         }
         std::fprintf(stderr, "[kimi_vulkan_resident] experts=%zu routes=%llu bytes=%llu us=%.1f pack_us=%.0f swiglu_us=%.0f scatter_us=%.0f\n",
                 which.size(), (unsigned long long) routes, (unsigned long long) bytes, us, pack_us, swiglu_us, scatter_us);
@@ -849,10 +977,16 @@ extern "C" bool kimi_cpu_prefill_run_activation(
         } else {
             batch.resident_vulkan = kimi_cpu_prefill::resident_vulkan;
         }
+        if (batch.resident_vulkan) {
+            batch.defer_vulkan = kimi_cpu_prefill::defer_vulkan;
+            batch.flush_vulkan = kimi_cpu_prefill::flush_vulkan;
+            batch.defer_min = kimi_cpu_prefill::k_defer_chunk;
+        }
         const bool ok = kimi_cpu_sink_stream_hybrid(prefill->sink, up, gate, down,
                 prefill->expert_ids.empty() ? &empty_id : prefill->expert_ids.data(),
                 static_cast<int>(prefill->expert_ids.size()), &batch, kimi_cpu_prefill::consume, prefill,
                 &stream, error, error_size);
+        prefill->defer_join(); // the stream joins it; this only covers an early return
         prefill->current.gpu_experts = batch.gpu_experts;
         prefill->current.gpu_routes = batch.gpu_routes;
         prefill->current.gpu_transient_experts = batch.gpu_transient_experts;
@@ -896,6 +1030,7 @@ extern "C" bool kimi_cpu_prefill_run_activation(
         if (stats) { *stats = prefill->current; }
         return ok;
     } catch (const std::exception & e) {
+        prefill->defer_join();
         kimi_cpu_sink_cache_reset(prefill->sink);
         prefill->current.stream.total_us = elapsed_us(start);
         if (stats) { *stats = prefill->current; }

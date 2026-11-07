@@ -70,6 +70,17 @@ struct kimi_cpu_sink_prefill_batch {
     // before writing outputs to fall back to the per-expert consumer.
     bool (*resident_vulkan)(void * userdata, const void * const * up, const void * const * gate,
             const void * const * down, int nexperts);
+    // Optional. A miss read into a reserved host-cache slot is offered to
+    // defer_vulkan instead of the consumer. True means the consumer took it for
+    // its device worker, which reads the payload until flush_vulkan returns; the
+    // slot stays unpublished until then. flush_vulkan waits for that worker and
+    // is false if any taken expert is still undone: the stream then runs the
+    // consumer for every one it deferred, and the consumer skips finished ones.
+    bool (*defer_vulkan)(void * userdata, size_t expert, const void * up, const void * gate, const void * down);
+    bool (*flush_vulkan)(void * userdata);
+    // Fewer candidates than this in a layer are not offered: a short batch run
+    // after the last read costs more than computing them as they arrive.
+    size_t defer_min;
 };
 
 void kimi_cpu_sink_parallel(struct kimi_cpu_sink * sink,

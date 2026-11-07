@@ -102,6 +102,14 @@ Supported types are the ones this GGUF uses: Q4_K, Q5_K, Q5_1, and Q8_0.
 Each selected expert is three `ggml_mul_mat` calls, each synchronized.
 SwiGLU stays on the CPU.
 
+A miss read into a free host-cache slot does not take that path when its
+layer has at least 32 such misses and more than 32 tokens. Its bytes stay in
+the slot, so a worker thread batches those experts through the device
+layer path in chunks while the CPU computes the ring reads. The slot is
+published after the worker is done. These misses ignore the budget: they
+use the prompt batch buffer. On the 500-token cold prompt this took 7.8 s
+to 6.4 s.
+
 An explicit `--ssd-vram-budget` is clamped to the memory still free after
 the dense model. `auto` uses that free room minus 128 MiB. Budget `0`
 leaves every expert on the CPU sink and is the baseline in the table.
