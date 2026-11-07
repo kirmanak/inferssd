@@ -1819,12 +1819,15 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         bool (*submit)(ggml_backend_t) = nullptr;
         void (*drop)(ggml_backend_t) = nullptr;
         bool (*early)(ggml_backend_t) = nullptr;
-        bool (*record_late)(ggml_backend_t, ggml_cgraph *, const ggml_tensor * const *, int) = nullptr;
+        bool (*record_late)(ggml_backend_t, ggml_cgraph *, const ggml_tensor * const *, const ggml_tensor * const *, int,
+                bool *) = nullptr;
         bool enabled = false;
         bool looked = false;
     } park;
     int parked_split = -1;
     ggml_backend_t parked_backend = nullptr;
+    // the parked record copies its inputs from other backends itself, see ggml_vk_park_record_late
+    bool parked_folded = false;
     bool (*read_batch)(const ggml_tensor * const *, void **, const size_t *, int) = nullptr;
     auto lookup_park = [&](ggml_backend_t backend) {
         if (park.looked || !backend || !ggml_backend_sched_single_token_input(sched->graph)) { return; }
@@ -1842,8 +1845,8 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         park.submit = (bool (*)(ggml_backend_t)) ggml_backend_reg_get_proc_address(reg, "ggml_vk_park_submit");
         park.drop = (void (*)(ggml_backend_t)) ggml_backend_reg_get_proc_address(reg, "ggml_vk_park_drop");
         park.early = (bool (*)(ggml_backend_t)) ggml_backend_reg_get_proc_address(reg, "ggml_vk_park_submit_early");
-        park.record_late = (bool (*)(ggml_backend_t, ggml_cgraph *, const ggml_tensor * const *, int))
-                ggml_backend_reg_get_proc_address(reg, "ggml_vk_park_record_late");
+        park.record_late = (bool (*)(ggml_backend_t, ggml_cgraph *, const ggml_tensor * const *,
+                const ggml_tensor * const *, int, bool *)) ggml_backend_reg_get_proc_address(reg, "ggml_vk_park_record_late");
         park.enabled = park.record && park.submit && park.drop;
         read_batch = (bool (*)(const ggml_tensor * const *, void **, const size_t *, int))
                 ggml_backend_reg_get_proc_address(reg, "ggml_vk_read_batch");
@@ -1932,6 +1935,16 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                 }
                 if (batched) {
                     for (int i = 0; i < nbatch; ++i) { skip_copy[ids[i]] = true; }
+                }
+            }
+        }
+        // The parked record copies these itself, at its cut.
+        const bool folded_here = park.enabled && parked_folded && parked_split == split_id && parked_backend == split_backend;
+        if (folded_here) {
+            for (int input_id = 0; input_id < split->n_inputs; input_id++) {
+                if (ggml_backend_sched_get_tensor_backend(sched, split->inputs[input_id]) != split_backend &&
+                        tensor_copy(split->inputs[input_id], split_backend_id, sched->cur_copy)) {
+                    skip_copy[input_id] = true;
                 }
             }
         }
@@ -2089,13 +2102,25 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                 ++park_n;
             } else {
                 park.drop(split_backend);
+                // the split computes as recorded now, without the copies the record held
+                if (parked_folded) {
+                    for (int input_id = 0; input_id < split->n_inputs; input_id++) {
+                        ggml_tensor * input = split->inputs[input_id];
+                        ggml_tensor * input_cpy = tensor_copy(input, split_backend_id, sched->cur_copy);
+                        if (ggml_backend_sched_get_tensor_backend(sched, input) != split_backend && input_cpy) {
+                            ggml_backend_tensor_copy(input, input_cpy);
+                        }
+                    }
+                }
             }
             parked_split = -1;
             parked_backend = nullptr;
+            parked_folded = false;
         } else if (park.enabled && parked_split >= 0 && split_id > parked_split && parked_backend) {
             park.drop(parked_backend);
             parked_split = -1;
             parked_backend = nullptr;
+            parked_folded = false;
         }
         if (!skipped_compute && !sched->callback_eval) {
             enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &split->graph);
@@ -2164,23 +2189,27 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                     const int64_t park_t0 = ggml_time_us();
                     // the next split's inputs from other backends: they are copied after the splits between
                     const ggml_tensor * late[GGML_SCHED_MAX_SPLIT_INPUTS];
+                    const ggml_tensor * late_src[GGML_SCHED_MAX_SPLIT_INPUTS];
                     int n_late = 0;
                     const ggml_backend_sched_split & ns = splits[next];
                     for (int i = 0; i < ns.n_inputs; ++i) {
                         if (ggml_backend_sched_get_tensor_backend(sched, ns.inputs[i]) != split_backend) {
                             const ggml_tensor * cpy = tensor_copy(ns.inputs[i], ns.backend_id, sched->cur_copy);
                             if (cpy) {
+                                late_src[n_late] = ns.inputs[i];
                                 late[n_late++] = cpy;
                             }
                         }
                     }
+                    bool folded = false;
                     const bool recorded = park.record_late ?
-                        park.record_late(split_backend, &splits[next].graph, late, n_late) :
+                        park.record_late(split_backend, &splits[next].graph, late, late_src, n_late, &folded) :
                         park.record(split_backend, &splits[next].graph);
                     if (recorded) {
                         park_us += (double) (ggml_time_us() - park_t0);
                         parked_split = next;
                         parked_backend = split_backend;
+                        parked_folded = folded;
                     }
                 }
             }

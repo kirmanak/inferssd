@@ -2091,8 +2091,11 @@ struct ggml_backend_vk_context {
         bool sem_ready = false;
     };
     decode_park parks[2];
-    // the parked split's inputs that another backend writes after the record, see ggml_vk_park_record_late
+    // the parked split's inputs that another backend writes after the record, and their sources, see
+    // ggml_vk_park_record_late
     std::vector<const ggml_tensor *> park_late;
+    std::vector<const ggml_tensor *> park_late_src;
+    bool park_folded = false;
     int park_slot = -1;
     int park_ready = -1;
     bool park_mode = false;
@@ -16867,6 +16870,31 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
     // backend, which that backend writes after the record. The nodes before the cut can be submitted early, see
     // ggml_vk_park_submit_early.
     int park_cut = -1;
+    // The sources in pinned host memory: the record copies them at the cut, and the scheduler does not.
+    struct park_copy { vk_buffer src; size_t src_off; vk_buffer dst; size_t dst_off; size_t size; };
+    std::vector<park_copy> park_copies;
+    ctx->park_folded = false;
+    if (ctx->park_mode && !ctx->park_late.empty() && ctx->park_late_src.size() == ctx->park_late.size()) {
+        for (size_t j = 0; j < ctx->park_late.size(); ++j) {
+            const ggml_tensor * dst = ctx->park_late[j];
+            const ggml_tensor * src = ctx->park_late_src[j];
+            vk_buffer pinned;
+            size_t pinned_off = 0;
+            // weights go through the scheduler's expert and drive copies, never whole
+            if (src && src->data && src->buffer && ggml_backend_buffer_is_host(src->buffer) &&
+                    ggml_backend_buffer_get_usage(src->buffer) != GGML_BACKEND_BUFFER_USAGE_WEIGHTS) {
+                ggml_vk_host_get(ctx->device, src->data, pinned, pinned_off);
+            }
+            if (!pinned || !dst->buffer || !ggml_backend_buffer_is_vk(dst->buffer) || ggml_nbytes(src) != ggml_nbytes(dst) ||
+                    !ggml_is_contiguous(src) || !ggml_is_contiguous(dst)) {
+                park_copies.clear();
+                break;
+            }
+            auto * dst_ctx = static_cast<ggml_backend_vk_buffer_context *>(dst->buffer->context);
+            park_copies.push_back({ pinned, pinned_off, dst_ctx->dev_buffer, vk_tensor_offset(dst) + dst->view_offs,
+                    ggml_nbytes(dst) });
+        }
+    }
     if (ctx->park_mode && !ctx->park_late.empty()) {
         const auto is_late = [&](const ggml_tensor * t) {
             while (t->view_src) {
@@ -17160,14 +17188,25 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
 
         // Cut the parked record before the fused group that reaches the first late node, if anything comes before
         // it. The second command buffer starts with a barrier: the first may still run when the second starts.
-        if (park_cut > 0 && i + ctx->num_additional_fused_ops >= park_cut) {
-            if (i > 0) {
-                auto & park = ctx->parks[ctx->park_slot];
-                if (park.held && park.held->s) {
-                    ggml_vk_ctx_begin(ctx->device, park.held);
+        if (park_cut >= 0 && i + ctx->num_additional_fused_ops >= park_cut) {
+            auto & park = ctx->parks[ctx->park_slot];
+            if (i > 0 && park.held && park.held->s) {
+                ggml_vk_ctx_begin(ctx->device, park.held);
+                ctx->unsynced_nodes_written.clear();
+                ctx->unsynced_nodes_read.clear();
+                ggml_vk_sync_buffers(ctx, park.held);
+            }
+            if (!park_copies.empty()) {
+                vk_context held = ggml_vk_get_compute_ctx(ctx);
+                if (held && held->s) {
+                    for (const auto & c : park_copies) {
+                        held->s->buffer->buf.copyBuffer(c.src->buffer, c.dst->buffer,
+                                vk::BufferCopy{ c.src_off, c.dst_off, c.size });
+                    }
                     ctx->unsynced_nodes_written.clear();
                     ctx->unsynced_nodes_read.clear();
-                    ggml_vk_sync_buffers(ctx, park.held);
+                    ggml_vk_sync_buffers(ctx, held);
+                    ctx->park_folded = true;
                 }
             }
             park_cut = -1;
@@ -17487,17 +17526,28 @@ extern "C" bool ggml_vk_park_record(ggml_backend_t backend, ggml_cgraph * graph)
 
 // As ggml_vk_park_record, with the graph's inputs that another backend writes after the record: the record is cut
 // before the first node that reads one, and ggml_vk_park_submit_early submits the nodes before it.
+// With `folded` set, the record also copies each late input from its source in pinned host memory, after the cut;
+// the caller must not copy them.
 extern "C" bool ggml_vk_park_record_late(ggml_backend_t backend, ggml_cgraph * graph,
-                                         const ggml_tensor * const * late, int n_late) {
+                                         const ggml_tensor * const * late, const ggml_tensor * const * late_src,
+                                         int n_late, bool * folded) {
+    if (folded) { *folded = false; }
     if (!backend) { return false; }
     auto * ctx = static_cast<ggml_backend_vk_context *>(backend->context);
     static const bool off = getenv("INFERSSD_NO_PARK_EARLY") != nullptr;
+    static const bool no_fold = getenv("INFERSSD_NO_PARK_FOLD") != nullptr;
     if (ctx && !off && late && n_late > 0) {
         ctx->park_late.assign(late, late + n_late);
+        if (!no_fold && late_src) {
+            ctx->park_late_src.assign(late_src, late_src + n_late);
+        }
     }
     const bool ok = ggml_vk_park_record(backend, graph);
     if (ctx) {
+        if (ok && folded) { *folded = ctx->park_folded; }
         ctx->park_late.clear();
+        ctx->park_late_src.clear();
+        ctx->park_folded = false;
     }
     return ok;
 }
