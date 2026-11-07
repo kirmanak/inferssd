@@ -126,7 +126,9 @@ struct expert_cache {
         uint64_t token = 0;
         bool seen = false;
         std::map<int32_t, uint64_t> frequency;
-        std::map<int32_t, double> count_frequency;
+        // Indexed by expert id, an absent expert 0: decaying a whole layer is one pass over contiguous memory,
+        // where a node per expert made each decode prepare chase hundreds of cold pointers.
+        std::vector<double> count_frequency;
         uint64_t count_step = 0;
     };
     std::vector<layer> layers;
@@ -456,8 +458,8 @@ struct expert_cache {
     std::pair<uint64_t, double> score(size_t layer_id, int32_t expert) const {
         if (policy == count_decay2) {
             const auto & item = layers.at(layer_id);
-            const auto found = item.count_frequency.find(expert);
-            const double value = found == item.count_frequency.end() ? 0.0 : found->second;
+            const double value = expert >= 0 && size_t(expert) < item.count_frequency.size() ?
+                item.count_frequency[size_t(expert)] : 0.0;
             return { 0, value * std::exp2(-double(age_steps - item.count_step) / 2.0) };
         }
         const auto & counts = layers.at(layer_id).frequency;
@@ -758,26 +760,27 @@ struct expert_cache {
         }
         l.seen = true; l.token = token;
         if (policy == count_decay2) {
-            size_t nodes = 0;
-            for (const auto & r : requests) { nodes += !r.cache_only && l.count_frequency.find(r.id) == l.count_frequency.end(); }
-            auto frequency_ticket = take_guard(multiply(nodes, allocation_cost(sizeof(std::pair<const int32_t, double>) + 4 * sizeof(void *))));
-            if (!frequency_ticket) {
-                reject_admission(requests, current, "cgroup_count_frequency_headroom"); return;
+            const size_t experts = size_t(tensors[0]->ne[2]);
+            if (l.count_frequency.size() < experts) {
+                auto frequency_ticket = take_guard(allocation_cost(multiply(experts, sizeof(double))));
+                if (!frequency_ticket) {
+                    reject_admission(requests, current, "cgroup_count_frequency_headroom"); return;
+                }
+                try { l.count_frequency.resize(experts, 0.0); }
+                catch (const std::bad_alloc &) { pause(requests, current, "count_frequency_allocation_failed"); return; }
+                frequency_ticket.value.commit();
             }
             const double factor = std::exp2(-double(age_steps - l.count_step) / 2.0);
-            for (auto & item : l.count_frequency) { item.second *= factor; }
+            for (double & value : l.count_frequency) { value *= factor; }
             l.count_step = age_steps;
-            try {
-                // Selection frequency, independent of routing weight. Count a
-                // duplicated ID once per layer/token, as the offline set did.
-                for (size_t j = 0; j < requests.size(); ++j) {
-                    if (requests[j].cache_only) { continue; }
-                    const auto duplicate = std::find_if(requests.begin(), requests.begin() + j,
-                        [&](const expert_request & r) { return r.id == requests[j].id; });
-                    if (duplicate == requests.begin() + j) { l.count_frequency[requests[j].id] += 1.0; }
-                }
-            } catch (const std::bad_alloc &) { pause(requests, current, "count_frequency_allocation_failed"); return; }
-            frequency_ticket.value.commit();
+            // Selection frequency, independent of routing weight. Count a
+            // duplicated ID once per layer/token, as the offline set did.
+            for (size_t j = 0; j < requests.size(); ++j) {
+                if (requests[j].cache_only) { continue; }
+                const auto duplicate = std::find_if(requests.begin(), requests.begin() + j,
+                    [&](const expert_request & r) { return r.id == requests[j].id; });
+                if (duplicate == requests.begin() + j) { l.count_frequency.at(size_t(requests[j].id)) += 1.0; }
+            }
         }
         if (policy == lfu || policy == decay) {
             size_t nodes = 0;
@@ -856,9 +859,17 @@ struct expert_cache {
         const uint64_t payload_pages = multiply(slot_pages, page_size);
         const uint64_t new_tables = multiply(new_slots, page_tables(payload_pages));
         const uint64_t extra = add(add(multiply(new_slots, payload_pages), new_tables), arena ? 0 : 64 * 1024);
-        auto slot_ticket = take_guard(extra);
-        if (!slot_ticket) {
-            reject_admission(requests, current, "cgroup_headroom"); return;
+        // Nothing new to commit needs no room, and measuring it reads the cgroup and meminfo files on every decode
+        // layer whose misses all land in slots already resident.
+        ssd::host::allocation_ticket slot_ticket;
+        if (extra) {
+            auto taken = take_guard(extra);
+            if (!taken) {
+                reject_admission(requests, current, "cgroup_headroom"); return;
+            }
+            slot_ticket = std::move(taken.value);
+        } else {
+            stats.last_guard_extra_bytes = 0;
         }
         if (!arena && stats.capacity_bytes && !requests.empty()) {
             if (const char * failed = map_arena()) { pause(requests, current, failed); return; }
@@ -884,7 +895,7 @@ struct expert_cache {
             current.cache_new_slot_bytes = add(current.cache_new_slot_bytes, stride);
         }
         stats.peak_bytes = std::max(stats.peak_bytes, stats.committed_bytes);
-        slot_ticket.value.commit();
+        if (slot_ticket) { slot_ticket.commit(); }
     }
     // The arena, address space only: the guard admits each resident slot against the cgroup, so the kernel's
     // overcommit heuristic must not refuse a mapping larger than RAM plus swap. Ordinary pages: partial reclaim gives
