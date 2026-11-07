@@ -17531,11 +17531,16 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
         case GGML_OP_ROLL:
             return op->src[0]->type == GGML_TYPE_F32;
         case GGML_OP_DSV4_HC_COMB:
+            return false;
         case GGML_OP_DSV4_HC_PRE:
         case GGML_OP_DSV4_HC_POST:
-            // The shader is close to the plain graph, but on this discrete GPU it
-            // changes the warm prompt token. Keep the plain graph until it matches.
-            return false;
+            // Off before only because it moved a near-tie first token. Against
+            // the CPU expert path it keeps the KL gate (0.013359, same top 94.98 %)
+            // and cuts decode's dense time per layer from 525 to 463 us.
+            for (int i = 0; i < GGML_MAX_SRC && op->src[i]; ++i) {
+                if (op->src[i]->type != GGML_TYPE_F32 || !ggml_is_contiguous(op->src[i])) { return false; }
+            }
+            return op->type == GGML_TYPE_F32;
         case GGML_OP_DIAG_MASK_INF:
             return ggml_is_contiguous(op->src[0]) && op->src[0]->type == GGML_TYPE_F32;
         case GGML_OP_SOFT_MAX:
