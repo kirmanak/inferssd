@@ -32,4 +32,5 @@
 
 - [Upstream patches](development/upstream-patches.md): integration points in the bundled llama.cpp snapshot.
 - [GPU prefill overhead](development/prefill-overhead.md): the placement cost model for batched GPU work.
+- [Speed with a quality gate](development/speed-2026-11.md): the KL check against the CPU expert path, and the Qwen3.8 Vulkan speed work after `prefill-100`.
 
