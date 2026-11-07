@@ -2095,21 +2095,28 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         descriptor->cache_compute = cache_compute;
         descriptor->routed_scale = execution.routed_scale;
         ggml_tensor * hint = !cache_compute && !cpu_sink_prefill && n_tokens == 1 ? cpu_sink_prefetch_hint : nullptr;
+        // A copy only where the tensor is not already contiguous: in decode each one was a device dispatch, four a
+        // layer.
+        const auto cont = [&](ggml_tensor * t) { return ggml_is_contiguous(t) ? t : ggml_cont(ctx0, t); };
         // slots: input, ids, weights, then the post-expert norm or the native ids and weights, then the hint
         ggml_tensor * args[] = {
-            ggml_cont(ctx0, cur), ggml_cont(ctx0, selected_experts), ggml_cont(ctx0, weights),
-            post_exp_norm ? ggml_cont(ctx0, post_exp_norm) : cache_compute ? ggml_cont(ctx0, native_experts) : nullptr,
-            cache_compute ? ggml_cont(ctx0, native_weights) : nullptr,
-            hint ? ggml_cont(ctx0, hint) : nullptr,
+            cont(cur), cont(selected_experts), cont(weights),
+            post_exp_norm ? cont(post_exp_norm) : cache_compute ? cont(native_experts) : nullptr,
+            cache_compute ? cont(native_weights) : nullptr,
+            hint ? cont(hint) : nullptr,
+        };
+        // names only for the copies made here; a tensor passed as it is keeps its own
+        const auto name = [&](ggml_tensor * arg, const ggml_tensor * source, const char * label) {
+            if (arg && arg != source) { cb(arg, label, il); }
         };
         if (cache_compute) {
-            cb(args[3], "ffn_moe_cpu_sink_native_ids", il);
-            cb(args[4], "ffn_moe_cpu_sink_native_weights", il);
+            name(args[3], native_experts, "ffn_moe_cpu_sink_native_ids");
+            name(args[4], native_weights, "ffn_moe_cpu_sink_native_weights");
         }
-        cb(args[0], "ffn_moe_cpu_sink_in", il);
+        name(args[0], cur, "ffn_moe_cpu_sink_in");
         descriptor->device_input = args[0] && args[0]->op == GGML_OP_CONT ? args[0]->src[0] : args[0];
-        cb(args[1], "ffn_moe_cpu_sink_ids", il);
-        cb(args[2], "ffn_moe_cpu_sink_weights", il);
+        name(args[1], selected_experts, "ffn_moe_cpu_sink_ids");
+        name(args[2], weights, "ffn_moe_cpu_sink_weights");
         // every CPU thread of the graph is a compute participant of the node's call
         ggml_tensor * result = ggml_custom_4d(ctx0, GGML_TYPE_F32, n_embd, n_tokens, 1, 1,
             args, hint ? 6 : cache_compute ? 5 : post_exp_norm ? 4 : 3, llama_kimi_cpu_sink_compute,
