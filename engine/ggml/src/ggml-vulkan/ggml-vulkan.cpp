@@ -1293,6 +1293,7 @@ struct vk_op_dsv4_hc_push_constants {
     // src0 to src3, then dst, in floats
     uint32_t offsets[5];
     uint32_t nb[5][3];
+    float param2;
 };
 
 struct vk_op_multi_add_push_constants {
@@ -11104,7 +11105,9 @@ static void ggml_vk_dsv4_hc(ggml_backend_vk_context * ctx, vk_context& subctx, g
         default:
             p.ne0 = (uint32_t)dst->ne[0];
             p.hc = (uint32_t)src1->ne[1];
-            p.flag = src3 != nullptr;
+            p.flag = (src3 != nullptr ? 1u : 0u) | (ggml_get_op_params_i32(dst, 0) ? 2u : 0u);
+            p.param = ggml_get_op_params_f32(dst, 1);
+            p.param2 = ggml_get_op_params_f32(dst, 2);
             break;
     }
     const ggml_tensor * tensors[5] = { src0, src1, src2, src3, dst };
@@ -18575,7 +18578,10 @@ static void ggml_vk_check_results_0(ggml_backend_vk_context * ctx, ggml_cgraph *
                 ggml_dsv4_hc_pre_gated(ggml_ctx, src_clone[0], src_clone[1], ggml_get_op_params_f32(tensor, 0)) :
                 ggml_dsv4_hc_pre(ggml_ctx, src_clone[0], src_clone[1]);
         } else if (tensor->op == GGML_OP_DSV4_HC_POST) {
-            tensor_clone = ggml_dsv4_hc_post(ggml_ctx, src_clone[0], src_clone[1], src_clone[2], src_clone[3]);
+            tensor_clone = ggml_get_op_params_i32(tensor, 0) ?
+                ggml_dsv4_hc_post_gated(ggml_ctx, src_clone[0], src_clone[1], src_clone[2], src_clone[3],
+                                        ggml_get_op_params_f32(tensor, 1), ggml_get_op_params_f32(tensor, 2)) :
+                ggml_dsv4_hc_post(ggml_ctx, src_clone[0], src_clone[1], src_clone[2], src_clone[3]);
         } else if (tensor->op == GGML_OP_ROLL) {
             const int32_t s0 = tensor->op_params[0];
             const int32_t s1 = tensor->op_params[1];

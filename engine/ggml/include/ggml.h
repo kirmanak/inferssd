@@ -1492,6 +1492,16 @@ extern "C" {
             struct ggml_tensor  * post,
             struct ggml_tensor  * comb);
 
+    // ggml_dsv4_hc_post with post[dst, t] = out_scale * sigmoid(in_scale * gate[dst, t]), computed in the op
+    GGML_API struct ggml_tensor * ggml_dsv4_hc_post_gated(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * x,
+            struct ggml_tensor  * residual,
+            struct ggml_tensor  * gate,
+            struct ggml_tensor  * comb,
+            float                 in_scale,
+            float                 out_scale);
+
     // change the precision of a matrix multiplication
     // set to GGML_PREC_F32 for higher precision (useful for phi-2)
     GGML_API void ggml_mul_mat_set_prec(

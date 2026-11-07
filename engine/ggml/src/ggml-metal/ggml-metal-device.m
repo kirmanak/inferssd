@@ -1112,6 +1112,10 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
         case GGML_OP_DSV4_HC_COMB:
         case GGML_OP_DSV4_HC_PRE:
         case GGML_OP_DSV4_HC_POST:
+            // the Metal kernel takes the post weights as they are, not a gate (ggml_dsv4_hc_post_gated)
+            if (op->op == GGML_OP_DSV4_HC_POST && ggml_get_op_params_i32(op, 0) != 0) {
+                return false;
+            }
             return op->type == GGML_TYPE_F32 && op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 &&
                 (op->src[2] == NULL || op->src[2]->type == GGML_TYPE_F32) &&
                 (op->src[3] == NULL || op->src[3]->type == GGML_TYPE_F32);

@@ -3456,6 +3456,23 @@ struct ggml_tensor * ggml_dsv4_hc_post(
     return result;
 }
 
+struct ggml_tensor * ggml_dsv4_hc_post_gated(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * x,
+        struct ggml_tensor  * residual,
+        struct ggml_tensor  * gate,
+        struct ggml_tensor  * comb,
+        float                 in_scale,
+        float                 out_scale) {
+    struct ggml_tensor * result = ggml_dsv4_hc_post(ctx, x, residual, gate, comb);
+
+    ggml_set_op_params_i32(result, 0, 1);
+    ggml_set_op_params_f32(result, 1, in_scale);
+    ggml_set_op_params_f32(result, 2, out_scale);
+
+    return result;
+}
+
 void ggml_mul_mat_set_prec(
         struct ggml_tensor * a,
         enum ggml_prec       prec) {

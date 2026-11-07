@@ -1769,6 +1769,11 @@ static void ggml_compute_forward_dsv4_hc_post_f32(
     GGML_TENSOR_LOCALS(size_t, nbp, post,     nb);
     GGML_TENSOR_LOCALS(size_t, nbd, dst,      nb);
 
+    // ggml_dsv4_hc_post_gated: post holds the gate, the weight is out_scale*sigmoid(in_scale*gate)
+    const bool  gated     = ggml_get_op_params_i32(dst, 0) != 0;
+    const float in_scale  = ggml_get_op_params_f32(dst, 1);
+    const float out_scale = ggml_get_op_params_f32(dst, 2);
+
     const int ith = params->ith;
     const int nth = params->nth;
 
@@ -1783,7 +1788,10 @@ static void ggml_compute_forward_dsv4_hc_post_f32(
         const int64_t it   = ir / (n_embd * hc);
 
         const float xv = *(const float *) ((const char *) x->data    + i0*nbx0 + it*nbx1);
-        const float pv = *(const float *) ((const char *) post->data + idst*nbp0 + it*nbp1);
+        float pv = *(const float *) ((const char *) post->data + idst*nbp0 + it*nbp1);
+        if (gated) {
+            pv = out_scale * (1.0f / (1.0f + expf(-(pv * in_scale))));
+        }
 
         float sum = xv * pv;
         if (comb) {

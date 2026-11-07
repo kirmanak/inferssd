@@ -85,18 +85,18 @@ ggml_tensor * llm_build_qwen4exp::build_hc_combine(
     const int64_t nt = residual->ne[2];
 
     // 2*sigmoid centres the scatter weights on 1, so a zero injection is a plain residual add
-    ggml_tensor * w = ggml_sigmoid(ctx0, ggml_scale(ctx0, inject, 1.0f / (float) hc));
-    w = ggml_scale(ctx0, w, 2.0f);
-
     ggml_tensor * cur = nullptr;
     if (cparams.ssd_hc_fused && il >= 0) {
-        // identity comb: every stream adds the same block output, scaled by its own weight
-        cur = ggml_dsv4_hc_post(ctx0, block_out, residual, w, nullptr);
+        // identity comb: every stream adds the same block output, scaled by its own weight. The op computes the
+        // weights itself: as three ops on hc numbers a token they were three more dispatches per combine.
+        cur = ggml_dsv4_hc_post_gated(ctx0, block_out, residual, inject, nullptr, 1.0f / (float) hc, 2.0f);
         if (!fused_supported(cur, il)) {
             cur = nullptr;
         }
     }
     if (!cur) {
+        ggml_tensor * w = ggml_sigmoid(ctx0, ggml_scale(ctx0, inject, 1.0f / (float) hc));
+        w = ggml_scale(ctx0, w, 2.0f);
         w = ggml_reshape_3d(ctx0, w, 1, hc, nt);
 
         ggml_tensor * b = ggml_reshape_3d(ctx0, block_out, n_embd, 1, nt);

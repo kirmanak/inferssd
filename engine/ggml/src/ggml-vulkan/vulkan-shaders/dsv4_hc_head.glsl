@@ -12,4 +12,5 @@ layout (push_constant) uniform parameter
     uint nb20; uint nb21; uint nb22;
     uint nb30; uint nb31; uint nb32;
     uint nb40; uint nb41; uint nb42;
+    float param2;
 } p;
