@@ -79,6 +79,9 @@ struct expert_session {
     std::unordered_map<const void *, size_t> ahead_at;
     std::unordered_map<const void *, size_t> ahead_bytes;
     int ahead_used = 0;
+    // Least free device memory seen while a prompt ran. The decode cache sizes
+    // from this, not from what the prompt released at the phase change.
+    size_t prefill_min_free = SIZE_MAX;
     ggml_backend_buffer_t slot_buf[16] = {};
     uint64_t slot_bytes = 0;
     ggml_context * ctx = nullptr;
@@ -124,6 +127,35 @@ struct expert_session {
 
 size_t align_up(size_t value, size_t alignment) {
     return (value + alignment - 1) & ~(alignment - 1);
+}
+
+void note_free(expert_session * session) {
+    size_t free_bytes = 0, total = 0;
+    ggml_backend_dev_memory(ggml_backend_get_device(session->backend), &free_bytes, &total);
+    if (free_bytes && free_bytes < session->prefill_min_free) { session->prefill_min_free = free_bytes; }
+}
+
+constexpr uint64_t k_batch_cap = 1536ull << 20;
+
+// The batch buffer goes straight to its cap. Grown per layer, it was freed and
+// allocated again after decode had filled the card, and the new one landed in
+// GTT: the next prompt's expert GEMM ran 6-10x slower.
+bool batch_reserve(expert_session * session, ggml_backend_buffer_type_t buft, size_t need) {
+    if (session->batch_buffer && session->batch_staging >= need && session->batch_buft == buft) { return true; }
+    if (session->batch_buffer) { ggml_backend_buffer_free(session->batch_buffer); }
+    session->batch_buffer = nullptr;
+    session->batch_staging = 0;
+    if (need < k_batch_cap) {
+        try { session->batch_buffer = ggml_backend_buft_alloc_buffer(buft, k_batch_cap); }
+        catch (...) { session->batch_buffer = nullptr; }
+    }
+    if (!session->batch_buffer) {
+        try { session->batch_buffer = ggml_backend_buft_alloc_buffer(buft, need); }
+        catch (...) { session->batch_buffer = nullptr; }
+    }
+    session->batch_buft = buft;
+    session->batch_staging = session->batch_buffer ? ggml_backend_buffer_get_size(session->batch_buffer) : 0;
+    return session->batch_buffer != nullptr;
 }
 
 bool expert_prepare(expert_session * session, int32_t type, int64_t k, int64_t n, int n_tokens, char * error, size_t error_size) {
@@ -251,7 +283,6 @@ bool expert_mul_mat(void * raw, int32_t type, int64_t k, int64_t n, int n_tokens
     return true;
 }
 
-constexpr uint64_t k_batch_cap = 1536ull << 20;
 constexpr int k_batch_experts = 512;
 
 bool expert_batch_chunk(expert_session * session, const ggml_vk_expert_matmul * items, int begin, int count,
@@ -324,20 +355,10 @@ bool expert_batch_chunk(expert_session * session, const ggml_vk_expert_matmul * 
         set_error(error, error_size, "vulkan expert batch exceeds the staging cap");
         return false;
     }
-    if (!session->batch_buffer || session->batch_staging < cursor || session->batch_buft != buft) {
-        if (session->batch_buffer) {
-            ggml_backend_buffer_free(session->batch_buffer);
-            session->batch_buffer = nullptr;
-            session->batch_staging = 0;
-        }
-        session->batch_buffer = ggml_backend_buft_alloc_buffer(buft, cursor);
-        session->batch_buft = buft;
-        if (!session->batch_buffer) {
-            ggml_free(ctx);
-            set_error(error, error_size, "vulkan expert batch staging allocation failed");
-            return false;
-        }
-        session->batch_staging = ggml_backend_buffer_get_size(session->batch_buffer);
+    if (!batch_reserve(session, buft, cursor)) {
+        ggml_free(ctx);
+        set_error(error, error_size, "vulkan expert batch staging allocation failed");
+        return false;
     }
     void * base = ggml_backend_buffer_get_base(session->batch_buffer);
     void * ahead_base = session->ahead_buffer ? ggml_backend_buffer_get_base(session->ahead_buffer) : nullptr;
@@ -447,6 +468,7 @@ bool expert_mul_mat_batch(void * raw, const ggml_vk_expert_matmul * items, int c
     if (session->ahead_used) {
         std::fprintf(stderr, "[kimi_vk_ahead] used=%d\n", session->ahead_used);
     }
+    note_free(session);
     return true;
 }
 
@@ -455,6 +477,8 @@ constexpr uint64_t k_ahead_cap = 1536ull << 20;
 bool expert_ahead(void * raw, const ggml_vk_expert_ahead * items, int count) {
     auto * session = static_cast<expert_session *>(raw);
     if (!session) { return false; }
+    // Once per prompt layer, after the scheduler has reserved this phase's graph.
+    note_free(session);
     if (!items || count <= 0) {
         session->join_ahead();
         // The host bytes behind the shown copy changed or are going away.
@@ -663,15 +687,9 @@ bool expert_buckets_compute(expert_session * session, const ggml_tensor * activa
         ggml_free(ctx);
         return false;
     }
-    if (!session->batch_buffer || session->batch_staging < cursor || session->batch_buft != buft) {
-        if (session->batch_buffer) { ggml_backend_buffer_free(session->batch_buffer); }
-        session->batch_buffer = ggml_backend_buft_alloc_buffer(buft, cursor);
-        session->batch_buft = buft;
-        session->batch_staging = session->batch_buffer ? ggml_backend_buffer_get_size(session->batch_buffer) : 0;
-        if (!session->batch_buffer) {
-            ggml_free(ctx);
-            return false;
-        }
+    if (!batch_reserve(session, buft, cursor)) {
+        ggml_free(ctx);
+        return false;
     }
     const size_t act_base = size_t(static_cast<char *>(activation->data) - static_cast<char *>(ggml_backend_buffer_get_base(activation->buffer)));
     std::vector<size_t> act_src, act_dst, act_sz;
@@ -891,16 +909,10 @@ bool expert_device_layer(void * raw, const ggml_tensor * activation, int32_t up_
         down_cols[size_t(e)] = item.n_tokens;
         down_off[size_t(e)] = sets.back().offset;
     }
-    if (!session->batch_buffer || session->batch_staging < cursor || session->batch_buft != buft) {
-        if (session->batch_buffer) { ggml_backend_buffer_free(session->batch_buffer); }
-        session->batch_buffer = ggml_backend_buft_alloc_buffer(buft, cursor);
-        session->batch_buft = buft;
-        session->batch_staging = session->batch_buffer ? ggml_backend_buffer_get_size(session->batch_buffer) : 0;
-        if (!session->batch_buffer) {
-            ggml_free(ctx);
-            set_error(error, error_size, "vulkan device layer staging allocation failed");
-            return false;
-        }
+    if (!batch_reserve(session, buft, cursor)) {
+        ggml_free(ctx);
+        set_error(error, error_size, "vulkan device layer staging allocation failed");
+        return false;
     }
     void * base = ggml_backend_buffer_get_base(session->batch_buffer);
     void * ahead_base = session->ahead_buffer ? ggml_backend_buffer_get_base(session->ahead_buffer) : nullptr;
@@ -1011,15 +1023,10 @@ bool expert_device_layer(void * raw, const ggml_tensor * activation, int32_t up_
         set_error(error, error_size, "vulkan device layer reduce is empty");
         return false;
     }
-    if (!session->batch_buffer || session->batch_staging < reduce_cursor) {
-        if (session->batch_buffer) { ggml_backend_buffer_free(session->batch_buffer); }
-        session->batch_buffer = ggml_backend_buft_alloc_buffer(buft, reduce_cursor);
-        session->batch_staging = session->batch_buffer ? ggml_backend_buffer_get_size(session->batch_buffer) : 0;
-        if (!session->batch_buffer) {
-            ggml_free(reduce);
-            set_error(error, error_size, "vulkan device layer reduce allocation failed");
-            return false;
-        }
+    if (!batch_reserve(session, buft, reduce_cursor)) {
+        ggml_free(reduce);
+        set_error(error, error_size, "vulkan device layer reduce allocation failed");
+        return false;
     }
     void * reduce_base = ggml_backend_buffer_get_base(session->batch_buffer);
     for (int s = 0; s < nslots; ++s) {
@@ -1057,6 +1064,7 @@ bool expert_device_layer(void * raw, const ggml_tensor * activation, int32_t up_
     std::fprintf(stderr, "[kimi_vk_device] experts=%d routes=%d compute_us=%.0f scatter_us=%.0f reduce_us=%.0f\n",
             n_experts, n_routes, compute_us, scatter_us, reduce_us);
     ggml_free(reduce);
+    note_free(session);
     return true;
 }
 
@@ -1485,6 +1493,10 @@ struct decode_cache {
             if (!ahead.buffer || ahead.cap < k_ahead_cap) { ahead_room += k_ahead_cap - (ahead.buffer ? ahead.cap : 0); }
         }
         free_bytes = free_bytes > ahead_room ? free_bytes - ahead_room : 0;
+        // What the prompt freed at the phase change (its graph, its batch
+        // buffer headroom) it takes back on the next prompt. Sized from the
+        // prompt's low point, the driver did not have to evict anything.
+        if (session->prefill_min_free < free_bytes) { free_bytes = session->prefill_min_free; }
         constexpr size_t reserve = 256ull << 20;
         size_t budget = free_bytes > reserve ? free_bytes - reserve : 0;
         if (budget > (10ull << 30)) { budget = 10ull << 30; }
