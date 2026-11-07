@@ -16498,6 +16498,8 @@ static void ggml_vk_park_reset_slot(ggml_backend_vk_context::decode_park & slot)
 
 extern "C" bool ggml_vk_park_record(ggml_backend_t backend, ggml_cgraph * graph) {
     if (!backend || !graph || !ggml_vk_graph_is_decode_one(graph)) { return false; }
+    // The perf logger times a live compute context; a parked record has none and crashed on the first decode token.
+    if (vk_perf_logger_enabled) { return false; }
     // Held across park_mode so a side-thread expert record cannot observe it.
     std::lock_guard<std::recursive_mutex> compute_lock(vk_compute_mutex);
     auto * ctx = static_cast<ggml_backend_vk_context *>(backend->context);
