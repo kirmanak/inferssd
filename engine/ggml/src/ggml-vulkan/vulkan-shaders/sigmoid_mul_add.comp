@@ -5,17 +5,27 @@
 // Offsets in floats.
 layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
 
+// HC_POST: the sum is the block output of a hyper-connection combine with an identity comb and a gate, as
+// dsv4_hc_post.comp computes it for one token: stream s of d is r's stream s + sum * param2 * sigmoid(param * p[s]).
 layout (push_constant) uniform parameter
 {
     uint ne;
     uint g_one;
     uint offs_a; uint offs_g; uint offs_c; uint offs_d;
+    uint hc; uint offs_r; uint offs_p;
+    float param; float param2;
 } p;
 
 layout (binding = 0) readonly buffer A {float data_a[];};
 layout (binding = 1) readonly buffer G {float data_g[];};
 layout (binding = 2) readonly buffer C {float data_c[];};
+#if HC_POST
+layout (binding = 3) readonly buffer R {float data_r[];};
+layout (binding = 4) readonly buffer P {float data_p[];};
+layout (binding = 5) writeonly buffer D {float data_d[];};
+#else
 layout (binding = 3) writeonly buffer D {float data_d[];};
+#endif
 
 void main() {
     const uint i = gl_GlobalInvocationID.x;
@@ -25,5 +35,16 @@ void main() {
     const float g = data_g[p.offs_g + (p.g_one != 0 ? 0 : i)];
     const float s = float(1. / (1 + exp(-1. * g)));
     precise const float m = data_a[p.offs_a + i] * s;
+#if HC_POST
+    const float x = data_c[p.offs_c + i] + m;
+    for (uint is = 0; is < p.hc; ++is) {
+        float w = data_p[p.offs_p + is];
+        w = p.param2 * float(1. / (1 + exp(-1. * float(w * p.param))));
+        float sum = x * w;
+        sum += data_r[p.offs_r + is*p.ne + i];
+        data_d[p.offs_d + is*p.ne + i] = sum;
+    }
+#else
     data_d[p.offs_d + i] = data_c[p.offs_c + i] + m;
+#endif
 }

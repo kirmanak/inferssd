@@ -774,6 +774,7 @@ struct vk_device_struct {
     vk_pipeline pipeline_group_norm_f32;
     vk_pipeline pipeline_rms_norm_f32;
     vk_pipeline pipeline_rms_norm_mul_f32;
+    vk_pipeline pipeline_rms_norm_mul_sigmoid_mul_f32;
     vk_pipeline pipeline_rms_norm_partials_f32;
     vk_pipeline pipeline_rms_norm_mul_partials_f32;
     vk_pipeline pipeline_rms_norm_mul_rope_f32_f32;
@@ -860,6 +861,7 @@ struct vk_device_struct {
     vk_pipeline pipeline_ssm_conv_f32;
     vk_pipeline pipeline_add_softplus_mul_f32;
     vk_pipeline pipeline_sigmoid_mul_add_f32;
+    vk_pipeline pipeline_sigmoid_mul_add_hc_post_f32;
     vk_pipeline pipeline_opt_step_adamw_f32;
     vk_pipeline pipeline_opt_step_sgd_f32;
     std::map<vk_conv2d_pipeline_state, vk_pipeline> pipeline_conv2d_f32[CONV_SHAPE_COUNT];
@@ -1577,6 +1579,9 @@ struct vk_op_ssm_conv_push_constants {
 struct vk_op_sigmoid_mul_add_push_constants {
     uint32_t ne, g_one;
     uint32_t offs_a, offs_g, offs_c, offs_d;
+    // a fused DSV4_HC_POST's streams, residual and gate offsets, and gate parameters
+    uint32_t hc, offs_r, offs_p;
+    float param, param2;
 };
 
 // ADD + SOFTPLUS + MUL; see add_softplus_mul.comp
@@ -2040,6 +2045,8 @@ struct ggml_backend_vk_context {
     bool fused_topk_moe_scale {};
     // RMS_NORM with the SCALE after it: the norm shader applies the factor
     bool fused_rms_norm_scale {};
+    // RMS_NORM, MUL, a SIGMOID and the MUL of the two: the norm shader applies the gate
+    bool fused_rms_norm_gate {};
 
     // for GGML_VK_PERF_LOGGER
     std::unique_ptr<vk_perf_logger> perf_logger;
@@ -4551,6 +4558,7 @@ static void ggml_vk_load_shaders(vk_device& device) {
 
     ggml_vk_create_pipeline(device, device->pipeline_rms_norm_f32, "rms_norm_f32", rms_norm_f32_len, rms_norm_f32_data, "main", 4, sizeof(vk_op_binary_push_constants), {1, 1, 1}, {0, 0}, 1, true);
     ggml_vk_create_pipeline(device, device->pipeline_rms_norm_mul_f32, "rms_norm_mul_f32", rms_norm_f32_len, rms_norm_f32_data, "main", 4, sizeof(vk_op_binary_push_constants), {1, 1, 1}, {0, 1}, 1, true);
+    ggml_vk_create_pipeline(device, device->pipeline_rms_norm_mul_sigmoid_mul_f32, "rms_norm_mul_sigmoid_mul_f32", rms_norm_mul_sigmoid_mul_f32_len, rms_norm_mul_sigmoid_mul_f32_data, "main", 4, sizeof(vk_op_binary_push_constants), {1, 1, 1}, {0, 1}, 1, true);
     ggml_vk_create_pipeline(device, device->pipeline_rms_norm_partials_f32, "rms_norm_partials_f32", rms_norm_partials_f32_len, rms_norm_partials_f32_data, "main", 4, sizeof(vk_op_binary_push_constants), {1, 1, 1}, {0, 0}, 1, true);
     ggml_vk_create_pipeline(device, device->pipeline_rms_norm_mul_partials_f32, "rms_norm_mul_partials_f32", rms_norm_partials_f32_len, rms_norm_partials_f32_data, "main", 4, sizeof(vk_op_binary_push_constants), {1, 1, 1}, {0, 1}, 1, true);
 
@@ -4910,6 +4918,7 @@ static void ggml_vk_load_shaders(vk_device& device) {
     ggml_vk_create_pipeline(device, device->pipeline_ssm_conv_f32, "ssm_conv_f32", ssm_conv_f32_len, ssm_conv_f32_data, "main", 6, sizeof(vk_op_ssm_conv_push_constants), {32, 16, 1}, {32, 16}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_add_softplus_mul_f32, "add_softplus_mul_f32", add_softplus_mul_f32_len, add_softplus_mul_f32_data, "main", 4, sizeof(vk_op_add_softplus_mul_push_constants), {256, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_sigmoid_mul_add_f32, "sigmoid_mul_add_f32", sigmoid_mul_add_f32_len, sigmoid_mul_add_f32_data, "main", 4, sizeof(vk_op_sigmoid_mul_add_push_constants), {256, 1, 1}, {}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_sigmoid_mul_add_hc_post_f32, "sigmoid_mul_add_hc_post_f32", sigmoid_mul_add_hc_post_f32_len, sigmoid_mul_add_hc_post_f32_data, "main", 6, sizeof(vk_op_sigmoid_mul_add_push_constants), {256, 1, 1}, {}, 1);
 
     ggml_vk_create_pipeline(device, device->pipeline_opt_step_adamw_f32, "opt_step_adamw_f32", opt_step_adamw_f32_len, opt_step_adamw_f32_data, "main", 5, sizeof(vk_op_push_constants), {512, 1, 1}, {}, 1);
 
@@ -9714,6 +9723,8 @@ static vk_pipeline ggml_vk_op_get_pipeline(ggml_backend_vk_context * ctx, const 
         if (src0->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
             if (ctx->do_add_rms_partials) {
                 return ctx->num_additional_fused_ops > 0 && !ctx->fused_rms_norm_scale ? ctx->device->pipeline_rms_norm_mul_partials_f32 : ctx->device->pipeline_rms_norm_partials_f32;
+            } else if (ctx->fused_rms_norm_gate) {
+                return ctx->device->pipeline_rms_norm_mul_sigmoid_mul_f32;
             } else {
                 return ctx->num_additional_fused_ops > 0 && !ctx->fused_rms_norm_scale ? ctx->device->pipeline_rms_norm_mul_f32 : ctx->device->pipeline_rms_norm_f32;
             }
@@ -10504,6 +10515,9 @@ static void ggml_vk_op_f32(ggml_backend_vk_context * ctx, vk_context& subctx, co
         vk_subbuffer a_buf = src0_buf;
         if (ctx->do_add_rms_partials) {
             a_buf = ggml_vk_subbuffer(ctx, ctx->prealloc_add_rms_partials, ctx->prealloc_size_add_rms_partials_offset);
+        } else if (use_src2) {
+            // RMS_NORM with a fused gate reads the gate's source there
+            a_buf = src2_buf;
         }
         ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
             { src0_buf, src1_buf, dst_buf, a_buf }, pc, elements);
@@ -11030,8 +11044,10 @@ static void ggml_vk_ssm_conv(ggml_backend_vk_context * ctx, vk_context& subctx, 
                               { pc.nr, pc.n_t, pc.n_s });
 }
 
-// SIGMOID, MUL and ADD, the ADD the last of the fused nodes; see sigmoid_mul_add.comp
-static void ggml_vk_sigmoid_mul_add(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_cgraph * cgraph, int node_idx) {
+// SIGMOID, MUL and ADD, the ADD the last of the fused nodes, or a DSV4_HC_POST of the ADD after them; see
+// sigmoid_mul_add.comp
+static void ggml_vk_sigmoid_mul_add(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_cgraph * cgraph, int node_idx,
+                                    bool hc_post) {
     const ggml_tensor * sig = cgraph->nodes[node_idx];
     const ggml_tensor * mul = cgraph->nodes[node_idx + 1];
     const ggml_tensor * add = cgraph->nodes[node_idx + 2];
@@ -11039,7 +11055,7 @@ static void ggml_vk_sigmoid_mul_add(ggml_backend_vk_context * ctx, vk_context& s
     const ggml_tensor * g = sig->src[0];
     const ggml_tensor * c = add->src[0] == mul ? add->src[1] : add->src[0];
 
-    vk_pipeline pipeline = ctx->device->pipeline_sigmoid_mul_add_f32;
+    vk_pipeline pipeline = hc_post ? ctx->device->pipeline_sigmoid_mul_add_hc_post_f32 : ctx->device->pipeline_sigmoid_mul_add_f32;
     ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
 
     const auto sub = [&](const ggml_tensor * t, uint32_t & offs) {
@@ -11051,10 +11067,21 @@ static void ggml_vk_sigmoid_mul_add(ggml_backend_vk_context * ctx, vk_context& s
     const vk_subbuffer a_buf = sub(a, pc.offs_a);
     const vk_subbuffer g_buf = sub(g, pc.offs_g);
     const vk_subbuffer c_buf = sub(c, pc.offs_c);
-    const vk_subbuffer d_buf = sub(add, pc.offs_d);
     pc.ne = (uint32_t)ggml_nelements(add);
     pc.g_one = ggml_nelements(g) == 1 ? 1u : 0u;
 
+    if (hc_post) {
+        const ggml_tensor * post = cgraph->nodes[node_idx + 3];
+        const vk_subbuffer r_buf = sub(post->src[1], pc.offs_r);
+        const vk_subbuffer p_buf = sub(post->src[2], pc.offs_p);
+        const vk_subbuffer d_buf = sub(post, pc.offs_d);
+        pc.hc = (uint32_t)post->src[1]->ne[1];
+        pc.param = ggml_get_op_params_f32(post, 1);
+        pc.param2 = ggml_get_op_params_f32(post, 2);
+        ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { a_buf, g_buf, c_buf, r_buf, p_buf, d_buf }, pc, { pc.ne, 1, 1 });
+        return;
+    }
+    const vk_subbuffer d_buf = sub(add, pc.offs_d);
     ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { a_buf, g_buf, c_buf, d_buf }, pc, { pc.ne, 1, 1 });
 }
 
@@ -11581,7 +11608,15 @@ static void ggml_vk_rms_norm(ggml_backend_vk_context * ctx, vk_context& subctx, 
 
     // the factor the plain norm's output is multiplied by: a fused SCALE's, otherwise one
     float out_scale = 1.0f;
-    if (ctx->fused_rms_norm_scale) {
+    // the source of the gate's SIGMOID, when the gate is fused
+    const ggml_tensor * gate = nullptr;
+    if (ctx->fused_rms_norm_gate) {
+        ggml_tensor * mul = cgraph->nodes[node_idx + 1];
+        dst = cgraph->nodes[node_idx + 3];
+        src0 = cgraph->nodes[node_idx]->src[0];
+        src1 = mul->src[0] == cgraph->nodes[node_idx] ? mul->src[1] : mul->src[0];
+        gate = cgraph->nodes[node_idx + 2]->src[0];
+    } else if (ctx->fused_rms_norm_scale) {
         dst = cgraph->nodes[node_idx + 1];
         src0 = src1 = cgraph->nodes[node_idx]->src[0];
         out_scale = ggml_get_op_params_f32(dst, 0);
@@ -11612,8 +11647,8 @@ static void ggml_vk_rms_norm(ggml_backend_vk_context * ctx, vk_context& subctx, 
         op_params[0], out_scale, (int32_t)param3,
     };
 
-    // more than one fused op means rms_norm+mul+rope
-    if (ctx->num_additional_fused_ops > 1) {
+    // more than one fused op means rms_norm+mul+rope, unless it is the gate
+    if (ctx->num_additional_fused_ops > 1 && !ctx->fused_rms_norm_gate) {
         static constexpr uint32_t max_tensors = 7;
         const ggml_tensor *tensors[max_tensors] {};
 
@@ -11685,7 +11720,7 @@ static void ggml_vk_rms_norm(ggml_backend_vk_context * ctx, vk_context& subctx, 
                 ggml_vk_subbuffer(ctx, buf[6], offset[6]),
             }, pc, elements);
     } else {
-        ggml_vk_op_f32<vk_op_binary_push_constants>(ctx, subctx, src0, src1, nullptr, nullptr, dst, GGML_OP_RMS_NORM, std::move(bin));
+        ggml_vk_op_f32<vk_op_binary_push_constants>(ctx, subctx, src0, src1, gate, nullptr, dst, GGML_OP_RMS_NORM, std::move(bin));
     }
 
     if (ctx->do_add_rms_partials_offset_calculation) {
@@ -13794,8 +13829,9 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
             ggml_vk_topk_moe(ctx, compute_ctx, cgraph, node_idx);
             break;
         }
-        if (ctx->num_additional_fused_ops == 2 && ggml_get_unary_op(node) == GGML_UNARY_OP_SIGMOID) {
-            ggml_vk_sigmoid_mul_add(ctx, compute_ctx, cgraph, node_idx);
+        if ((ctx->num_additional_fused_ops == 2 || ctx->num_additional_fused_ops == 3) &&
+                ggml_get_unary_op(node) == GGML_UNARY_OP_SIGMOID) {
+            ggml_vk_sigmoid_mul_add(ctx, compute_ctx, cgraph, node_idx, ctx->num_additional_fused_ops == 3);
             break;
         }
         if (ctx->num_additional_fused_ops == 1 && ggml_get_unary_op(node) == GGML_UNARY_OP_SIGMOID) {
@@ -16236,6 +16272,48 @@ static bool ggml_vk_can_fuse_sigmoid_mul_add(const struct ggml_cgraph * cgraph, 
            (ggml_nelements(g) == 1 || ggml_are_same_shape(g, mul));
 }
 
+// SIGMOID_MUL_ADD of one token whose sum is only the block output of the DSV4_HC_POST after it, with an identity comb
+// and a gate: the hyper-connection combine after the shared expert.
+static bool ggml_vk_can_fuse_sigmoid_mul_add_hc_post(const struct ggml_cgraph * cgraph, int node_idx) {
+    if (node_idx + 3 >= cgraph->n_nodes || !ggml_vk_can_fuse_sigmoid_mul_add(cgraph, node_idx)) {
+        return false;
+    }
+    const ggml_tensor * add  = cgraph->nodes[node_idx + 2];
+    const ggml_tensor * post = cgraph->nodes[node_idx + 3];
+    if (post->op != GGML_OP_DSV4_HC_POST || !(post->flags & GGML_TENSOR_FLAG_COMPUTE) || post->src[0] != add ||
+            post->src[3] != nullptr || ggml_get_op_params_i32(post, 0) == 0 ||
+            !ggml_node_has_n_uses(cgraph, node_idx + 2, 1) || (add->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+        return false;
+    }
+    const ggml_tensor * r = post->src[1];
+    const ggml_tensor * w = post->src[2];
+    const auto f32 = [](const ggml_tensor * t) { return t->type == GGML_TYPE_F32 && ggml_is_contiguous(t); };
+    if (!(f32(r) && f32(w) && f32(post) && ggml_nrows(add) == 1 &&
+          r->ne[0] == add->ne[0] && r->ne[2] == 1 && r->ne[3] == 1 && ggml_are_same_shape(r, post) &&
+          ggml_nelements(w) == r->ne[1])) {
+        return false;
+    }
+    // The output is hc times the sum's size, which the caller's overlap check cannot place, so it is checked here.
+    // It may start where the product's or the sum's other source starts: each invocation reads its element before it
+    // writes it, and the other streams lie past that source. Any other overlap is refused.
+    const ggml_tensor * mul = cgraph->nodes[node_idx + 1];
+    const ggml_tensor * a = mul->src[0];
+    const ggml_tensor * c = add->src[0] == mul ? add->src[1] : add->src[0];
+    const auto base = [](const ggml_tensor * t) { return vk_tensor_offset(t) + t->view_offs; };
+    for (const ggml_tensor * t : { a, c }) {
+        if (ggml_vk_tensors_overlap(t, post, false) && base(t) != base(post)) {
+            return false;
+        }
+    }
+    const ggml_tensor * g = cgraph->nodes[node_idx]->src[0];
+    for (const ggml_tensor * t : { g, r, w }) {
+        if (ggml_vk_tensors_overlap(t, post, false)) {
+            return false;
+        }
+    }
+    return true;
+}
+
 // A SIGMOID whose only use is the second source of the MUL after it: the MUL shader applies it. Unlike
 // ggml_can_fuse this lets the MUL broadcast the sigmoid, as the binary shader does with its second source.
 static bool ggml_vk_can_fuse_sigmoid_mul(const struct ggml_cgraph * cgraph, int node_idx) {
@@ -16253,6 +16331,45 @@ static bool ggml_vk_can_fuse_sigmoid_mul(const struct ggml_cgraph * cgraph, int 
            ggml_are_same_shape(mul->src[0], mul) && ggml_can_repeat(sig, mul) &&
            sig->src[0]->type == GGML_TYPE_F32 && sig->type == GGML_TYPE_F32 && ggml_is_contiguous(sig->src[0]) &&
            ggml_is_contiguous(sig) && mul->src[0]->type == GGML_TYPE_F32 && mul->type == GGML_TYPE_F32;
+}
+
+// RMS_NORM, the MUL by a weight row, a SIGMOID of a gate in the output's shape, and the MUL of the two: the gated
+// norm after a DeltaNet layer. The norm shader reads the gate's source and applies the sigmoid.
+static bool ggml_vk_can_fuse_rms_norm_mul_sigmoid_mul(ggml_backend_vk_context * ctx, const struct ggml_cgraph * cgraph,
+                                                      int node_idx) {
+    if (node_idx + 3 >= cgraph->n_nodes) {
+        return false;
+    }
+    const ggml_tensor * rms  = cgraph->nodes[node_idx];
+    const ggml_tensor * mul  = cgraph->nodes[node_idx + 1];
+    const ggml_tensor * sig  = cgraph->nodes[node_idx + 2];
+    const ggml_tensor * gmul = cgraph->nodes[node_idx + 3];
+    if (rms->op != GGML_OP_RMS_NORM || mul->op != GGML_OP_MUL || sig->op != GGML_OP_UNARY || gmul->op != GGML_OP_MUL ||
+            ggml_get_unary_op(sig) != GGML_UNARY_OP_SIGMOID) {
+        return false;
+    }
+    for (int k = 0; k < 4; ++k) {
+        const ggml_tensor * t = cgraph->nodes[node_idx + k];
+        if (!(t->flags & GGML_TENSOR_FLAG_COMPUTE) || (k < 3 && (t->flags & GGML_TENSOR_FLAG_OUTPUT)) ||
+                (k < 3 && !ggml_node_has_n_uses(cgraph, node_idx + k, 1))) {
+            return false;
+        }
+    }
+    if ((mul->src[0] == rms) == (mul->src[1] == rms) || gmul->src[0] != mul || gmul->src[1] != sig) {
+        return false;
+    }
+    const ggml_tensor * w = mul->src[0] == rms ? mul->src[1] : mul->src[0];
+    const ggml_tensor * g = sig->src[0];
+    // a norm after an ADD of one row may take the ADD's partial sums, a path without the gate
+    if (ggml_nrows(rms) == 1) {
+        return false;
+    }
+    const auto f32 = [](const ggml_tensor * t) { return t->type == GGML_TYPE_F32 && ggml_is_contiguous(t); };
+    // the shader applies the gate only where the weight row is as wide as the norm's rows
+    return f32(rms->src[0]) && f32(rms) && f32(mul) && f32(sig) && f32(gmul) && f32(g) && w->type == GGML_TYPE_F32 &&
+           w->ne[0] == rms->ne[0] && ggml_can_repeat(w, rms) &&
+           ggml_are_same_shape(rms, mul) && ggml_are_same_shape(g, mul) && ggml_are_same_shape(sig, gmul) &&
+           ggml_are_same_shape(mul, gmul) && get_misalign_bytes(ctx, g) == 0;
 }
 
 static bool ggml_vk_can_fuse_rms_norm_mul_rope(ggml_backend_vk_context * ctx, const struct ggml_cgraph * cgraph,
@@ -16765,10 +16882,13 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
         // the src is allowed to overlap the memory for the destination.
         // The array is sized to handle the largest fusion (asserted later).
         bool op_srcs_fused_elementwise[12];
+        // set when the fusion's detector checked its sources against its output itself
+        bool fused_overlap_checked = false;
 
         ctx->fused_topk_moe_mode = TOPK_MOE_COUNT;
         ctx->fused_topk_moe_scale = false;
         ctx->fused_rms_norm_scale = false;
+        ctx->fused_rms_norm_gate = false;
         const char *fusion_string {};
         // Decode expert graphs are a few mul_mat_id nodes. The fusion scan is
         // empty for them and was running on every layer of the token.
@@ -16818,6 +16938,12 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 op_srcs_fused_elementwise[0] = false;
                 op_srcs_fused_elementwise[1] = true;
                 op_srcs_fused_elementwise[2] = false;
+            } else if (ggml_vk_can_fuse_sigmoid_mul_add_hc_post(cgraph, i)) {
+                ctx->num_additional_fused_ops = 3;
+                fusion_string = "SIGMOID_MUL_ADD_HC_POST";
+                // the detector checked the overlaps
+                fused_overlap_checked = true;
+                std::fill_n(op_srcs_fused_elementwise, 4, false);
             } else if (ggml_vk_can_fuse_sigmoid_mul_add(cgraph, i)) {
                 ctx->num_additional_fused_ops = 2;
                 fusion_string = "SIGMOID_MUL_ADD";
@@ -16860,6 +16986,12 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 op_srcs_fused_elementwise[0] = false;
                 op_srcs_fused_elementwise[1] = true;
                 op_srcs_fused_elementwise[2] = true;
+            } else if (ggml_vk_can_fuse_rms_norm_mul_sigmoid_mul(ctx, cgraph, i)) {
+                ctx->num_additional_fused_ops = 3;
+                ctx->fused_rms_norm_gate = true;
+                fusion_string = "RMS_NORM_MUL_SIGMOID_MUL";
+                // as RMS_NORM_MUL: whole rows, one workgroup each; the gate is read where the output is written
+                std::fill_n(op_srcs_fused_elementwise, 4, true);
             } else if (ggml_vk_can_fuse(ctx, cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL })) {
                 ctx->num_additional_fused_ops = 1;
                 fusion_string = "RMS_NORM_MUL";
@@ -16955,7 +17087,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
             bool is_topk_moe_single_row = ctx->fused_topk_moe_mode != TOPK_MOE_COUNT &&
                                           ggml_nrows(cgraph->nodes[i]->src[0]) == 1;
 
-            if (!is_topk_moe_single_row) {
+            if (!is_topk_moe_single_row && !fused_overlap_checked) {
                 for (int j = 0; j < 2; ++j) {
                     ggml_tensor *dst = output_nodes[j];
                     if (!dst) {
@@ -16992,6 +17124,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 ctx->fused_topk_moe_mode = TOPK_MOE_COUNT;
                 ctx->fused_topk_moe_scale = false;
                 ctx->fused_rms_norm_scale = false;
+                ctx->fused_rms_norm_gate = false;
             }
         }
 
@@ -17528,10 +17661,14 @@ static void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * 
                 match_pattern(topk_moe_late_softmax, j)) {
                 continue;
             }
-            // Don't pull a SIGMOID away from the MUL after it that takes it, see SIGMOID_MUL
+            // Don't pull a SIGMOID away from the MUL after it that takes it, see SIGMOID_MUL. Unless the set ends with
+            // the RMS_NORM and MUL that MUL also takes, see RMS_NORM_MUL_SIGMOID_MUL.
             if (j + 1 < graph->n_nodes && graph->nodes[j]->op == GGML_OP_UNARY &&
                 ggml_get_unary_op(graph->nodes[j]) == GGML_UNARY_OP_SIGMOID &&
-                graph->nodes[j + 1]->op == GGML_OP_MUL && graph->nodes[j + 1]->src[1] == graph->nodes[j]) {
+                graph->nodes[j + 1]->op == GGML_OP_MUL && graph->nodes[j + 1]->src[1] == graph->nodes[j] &&
+                !(current_set.size() >= 2 && current_set.back() == j - 1 && current_set[current_set.size() - 2] == j - 2 &&
+                  graph->nodes[j - 2]->op == GGML_OP_RMS_NORM && graph->nodes[j - 1]->op == GGML_OP_MUL &&
+                  graph->nodes[j + 1]->src[0] == graph->nodes[j - 1])) {
                 continue;
             }
             bool ok = true;
@@ -17539,6 +17676,12 @@ static void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * 
                 if (!used[c] &&
                     is_src_of(graph->nodes[j], graph->nodes[c]) &&
                     !(j == c+1 && c == current_set.back() && graph->nodes[c]->op == GGML_OP_RMS_NORM && graph->nodes[j]->op == GGML_OP_MUL) &&
+                    // the gate MUL of RMS_NORM_MUL_SIGMOID_MUL, after the norm's MUL and the SIGMOID
+                    !(j == c+2 && current_set.size() >= 3 && current_set.back() == j-1 && current_set[current_set.size() - 2] == c &&
+                      current_set[current_set.size() - 3] == c-1 && graph->nodes[c-1]->op == GGML_OP_RMS_NORM &&
+                      graph->nodes[c]->op == GGML_OP_MUL && graph->nodes[j-1]->op == GGML_OP_UNARY &&
+                      ggml_get_unary_op(graph->nodes[j-1]) == GGML_UNARY_OP_SIGMOID && graph->nodes[j]->op == GGML_OP_MUL &&
+                      graph->nodes[j]->src[0] == graph->nodes[c] && graph->nodes[j]->src[1] == graph->nodes[j-1]) &&
                     !(j == c+1 && c == current_set.back() && graph->nodes[c]->op == GGML_OP_RMS_NORM && graph->nodes[j]->op == GGML_OP_SCALE) &&
                     !(j == c+1 && c == current_set.back() && graph->nodes[c]->op == GGML_OP_MUL_MAT && graph->nodes[j]->op == GGML_OP_SCALE &&
                       graph->nodes[j]->src[0] == graph->nodes[c]) &&
@@ -17556,6 +17699,13 @@ static void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * 
                     !(j == c+1 && c == current_set.back() && graph->nodes[c]->op == GGML_OP_UNARY && graph->nodes[j]->op == GGML_OP_MUL &&
                       ggml_get_unary_op(graph->nodes[c]) == GGML_UNARY_OP_SOFTPLUS && graph->nodes[j]->src[0] == graph->nodes[c]) &&
                     !(j == c+1 && c == current_set.back() && graph->nodes[c]->op == GGML_OP_MUL_MAT && graph->nodes[j]->op == GGML_OP_ADD) &&
+                    // the DSV4_HC_POST of SIGMOID_MUL_ADD_HC_POST
+                    !(j == c+1 && c == current_set.back() && c >= 2 && current_set.size() >= 3 &&
+                      current_set[current_set.size() - 2] == c-1 && current_set[current_set.size() - 3] == c-2 &&
+                      graph->nodes[c]->op == GGML_OP_ADD && graph->nodes[j]->op == GGML_OP_DSV4_HC_POST &&
+                      graph->nodes[j]->src[0] == graph->nodes[c] && graph->nodes[c-1]->op == GGML_OP_MUL &&
+                      graph->nodes[c-2]->op == GGML_OP_UNARY && ggml_get_unary_op(graph->nodes[c-2]) == GGML_UNARY_OP_SIGMOID &&
+                      graph->nodes[c-1]->src[1] == graph->nodes[c-2]) &&
                     !(j == c+1 && c == current_set.back() && graph->nodes[c]->op == GGML_OP_MUL_MAT_ID && graph->nodes[j]->op == GGML_OP_ADD_ID) &&
                     !(j == c+1 && c == current_set.back() && graph->nodes[c]->op == GGML_OP_MUL_MAT_ID && graph->nodes[j]->op == GGML_OP_MUL) &&
                     !(j == c+1 && c == current_set.back() && graph->nodes[c]->op == GGML_OP_ADD && graph->nodes[j]->op == GGML_OP_ADD)) {

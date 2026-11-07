@@ -29,6 +29,11 @@ layout (binding = 6) readonly buffer R_I {uvec2 rope_data_i[];}; // indices for 
 
 #endif
 
+#if RMS_NORM_SIGMOID_GATE
+// the source of a SIGMOID whose result multiplies the norm's output, in the output's shape
+layout (binding = 3) readonly buffer G {float data_g[];};
+#endif
+
 #extension GL_EXT_control_flow_attributes : enable
 #define BLOCK_SIZE 512
 
@@ -98,7 +103,14 @@ void rms_norm(uint num_iters) {
                 if (col >= ncols) {
                     continue;
                 }
+#if RMS_NORM_SIGMOID_GATE
+                // rounded as the separate norm, sigmoid and multiply are
+                precise float n = float(D_TYPE(scale * FLOAT_TYPE(data_a[a_offset + col]) * FLOAT_TYPE(data_b[b_offset + col])));
+                const float g = float(1. / (1 + exp(-1. * float(data_g[d_offset - get_doffset() + col]))));
+                data_d[d_offset + col] = D_TYPE(n * g);
+#else
                 data_d[d_offset + col] = D_TYPE(scale * FLOAT_TYPE(data_a[a_offset + col]) * FLOAT_TYPE(data_b[b_offset + col]));
+#endif
             }
         }
     } else {
