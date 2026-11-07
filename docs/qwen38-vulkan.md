@@ -110,6 +110,13 @@ published after the worker is done. These misses ignore the budget: they
 use the prompt batch buffer. On the 500-token cold prompt this took 7.8 s
 to 6.4 s.
 
+During decode the prompt's two ahead slots and its batch buffer (4.5 GB)
+are lent to the decode cache as overflow windows for the layers that have
+none (`[kimi_vk_decode] lend slots=1092 windows=39`). The next prompt
+entry takes them back before it touches them (`take_back`); experts the
+decode cache held there are dropped. The last 128 tokens of a 256-token
+completion went from 60.8 to 56.6 ms over six interleaved runs.
+
 An explicit `--ssd-vram-budget` is clamped to the memory still free after
 the dense model. `auto` uses that free room minus 128 MiB. Budget `0`
 leaves every expert on the CPU sink and is the baseline in the table.

@@ -142,6 +142,10 @@ size_t round_up(size_t value, size_t multiple) {
     return (value + multiple - 1) / multiple * multiple;
 }
 
+// Takes back the prompt buffers the decode cache borrowed (decode_cache::lend). Every prompt entry that touches the
+// ahead slots or the batch buffer calls it first, under the session's API lock.
+void decode_take_back(expert_session * session);
+
 void note_free(expert_session * session) {
     size_t free_bytes = 0, total = 0;
     ggml_backend_dev_memory(ggml_backend_get_device(session->backend), &free_bytes, &total);
@@ -454,6 +458,7 @@ bool expert_mul_mat_batch(void * raw, const ggml_vk_expert_matmul * items, int c
     auto * session = static_cast<expert_session *>(raw);
     std::unique_lock<std::mutex> lock;
     if (session) { lock = std::unique_lock<std::mutex>(session->api_mutex); }
+    if (session) { decode_take_back(session); }
     // The sink already published the finished slot. Joining here would wait for
     // the next layer's fill and then show that slot to this batch.
     if (session) { session->ahead_used = 0; }
@@ -494,6 +499,7 @@ bool expert_ahead(void * raw, const ggml_vk_expert_ahead * items, int count) {
     auto * session = static_cast<expert_session *>(raw);
     if (!session) { return false; }
     std::lock_guard<std::mutex> lock(session->api_mutex);
+    decode_take_back(session);
     // Once per prompt layer, after the scheduler has reserved this phase's graph.
     note_free(session);
     if (!items || count <= 0) {
@@ -914,6 +920,7 @@ bool expert_device_layer(void * raw, const ggml_tensor * activation, int32_t up_
         return false;
     }
     std::lock_guard<std::mutex> lock(session->api_mutex);
+    decode_take_back(session);
     if (!ggml_vk_tensor_on_device(activation) || activation->ne[0] != latent || activation->ne[1] < ntokens) {
         set_error(error, error_size, "vulkan device layer activation is not a device tensor");
         return false;
@@ -1248,6 +1255,7 @@ struct decode_cache {
     struct slab_rec {
         ggml_backend_buffer_t buffer = nullptr;
         int nslots = 0;
+        bool borrowed = false; // a prompt buffer (lend), freed by the session
     };
     struct layer_home {
         int begin = -1;
@@ -1388,6 +1396,9 @@ struct decode_cache {
     std::atomic<int> vulkan_busy{0};
     std::vector<built> graphs;
     std::vector<float> raw;
+    // Borrowed slabs start at lent_slab and their slots at lent_slot (-1: nothing lent).
+    int lent_slab = -1;
+    int lent_slot = -1;
 
     ~decode_cache() {
         {
@@ -1409,7 +1420,7 @@ struct decode_cache {
         inplace_pool.clear();
         active_inplace = -1;
         for (auto & slab : slabs) {
-            if (slab.buffer) { ggml_backend_buffer_free(slab.buffer); }
+            if (slab.buffer && !slab.borrowed) { ggml_backend_buffer_free(slab.buffer); }
         }
         for (auto & rec : imports) {
             if (rec.buffer) { ggml_backend_buffer_free(rec.buffer); }
@@ -1705,6 +1716,90 @@ struct decode_cache {
         std::fprintf(stderr, "[kimi_vk_decode] cache slots=%zu stride=%zu free_was=%zu windows=%d extra=%d\n",
                 slots.size(), k_stride, free_bytes, assigned, extra);
         return true;
+    }
+
+    // The prompt's two ahead slots and its batch buffer (4.5 GB) are idle while decode runs, and the cache is sized
+    // from the prompt's low point, which counts them. Their whole windows become overflow windows of layers that
+    // have none, so a layer's hot set past 28 experts stays on the device instead of the CPU walk. Lent at a decode
+    // token, taken back (decode_take_back) before a prompt touches them. Nothing is freed: an allocation made after
+    // a free, before the kernel had released the memory, landed in GTT.
+    void lend(expert_session * session) {
+        if (!live || lent_slab >= 0 || launched) { return; }
+        ggml_backend_buffer_t lendable[3] = { session->ahead_slots[0].buffer, session->ahead_slots[1].buffer,
+            session->batch_buffer };
+        if (!lendable[0] && !lendable[1] && !lendable[2]) { return; }
+        // Only this thread changes the homes.
+        std::vector<int> open;
+        for (int layer = 0; layer < int(homes.size()); ++layer) {
+            if (homes[size_t(layer)].begin >= 0 && homes[size_t(layer)].begin2 < 0) { open.push_back(layer); }
+        }
+        if (open.empty()) { return; }
+        session->join_ahead();
+        ggml_backend_synchronize(session->backend);
+        std::lock_guard<std::mutex> lock(mu);
+        const int first_slab = int(slabs.size()), first_slot = int(slots.size());
+        size_t next = 0;
+        for (ggml_backend_buffer_t buffer : lendable) {
+            if (!buffer || next >= open.size() || ggml_backend_buffer_get_type(buffer) != buft) { continue; }
+            const int windows = int(std::min<size_t>(ggml_backend_buffer_get_size(buffer) / (size_t(k_window) * k_stride),
+                    open.size() - next));
+            if (windows <= 0) { continue; }
+            slab_rec slab;
+            slab.buffer = buffer;
+            slab.nslots = windows * k_window;
+            slab.borrowed = true;
+            const int base = int(slots.size());
+            slots.resize(size_t(base + slab.nslots));
+            for (int i = 0; i < slab.nslots; ++i) {
+                slots[size_t(base + i)].slab = int(slabs.size());
+                slots[size_t(base + i)].offset = size_t(i) * k_stride;
+            }
+            for (int w = 0; w < windows; ++w) {
+                auto & home = homes[size_t(open[next++])];
+                home.begin2 = base + w * k_window;
+                home.slab2 = int(slabs.size());
+                home.base2 = w * k_window;
+            }
+            slabs.push_back(slab);
+        }
+        if (int(slabs.size()) == first_slab) { return; }
+        lent_slab = first_slab;
+        lent_slot = first_slot;
+        // The decode uploads overwrite whatever the prompt left there.
+        for (auto & ahead : session->ahead_slots) { ahead.at.clear(); ahead.bytes.clear(); }
+        session->ahead_at.clear();
+        session->ahead_bytes.clear();
+        std::fprintf(stderr, "[kimi_vk_decode] lend slots=%d windows=%zu\n", int(slots.size()) - first_slot, next);
+    }
+
+    void take_back(expert_session * session) {
+        if (lent_slab < 0) { return; }
+        // Uploads into a lent slot become visible here, not at the next decode token.
+        const int acquired = ggml_vk_decode_upload_acquire();
+        std::unique_lock<std::mutex> lock(mu);
+        idle_cv.wait(lock, [&] { return upload_busy.load(std::memory_order_acquire) == 0; });
+        for (int index : pending_ready) {
+            if (index < 0 || index >= int(slots.size()) || !slots[size_t(index)].busy) { continue; }
+            __atomic_store_n(&slots[size_t(index)].acquire_done, acquired ? 1 : -1, __ATOMIC_RELEASE);
+        }
+        pending_ready.clear();
+        for (auto it = jobs.begin(); it != jobs.end();) {
+            if (it->slot >= lent_slot) { fail_slot_locked(it->slot); it = jobs.erase(it); }
+            else { ++it; }
+        }
+        for (int i = lent_slot; i < int(slots.size()); ++i) {
+            if (slots[size_t(i)].key >= 0) { at.erase(slots[size_t(i)].key); }
+        }
+        for (auto & home : homes) {
+            if (home.begin2 >= lent_slot) { home.begin2 = -1; home.slab2 = -1; home.base2 = 0; }
+        }
+        slots.resize(size_t(lent_slot));
+        slabs.resize(size_t(lent_slab));
+        lent_slab = lent_slot = -1;
+        lock.unlock();
+        // The last decode token's work read these buffers.
+        ggml_backend_synchronize(session->backend);
+        std::fprintf(stderr, "[kimi_vk_decode] take_back\n");
     }
 
     // Each layer owns a run of windows. Ten hot experts then share one matmul
@@ -2387,6 +2482,10 @@ expert_session::~expert_session() {
     }
 }
 
+void decode_take_back(expert_session * session) {
+    if (session && session->decode) { session->decode->take_back(session); }
+}
+
 bool decode_prepare(void * raw, ggml_vk_decode_batch * batch) {
     auto * session = static_cast<expert_session *>(raw);
     if (!session || !batch || !batch->experts || !batch->ran || batch->n_experts < 1 || batch->n_experts > 1024 ||
@@ -2402,6 +2501,7 @@ bool decode_prepare(void * raw, ggml_vk_decode_batch * batch) {
     if (!session->decode || !session->decode->ensure(session)) { return false; }
     auto * cache = session->decode;
     if (cache->launched) { return false; }
+    cache->lend(session);
     // Once a token, while the compute queue is idle. Uploads from the previous
     // token become hits before this layer's plan. Doing it every layer put a
     // barrier in front of the dense sync.
