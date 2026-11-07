@@ -3545,6 +3545,48 @@ struct test_scale_silu : public test_case {
     }
 };
 
+// GGML_OP_RMS_NORM + GGML_OP_SCALE, which a backend may fuse
+struct test_rms_norm_scale : public test_case {
+    const std::array<int64_t, 4> ne;
+    const float scale;
+    const float bias;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "RMS_NORM_SCALE";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    std::string vars() override {
+        return VARS_TO_STR3(ne, scale, bias);
+    }
+
+    test_rms_norm_scale(std::array<int64_t, 4> ne = {128, 16, 1, 1}, float scale = 0.0883883f, float bias = 0.0f)
+        : ne(ne), scale(scale), bias(bias) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * a = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne.data());
+        ggml_tensor * b = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne.data());
+        ggml_set_name(a, "a");
+        ggml_set_name(b, "b");
+        // a chain of computed inputs, as a backend may fuse only in graphs of more than a few nodes
+        ggml_tensor * x = a;
+        for (int i = 0; i < 40; ++i) {
+            x = ggml_add(ctx, x, b);
+        }
+        ggml_tensor * out = ggml_scale_bias(ctx, ggml_rms_norm(ctx, x, 1e-6f), scale, bias);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            init_tensor_uniform(t, -0.1f, 0.1f);
+        }
+    }
+};
+
 struct test_rms_norm_mul_add : public test_case {
     const ggml_type type;
     const std::array<int64_t, 4> ne;
@@ -8531,6 +8573,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_rms_norm(GGML_TYPE_F32, {64, 5, 4, 3}, false, 1e-6f, true));
 
     test_cases.emplace_back(new test_scale_silu({ 320, 1, 1, 1 }, 0.25f, 0.0f));
+    test_cases.emplace_back(new test_rms_norm_scale({ 128, 16, 1, 1 }, 0.0883883f, 0.0f));
+    test_cases.emplace_back(new test_rms_norm_scale({ 1000, 7, 3, 2 }, -1.5f, 0.0f));
+    test_cases.emplace_back(new test_rms_norm_scale({ 64, 5, 4, 3 }, 2.0f, 0.5f)); // a bias: not fused
     test_cases.emplace_back(new test_scale_silu({ 1000, 7, 3, 2 }, -1.5f, 0.5f));
     test_cases.emplace_back(new test_scale_silu({ 64, 5, 4, 3 }, 2.0f, 0.0f));
 
