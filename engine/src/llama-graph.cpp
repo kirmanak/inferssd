@@ -1638,14 +1638,21 @@ llama_expert_gating_func_type gating_op,
     ggml_tensor * x = next_norm ? build_norm(ffn_inp, next_norm, nullptr, LLM_NORM_RMS, il) : ffn_inp;
     ggml_tensor * logits = build_lora_mm(next_gate_inp, x);
     ggml_prec_set_acc(logits, GGML_PREC_F32);
-    ggml_tensor * probs = nullptr;
     switch (gating_op) {
-        case LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX:       probs = ggml_soft_max(ctx0, logits); break;
-        case LLAMA_EXPERT_GATING_FUNC_TYPE_SIGMOID:       probs = ggml_sigmoid(ctx0, logits); break;
-        case LLAMA_EXPERT_GATING_FUNC_TYPE_SQRT_SOFTPLUS: probs = ggml_sqrt(ctx0, ggml_softplus(ctx0, logits)); break;
+        case LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX:
+        case LLAMA_EXPERT_GATING_FUNC_TYPE_SIGMOID:
+        case LLAMA_EXPERT_GATING_FUNC_TYPE_SQRT_SOFTPLUS: break;
         default: return nullptr; // the selection does not follow the logits alone
     }
+    // Each gating function is increasing, so without a bias the logits rank the experts as the probabilities do;
+    // on a GPU that is a dispatch or two a layer fewer.
+    ggml_tensor * probs = logits;
     if (next_exp_probs_b) {
+        switch (gating_op) {
+            case LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX: probs = ggml_soft_max(ctx0, logits); break;
+            case LLAMA_EXPERT_GATING_FUNC_TYPE_SIGMOID: probs = ggml_sigmoid(ctx0, logits); break;
+            default:                                    probs = ggml_sqrt(ctx0, ggml_softplus(ctx0, logits)); break;
+        }
         probs = ggml_add(ctx0, probs, next_exp_probs_b);
     }
     // every rank the next router selects: the sink reads the first GGML_KIMI_CPU_SINK_PREFETCH of them and keeps
