@@ -1,0 +1,89 @@
+#version 450
+
+#extension GL_EXT_control_flow_attributes : enable
+
+#include "types.glsl"
+
+// GGML_OP_LIGHTNING_INDEXER: res[kv, t] = sum_h w[h, t]*relu(q[:, h, t].k[:, kv]) + mask[kv, t]
+// A workgroup takes ROWS kv rows of one token, LANES invocations a row: each lane takes every LANES-th element of the
+// head dimension for up to H_CHUNK heads at a time, and the lanes' partial products are summed in shared memory.
+// Strides and offsets are in elements.
+#define LANES 32
+#define ROWS 8
+#define H_CHUNK 8
+
+layout(local_size_x = LANES*ROWS, local_size_y = 1, local_size_z = 1) in;
+
+layout (push_constant) uniform parameter
+{
+    uint hsk; uint nh; uint n_kv; uint n_tokens; uint nem3;
+    uint sq1; uint sq2; uint sq3;
+    uint sk2; uint sk3;
+    uint sw1; uint sw3;
+    uint sm1; uint sm3;
+    uint offs_q; uint offs_k; uint offs_w; uint offs_m; uint offs_d;
+} p;
+
+layout (binding = 0) readonly buffer Q {float data_q[];};
+layout (binding = 1) readonly buffer K {A_TYPE data_k[];};
+layout (binding = 2) readonly buffer W {float data_w[];};
+layout (binding = 3) readonly buffer M {float16_t data_m[];};
+layout (binding = 4) writeonly buffer D {float data_d[];};
+
+shared float red[H_CHUNK][LANES*ROWS];
+
+void main() {
+    const uint tid = gl_LocalInvocationID.x;
+    const uint lane = tid % LANES;
+    const uint row = gl_WorkGroupID.x*ROWS + tid / LANES;
+    const uint t = gl_WorkGroupID.y;
+    const uint s = gl_WorkGroupID.z;
+    const bool live = row < p.n_kv;
+
+    const uint q_base = p.offs_q + t*p.sq2 + s*p.sq3;
+    const uint k_base = p.offs_k + row*p.sk2 + s*p.sk3;
+    const uint w_base = p.offs_w + t*p.sw1 + s*p.sw3;
+
+    float score = 0.0;
+    for (uint h0 = 0; h0 < p.nh; h0 += H_CHUNK) {
+        const uint hn = min(uint(H_CHUNK), p.nh - h0);
+
+        float part[H_CHUNK];
+        [[unroll]] for (uint h = 0; h < H_CHUNK; ++h) {
+            part[h] = 0.0;
+        }
+        if (live) {
+            for (uint e = lane; e < p.hsk; e += LANES) {
+                const float kv = float(data_k[k_base + e]);
+                [[unroll]] for (uint h = 0; h < H_CHUNK; ++h) {
+                    if (h < hn) {
+                        part[h] += data_q[q_base + (h0 + h)*p.sq1 + e] * kv;
+                    }
+                }
+            }
+        }
+        [[unroll]] for (uint h = 0; h < H_CHUNK; ++h) {
+            red[h][tid] = part[h];
+        }
+        barrier();
+        [[unroll]] for (uint w = LANES/2; w > 0; w >>= 1) {
+            if (lane < w) {
+                [[unroll]] for (uint h = 0; h < H_CHUNK; ++h) {
+                    red[h][tid] += red[h][tid + w];
+                }
+            }
+            barrier();
+        }
+        if (live && lane == 0) {
+            for (uint h = 0; h < hn; ++h) {
+                score += max(red[h][tid], 0.0) * data_w[w_base + h0 + h];
+            }
+        }
+        barrier();
+    }
+
+    if (live && lane == 0) {
+        const float m = float(data_m[p.offs_m + row + t*p.sm1 + (s % p.nem3)*p.sm3]);
+        data_d[p.offs_d + row + t*p.n_kv + s*p.n_kv*p.n_tokens] = score + m;
+    }
+}

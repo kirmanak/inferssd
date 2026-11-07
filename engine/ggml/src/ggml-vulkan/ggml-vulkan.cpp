@@ -757,6 +757,7 @@ struct vk_device_struct {
     vk_pipeline pipeline_roll_f32;
     vk_pipeline pipeline_dsv4_hc_comb_f32, pipeline_dsv4_hc_pre_f32, pipeline_dsv4_hc_post_f32;
     vk_pipeline pipeline_top_k_mask_f16, pipeline_top_k_mask_f32;
+    vk_pipeline pipeline_lightning_indexer_f32, pipeline_lightning_indexer_f16;
     vk_pipeline pipeline_repeat_f32, pipeline_repeat_back_f32;
     vk_pipeline pipeline_cpy_f32_f32, pipeline_cpy_f32_f16, pipeline_cpy_f16_f16, pipeline_cpy_f16_f32, pipeline_cpy_f32_bf16, pipeline_cpy_f32_i32, pipeline_cpy_i32_f32;
     vk_pipeline pipeline_contig_cpy_f32_f32, pipeline_contig_cpy_f32_f16, pipeline_contig_cpy_f16_f16, pipeline_contig_cpy_f16_f32, pipeline_contig_cpy_f32_bf16, pipeline_contig_cpy_f32_i32, pipeline_contig_cpy_i32_f32;
@@ -1311,6 +1312,16 @@ struct vk_op_top_k_mask_push_constants {
     uint32_t offs_m, offs_k, offs_s, offs_b, offs_e, offs_d;
 };
 static_assert(sizeof(vk_op_top_k_mask_push_constants) <= 128, "the guaranteed push constant size");
+
+// GGML_OP_LIGHTNING_INDEXER: strides and offsets in elements; dst is contiguous
+struct vk_op_lightning_indexer_push_constants {
+    uint32_t hsk, nh, n_kv, n_tokens, nem3;
+    uint32_t sq1, sq2, sq3;
+    uint32_t sk2, sk3;
+    uint32_t sw1, sw3;
+    uint32_t sm1, sm3;
+    uint32_t offs_q, offs_k, offs_w, offs_m, offs_d;
+};
 
 struct vk_op_multi_add_push_constants {
     // shape for dst
@@ -4636,6 +4647,8 @@ static void ggml_vk_load_shaders(vk_device& device) {
     ggml_vk_create_pipeline(device, device->pipeline_dsv4_hc_post_f32, "dsv4_hc_post_f32", dsv4_hc_post_f32_len, dsv4_hc_post_f32_data, "main", 5, sizeof(vk_op_dsv4_hc_push_constants), {512, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_top_k_mask_f16, "top_k_mask_f16", top_k_mask_f16_len, top_k_mask_f16_data, "main", 6, sizeof(vk_op_top_k_mask_push_constants), {1, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_top_k_mask_f32, "top_k_mask_f32", top_k_mask_f32_len, top_k_mask_f32_data, "main", 6, sizeof(vk_op_top_k_mask_push_constants), {1, 1, 1}, {}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_lightning_indexer_f32, "lightning_indexer_f32", lightning_indexer_f32_len, lightning_indexer_f32_data, "main", 5, sizeof(vk_op_lightning_indexer_push_constants), {1, 1, 1}, {}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_lightning_indexer_f16, "lightning_indexer_f16", lightning_indexer_f16_len, lightning_indexer_f16_data, "main", 5, sizeof(vk_op_lightning_indexer_push_constants), {1, 1, 1}, {}, 1);
 
     ggml_vk_create_pipeline(device, device->pipeline_repeat_f32, "repeat_f32", repeat_f32_len, repeat_f32_data, "main", 2, sizeof(vk_op_unary_push_constants), {512, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_repeat_back_f32, "repeat_back_f32", repeat_back_f32_len, repeat_back_f32_data, "main", 2, sizeof(vk_op_unary_push_constants), {512, 1, 1}, {}, 1);
@@ -11204,6 +11217,45 @@ static void ggml_vk_top_k_mask(ggml_backend_vk_context * ctx, vk_context& subctx
         { (uint32_t)ggml_nrows(dst), 1, 1 });
 }
 
+// A workgroup per 8 kv rows of a token; see lightning_indexer.comp.
+static void ggml_vk_lightning_indexer(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_tensor * dst) {
+    const ggml_tensor * q = dst->src[0];
+    const ggml_tensor * k = dst->src[1];
+    const ggml_tensor * w = dst->src[2];
+    const ggml_tensor * m = dst->src[3];
+
+    vk_pipeline pipeline = k->type == GGML_TYPE_F16 ? ctx->device->pipeline_lightning_indexer_f16 : ctx->device->pipeline_lightning_indexer_f32;
+    ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
+
+    const auto sub = [&](const ggml_tensor * t, uint32_t & offs) {
+        const vk_subbuffer b = ggml_vk_tensor_subbuffer(ctx, t, true);
+        offs = (uint32_t)((b.size - ggml_nbytes(t)) / ggml_type_size(t->type));
+        return b;
+    };
+
+    vk_op_lightning_indexer_push_constants pc {};
+    const vk_subbuffer q_buf = sub(q, pc.offs_q);
+    const vk_subbuffer k_buf = sub(k, pc.offs_k);
+    const vk_subbuffer w_buf = sub(w, pc.offs_w);
+    const vk_subbuffer m_buf = sub(m, pc.offs_m);
+    const vk_subbuffer d_buf = sub(dst, pc.offs_d);
+
+    const size_t tk = ggml_type_size(k->type);
+    const size_t tm = ggml_type_size(m->type);
+    pc.hsk = (uint32_t)q->ne[0];
+    pc.nh = (uint32_t)q->ne[1];
+    pc.n_kv = (uint32_t)k->ne[2];
+    pc.n_tokens = (uint32_t)q->ne[2];
+    pc.nem3 = (uint32_t)m->ne[3];
+    pc.sq1 = (uint32_t)(q->nb[1]/sizeof(float)); pc.sq2 = (uint32_t)(q->nb[2]/sizeof(float)); pc.sq3 = (uint32_t)(q->nb[3]/sizeof(float));
+    pc.sk2 = (uint32_t)(k->nb[2]/tk); pc.sk3 = (uint32_t)(k->nb[3]/tk);
+    pc.sw1 = (uint32_t)(w->nb[1]/sizeof(float)); pc.sw3 = (uint32_t)(w->nb[3]/sizeof(float));
+    pc.sm1 = (uint32_t)(m->nb[1]/tm); pc.sm3 = (uint32_t)(m->nb[3]/tm);
+
+    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { q_buf, k_buf, w_buf, m_buf, d_buf }, pc,
+        { (uint32_t)((k->ne[2] + 7)/8), (uint32_t)q->ne[2], (uint32_t)q->ne[3] });
+}
+
 static void ggml_vk_roll(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, ggml_tensor * dst) {
     const int32_t s0 = ggml_get_op_params_i32(dst, 0);
     const int32_t s1 = ggml_get_op_params_i32(dst, 1);
@@ -13490,6 +13542,10 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
         break;
     case GGML_OP_TOP_K_MASK:
         ggml_vk_top_k_mask(ctx, compute_ctx, node);
+
+        break;
+    case GGML_OP_LIGHTNING_INDEXER:
+        ggml_vk_lightning_indexer(ctx, compute_ctx, node);
 
         break;
     case GGML_OP_CPY:
@@ -17683,6 +17739,20 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                     }
                 }
                 return true;
+            }
+        case GGML_OP_LIGHTNING_INDEXER:
+            {
+                // element strides throughout and a contiguous destination
+                const ggml_tensor * q = op->src[0];
+                const ggml_tensor * k = op->src[1];
+                const ggml_tensor * w = op->src[2];
+                const ggml_tensor * m = op->src[3];
+                const auto & lim = device->properties.limits.maxComputeWorkGroupCount;
+                return (k->type == GGML_TYPE_F32 || k->type == GGML_TYPE_F16) &&
+                    ggml_is_contiguous(op) && q->nb[0] == sizeof(float) && q->nb[1] % sizeof(float) == 0 &&
+                    k->nb[0] == ggml_type_size(k->type) && k->nb[2] % ggml_type_size(k->type) == 0 &&
+                    w->nb[0] == sizeof(float) && m->nb[0] == ggml_type_size(m->type) &&
+                    (k->ne[2] + 7)/8 <= (int64_t) lim[0] && q->ne[2] <= (int64_t) lim[1] && q->ne[3] <= (int64_t) lim[2];
             }
         case GGML_OP_DSV4_HC_PRE:
         case GGML_OP_DSV4_HC_POST:
