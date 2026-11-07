@@ -1010,11 +1010,11 @@ bool expert_device_layer(void * raw, const ggml_tensor * activation, int32_t up_
     for (int s = 0; s < nslots; ++s) {
         ggml_tensor * slot = ggml_new_tensor_2d(reduce, GGML_TYPE_F32, latent, ntokens);
         ggml_tensor * weights = ggml_new_tensor_2d(reduce, GGML_TYPE_F32, 1, ntokens);
-        ggml_tensor * repeated = slot && weights ? ggml_repeat(reduce, weights, slot) : nullptr;
-        ggml_tensor * scaled = slot && repeated ? ggml_mul(reduce, slot, repeated) : nullptr;
+        // MUL broadcasts the per-token weight over the row; a REPEAT first was half the reduce.
+        ggml_tensor * scaled = slot && weights ? ggml_mul(reduce, slot, weights) : nullptr;
         slot_tensors[size_t(s)] = slot;
         if (!scaled || !take_reduce(weights, slot_w[size_t(s)].data(), slot_w[size_t(s)].size() * sizeof(float)) ||
-                !take_reduce(repeated, nullptr, 0) || !take_reduce(scaled, nullptr, 0)) {
+                !take_reduce(scaled, nullptr, 0)) {
             ggml_free(reduce);
             set_error(error, error_size, "vulkan device layer reduce build failed");
             return false;
