@@ -3728,6 +3728,56 @@ struct test_sigmoid_mul_add : public test_case {
     }
 };
 
+// GGML_OP_MUL_MAT of one row + GGML_OP_SCALE + GGML_OP_UNARY(SILU), which a backend may fuse
+struct test_mul_mat_scale_silu : public test_case {
+    const ggml_type type_a;
+    const int64_t m;
+    const int64_t k;
+    const float scale;
+    const float bias;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "MUL_MAT_SCALE_SILU";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    std::string vars() override {
+        return VARS_TO_STR5(type_a, m, k, scale, bias);
+    }
+
+    double max_nmse_err() override {
+        return 5e-4;
+    }
+
+    test_mul_mat_scale_silu(ggml_type type_a = GGML_TYPE_Q8_0, int64_t m = 320, int64_t k = 10240,
+            float scale = 0.25f, float bias = 0.0f)
+        : type_a(type_a), m(m), k(k), scale(scale), bias(bias) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * w = ggml_new_tensor_2d(ctx, type_a, k, m);
+        ggml_tensor * x0 = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, 1);
+        ggml_tensor * d = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, 1);
+        ggml_set_name(w, "w");
+        // a computed input and a chain of nodes, as a backend may fuse only in graphs of more than a few nodes
+        ggml_tensor * x = x0;
+        for (int i = 0; i < 40; ++i) {
+            x = ggml_add(ctx, x, d);
+        }
+        x = ggml_neg(ctx, x);
+        ggml_tensor * out = ggml_silu(ctx, ggml_scale_bias(ctx, ggml_mul_mat(ctx, w, x), scale, bias));
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            init_tensor_uniform(t, -0.1f, 0.1f);
+        }
+    }
+};
+
 // GGML_OP_RMS_NORM + GGML_OP_SCALE, which a backend may fuse
 struct test_rms_norm_scale : public test_case {
     const std::array<int64_t, 4> ne;
@@ -8897,6 +8947,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_sigmoid_mul_add({ 2560, 1, 1, 1 }, { 1, 1, 1, 1 }, false));
     test_cases.emplace_back(new test_sigmoid_mul_add({ 2560, 1, 1, 1 }, { 1, 1, 1, 1 }, true));
     test_cases.emplace_back(new test_sigmoid_mul_add({ 1000, 7, 3, 1 }, { 1000, 7, 3, 1 }, false));
+    test_cases.emplace_back(new test_mul_mat_scale_silu(GGML_TYPE_Q8_0, 320, 10240, 0.25f, 0.0f));
+    test_cases.emplace_back(new test_mul_mat_scale_silu(GGML_TYPE_Q8_0, 7, 256, 2.0f, 0.5f));
+    test_cases.emplace_back(new test_mul_mat_scale_silu(GGML_TYPE_Q4_K, 320, 2560, 0.5f, 0.0f));
+    test_cases.emplace_back(new test_mul_mat_scale_silu(GGML_TYPE_F32, 64, 512, 1.5f, -0.25f));
     test_cases.emplace_back(new test_ssm_conv_silu({ 4, 8192, 1, 1 }, { 4, 8192, 1, 1 }));
     test_cases.emplace_back(new test_ssm_conv_silu({ 3 + 7, 8192, 2, 1 }, { 4, 8192, 1, 1 }));
     test_cases.emplace_back(new test_add_softplus_mul({ 48, 1, 1, 1 }));

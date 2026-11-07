@@ -1010,6 +1010,7 @@ struct vk_mat_mat_push_constants {
 #define MAT_VEC_FUSION_FLAGS_BIAS1 0x2
 #define MAT_VEC_FUSION_FLAGS_SCALE0 0x4
 #define MAT_VEC_FUSION_FLAGS_SCALE1 0x8
+#define MAT_VEC_FUSION_FLAGS_SCALE_SILU 0x10
 
 struct vk_mat_vec_push_constants {
     uint32_t ncols;
@@ -1025,6 +1026,9 @@ struct vk_mat_vec_push_constants {
     uint32_t ne12;
     uint32_t broadcast2;
     uint32_t broadcast3;
+    // MAT_VEC_FUSION_FLAGS_SCALE_SILU: the SCALE's factor and bias
+    float fuse_scale;
+    float fuse_bias;
 };
 
 struct vk_mat_vec_p021_push_constants {
@@ -8214,9 +8218,18 @@ static void ggml_vk_mul_mat_vec_q_f16(ggml_backend_vk_context * ctx, vk_context&
     }
 
     uint32_t fusion_flags = 0;
+    float fuse_scale = 0.0f;
+    float fuse_bias = 0.0f;
+    // MUL_MAT_SCALE_SILU: the product goes through the SCALE and the SILU after it
+    const bool scale_silu = ctx->num_additional_fused_ops == 2 && cgraph->nodes[node_idx + 1]->op == GGML_OP_SCALE;
+    if (scale_silu) {
+        fusion_flags |= MAT_VEC_FUSION_FLAGS_SCALE_SILU;
+        fuse_scale = ggml_get_op_params_f32(cgraph->nodes[node_idx + 1], 0);
+        fuse_bias = ggml_get_op_params_f32(cgraph->nodes[node_idx + 1], 1);
+    }
 
     vk_subbuffer d_F0 = d_D;
-    if (ctx->num_additional_fused_ops > 0) {
+    if (ctx->num_additional_fused_ops > 0 && !scale_silu) {
         const ggml_tensor * add = cgraph->nodes[node_idx + 1];
         const ggml_tensor * bias = add->src[0] == dst ? add->src[1] : add->src[0];
 
@@ -8225,7 +8238,7 @@ static void ggml_vk_mul_mat_vec_q_f16(ggml_backend_vk_context * ctx, vk_context&
     }
 
     vk_subbuffer d_F1 = d_D;
-    if (ctx->num_additional_fused_ops == 2) {
+    if (ctx->num_additional_fused_ops == 2 && !scale_silu) {
         const ggml_tensor * add = cgraph->nodes[node_idx + 2];
         const ggml_tensor * bias = add->src[0] == cgraph->nodes[node_idx + 1] ? add->src[1] : add->src[0];
 
@@ -8244,6 +8257,7 @@ static void ggml_vk_mul_mat_vec_q_f16(ggml_backend_vk_context * ctx, vk_context&
             stride_batch_x, stride_batch_y, stride_batch_d,
             fusion_flags, base_work_group_y,
             (uint32_t)ne02, (uint32_t)ne12, (uint32_t)r2, (uint32_t)r3,
+            fuse_scale, fuse_bias,
         };
         ggml_vk_dispatch_pipeline(ctx, subctx, dmmv,
                                   {
@@ -16117,6 +16131,29 @@ static bool ggml_vk_tensors_overlap(const ggml_tensor * a, const ggml_tensor * b
     return false;
 }
 
+// A one-row MUL_MAT that ggml_vk_mul_mat sends to ggml_vk_mul_mat_vec_q_f16, then a SCALE and a SILU of it: the mat-vec
+// shader scales the product and applies the SILU (MAT_VEC_FUSION_FLAGS_SCALE_SILU).
+static bool ggml_vk_can_fuse_mul_mat_scale_silu(const ggml_backend_vk_context * ctx, const struct ggml_cgraph * cgraph, int node_idx) {
+    if (!ggml_can_fuse(cgraph, node_idx, { GGML_OP_MUL_MAT, GGML_OP_SCALE, GGML_OP_UNARY })) {
+        return false;
+    }
+    const ggml_tensor * mm = cgraph->nodes[node_idx];
+    const ggml_tensor * scale = cgraph->nodes[node_idx + 1];
+    const ggml_tensor * silu = cgraph->nodes[node_idx + 2];
+    const ggml_tensor * src0 = mm->src[0];
+    const ggml_tensor * src1 = mm->src[1];
+    if (ggml_get_unary_op(silu) != GGML_UNARY_OP_SILU || scale->src[0] != mm || silu->src[0] != scale) {
+        return false;
+    }
+    const bool vec_type = src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16 || src0->type == GGML_TYPE_BF16 ||
+                          ggml_is_quantized(src0->type);
+    return vec_type && ggml_is_contiguous(src0) && ggml_nrows(mm) == 1 &&
+           ggml_nbytes(src0) <= ctx->device->properties.limits.maxStorageBufferRange &&
+           src1->type == GGML_TYPE_F32 && ggml_is_contiguous(src1) &&
+           mm->type == GGML_TYPE_F32 && scale->type == GGML_TYPE_F32 && silu->type == GGML_TYPE_F32 &&
+           ggml_is_contiguous(silu);
+}
+
 // SCALE into SILU: the SILU shader applies the scale and bias to its input itself.
 static bool ggml_vk_can_fuse_scale_silu(const struct ggml_cgraph * cgraph, int node_idx) {
     if (!ggml_can_fuse(cgraph, node_idx, { GGML_OP_SCALE, GGML_OP_UNARY })) {
@@ -16755,6 +16792,12 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
             } else if (ggml_vk_can_fuse(ctx, cgraph, i, { GGML_OP_MUL_MAT_ID, GGML_OP_ADD_ID, GGML_OP_MUL })) {
                 ctx->num_additional_fused_ops = 2;
                 fusion_string = "MUL_MAT_ID_ADD_ID_MUL";
+                op_srcs_fused_elementwise[0] = false;
+                op_srcs_fused_elementwise[1] = true;
+                op_srcs_fused_elementwise[2] = true;
+            } else if (ggml_vk_can_fuse_mul_mat_scale_silu(ctx, cgraph, i)) {
+                ctx->num_additional_fused_ops = 2;
+                fusion_string = "MUL_MAT_SCALE_SILU";
                 op_srcs_fused_elementwise[0] = false;
                 op_srcs_fused_elementwise[1] = true;
                 op_srcs_fused_elementwise[2] = true;
@@ -17497,6 +17540,8 @@ static void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * 
                     is_src_of(graph->nodes[j], graph->nodes[c]) &&
                     !(j == c+1 && c == current_set.back() && graph->nodes[c]->op == GGML_OP_RMS_NORM && graph->nodes[j]->op == GGML_OP_MUL) &&
                     !(j == c+1 && c == current_set.back() && graph->nodes[c]->op == GGML_OP_RMS_NORM && graph->nodes[j]->op == GGML_OP_SCALE) &&
+                    !(j == c+1 && c == current_set.back() && graph->nodes[c]->op == GGML_OP_MUL_MAT && graph->nodes[j]->op == GGML_OP_SCALE &&
+                      graph->nodes[j]->src[0] == graph->nodes[c]) &&
                     !(j == c+1 && c == current_set.back() && graph->nodes[c]->op == GGML_OP_SCALE && graph->nodes[j]->op == GGML_OP_UNARY &&
                       ggml_get_unary_op(graph->nodes[j]) == GGML_UNARY_OP_SILU && graph->nodes[j]->src[0] == graph->nodes[c]) &&
                     !(j == c+1 && c == current_set.back() && graph->nodes[c]->op == GGML_OP_UNARY && graph->nodes[j]->op == GGML_OP_MUL &&

@@ -4,6 +4,8 @@
 #define MAT_VEC_FUSION_FLAGS_BIAS1 0x2
 #define MAT_VEC_FUSION_FLAGS_SCALE0 0x4
 #define MAT_VEC_FUSION_FLAGS_SCALE1 0x8
+// a SCALE (fuse_scale, fuse_bias) and a SILU of the product, computed as silu.comp computes a fused SCALE_SILU
+#define MAT_VEC_FUSION_FLAGS_SCALE_SILU 0x10
 
 layout (binding = 0) readonly buffer A {A_TYPE data_a[];};
 #if defined(A_TYPEV4)

@@ -37,6 +37,8 @@ layout (push_constant) uniform parameter
     uint ne12;
     uint broadcast2;
     uint broadcast3;
+    float fuse_scale;
+    float fuse_bias;
 #endif
 } p;
 
@@ -86,6 +88,17 @@ void get_offsets(out uint a_offset, out uint b_offset, out uint d_offset) {
 #endif
 }
 
+#ifndef MUL_MAT_ID
+// MAT_VEC_FUSION_FLAGS_SCALE_SILU: the stored product, scaled and through a SILU as silu.comp does
+FLOAT_TYPE mmv_fuse_scale_silu(const FLOAT_TYPE v) {
+    if ((p.fusion_flags & MAT_VEC_FUSION_FLAGS_SCALE_SILU) == 0) {
+        return v;
+    }
+    const float xi = float(D_TYPE(v)) * p.fuse_scale + p.fuse_bias;
+    return FLOAT_TYPE(xi / (1.0f + exp(-xi)));
+}
+#endif
+
 layout (constant_id = 0) const uint BLOCK_SIZE = 32;
 layout (constant_id = 1) const uint NUM_ROWS = 1;
 layout (constant_id = 2) const uint NUM_COLS = 1;
@@ -120,6 +133,7 @@ void reduce_result(inout FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], const in uint32_t 
                 if ((p.fusion_flags & MAT_VEC_FUSION_FLAGS_BIAS1) != 0) {
                     temp[j][n] += FLOAT_TYPE(data_fuse1[j*p.batch_stride_d + d_offset + first_row + n]);
                 }
+                temp[j][n] = mmv_fuse_scale_silu(temp[j][n]);
 #endif
                 data_d[j*p.batch_stride_d + d_offset + first_row + n] = D_TYPE(temp[j][n]);
             }
@@ -175,6 +189,7 @@ void reduce_result(FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], const in uint32_t d_offs
                 if ((p.fusion_flags & MAT_VEC_FUSION_FLAGS_BIAS1) != 0) {
                     temp[j][n] += FLOAT_TYPE(data_fuse1[j*p.batch_stride_d + d_offset + first_row + n]);
                 }
+                temp[j][n] = mmv_fuse_scale_silu(temp[j][n]);
 #endif
                 data_d[j*p.batch_stride_d + d_offset + first_row + n] = D_TYPE(temp[j][n]);
             }
@@ -220,6 +235,7 @@ void reduce_result(FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], const in uint32_t d_offs
                 if ((p.fusion_flags & MAT_VEC_FUSION_FLAGS_BIAS1) != 0) {
                     tmpsh[j][n][0] += FLOAT_TYPE(data_fuse1[j*p.batch_stride_d + d_offset + first_row + n]);
                 }
+                tmpsh[j][n][0] = mmv_fuse_scale_silu(tmpsh[j][n][0]);
 #endif
                 data_d[j*p.batch_stride_d + d_offset + first_row + n] = D_TYPE(tmpsh[j][n][0]);
             }
