@@ -6350,6 +6350,13 @@ static vk_pipeline ggml_vk_get_dequantize_mul_mat_vec(ggml_backend_vk_context * 
 
     // heuristic to choose workgroup size
     uint32_t dmmv_wg = DMMV_WG_SIZE_SUBGROUP;
+    if (ctx->device->architecture == vk_device_architecture::AMD_RDNA3 &&
+            ((m <= 8192 && k >= 4096) || (m <= 64 && k >= 1024))) {
+        // RDNA3 and RDNA4 (one class here): a long row or a handful of rows leaves the subgroup-sized workgroups too
+        // few to fill the card. A decode token's 4x10240 f32, 320x10240 and 2560x6144 q8_0 products took 11, 12.5 and
+        // 37 us that way and 6.4, 11.5 and 33 us with the large workgroup; 640x2560 got slower with it.
+        dmmv_wg = DMMV_WG_SIZE_LARGE;
+    }
     if ((ctx->device->vendor_id == VK_VENDOR_ID_NVIDIA && ctx->device->architecture != vk_device_architecture::NVIDIA_PRE_TURING) || ctx->device->vendor_id == VK_VENDOR_ID_INTEL) {
         // Prefer larger workgroups when M is small, to spread the work out more
         // and keep more SMs busy.
