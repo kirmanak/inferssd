@@ -838,6 +838,8 @@ struct ggml_backend_sched {
     bool op_offload;
     const struct ggml_backend_sched_ssd_hooks * ssd_hooks;
     void * ssd_userdata;
+    // a one-token decode ubatch, see ggml_backend_sched_kimi_set_dense_decode
+    bool kimi_dense_decode;
 
     int debug;
     char (* debug_causes)[64];
@@ -1750,8 +1752,10 @@ void ggml_backend_sched_kimi_set_profile_phase(ggml_backend_sched_t sched, int p
     if (sched && sched->ssd_hooks) { sched->ssd_hooks->phase(sched->ssd_userdata, phase); }
 }
 
+// The dense layout is the same in both phases. The decode park is not: a one-token ubatch of a prompt-phase call
+// takes the CPU sink's prompt route, and parked splits there gave a chunk-1 KLD of 0.10 against 0.008.
 void ggml_backend_sched_kimi_set_dense_decode(ggml_backend_sched_t sched, bool decode) {
-    (void) sched; (void) decode; // The supported dense layout applies to both phases.
+    if (sched) { sched->kimi_dense_decode = decode; }
 }
 
 void ggml_backend_sched_kimi_copy_stats_get(ggml_backend_sched_t sched,
@@ -1866,7 +1870,9 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         return nbatch;
     };
     auto lookup_park = [&](ggml_backend_t backend) {
-        if (park.looked || !backend || !ggml_backend_sched_single_token_input(sched->graph)) { return; }
+        if (park.looked || !backend || !sched->kimi_dense_decode || !ggml_backend_sched_single_token_input(sched->graph)) {
+            return;
+        }
         // The CPU backend has no Vulkan park hooks. Latching here left every
         // later lookup as a no-op and the dense record fell back into gpu_us.
         if (ggml_backend_dev_type(ggml_backend_get_device(backend)) != GGML_BACKEND_DEVICE_TYPE_GPU) {
@@ -2283,6 +2289,7 @@ ggml_backend_sched_t ggml_backend_sched_new(
     sched->debug_realloc = GGML_SCHED_DEBUG_REALLOC ? atoi(GGML_SCHED_DEBUG_REALLOC) : sched->debug_realloc;
 
     sched->auto_reserve = true;
+    sched->kimi_dense_decode = true;
     sched->n_backends = n_backends;
     sched->n_copies = parallel ? GGML_SCHED_MAX_COPIES : 1;
 

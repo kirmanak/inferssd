@@ -1739,10 +1739,12 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         cpu_sink_multi_token_reported = true;
     }
 
+    // a one-token ubatch the CPU sink takes on its prompt route is not a decode for the scheduler's park
     ggml_backend_sched_kimi_set_dense_decode(
         sched.get(),
-        !dense_gpu_phase_gate_enabled ||
-            (!dense_gpu_prefill_phase_active && ubatch.n_seq_tokens == 1));
+        (!dense_gpu_phase_gate_enabled ||
+            (!dense_gpu_prefill_phase_active && ubatch.n_seq_tokens == 1)) &&
+        (!cpu_sink_enabled || cpu_sink_decode_active));
 
     auto * res = gf_res_prev.get();
     auto * gf  = res->get_gf();
