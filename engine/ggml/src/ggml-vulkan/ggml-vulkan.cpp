@@ -2084,6 +2084,11 @@ struct ggml_backend_vk_context {
         // from another backend, which ggml_vk_park_submit_early submits while that backend computes it.
         vk_command_buffer * cmd_early = nullptr;
         bool early_submitted = false;
+        // The next CPU split's reads from this record, copied at its end, see ggml_vk_park_take_reads.
+        vk_buffer read_staging;
+        std::vector<const ggml_tensor *> read_srcs;
+        std::vector<size_t> read_sizes;
+        bool reads_recorded = false;
         std::vector<vk::DescriptorPool> pools;
         std::vector<vk::DescriptorSet> sets;
         uint32_t set_idx = 0;
@@ -2096,6 +2101,10 @@ struct ggml_backend_vk_context {
     std::vector<const ggml_tensor *> park_late;
     std::vector<const ggml_tensor *> park_late_src;
     bool park_folded = false;
+    // the reads for the next record (ggml_vk_park_reads), and the submitted park that holds the last ones
+    std::vector<const ggml_tensor *> park_reads_srcs;
+    std::vector<size_t> park_reads_sizes;
+    int park_reads_slot = -1;
     int park_slot = -1;
     int park_ready = -1;
     bool park_mode = false;
@@ -13479,6 +13488,47 @@ static void ggml_vk_compute_forward(ggml_backend_vk_context* ctx, ggml_cgraph * 
 // Expert outputs are a few dozen kilobytes. A second submit and fence after the
 // shaders had already been waited on was about 3 ms/token. The copy belongs in
 // this command buffer, after the dispatches, so the existing fence covers it.
+static bool ggml_backend_buffer_is_vk(ggml_backend_buffer_t buffer);
+
+// The parked record's end: copy the next CPU split's reads into the slot's host staging, as read_batch lays them out.
+static void ggml_vk_record_park_reads(ggml_backend_vk_context * ctx, vk_context & compute_ctx) {
+    if (!ctx || ctx->park_reads_srcs.empty() || ctx->park_slot < 0 || !compute_ctx || !compute_ctx->s) {
+        return;
+    }
+    auto & park = ctx->parks[ctx->park_slot];
+    std::vector<vk::BufferCopy> regions;
+    std::vector<vk::Buffer> buffers;
+    size_t cursor = 0;
+    for (size_t i = 0; i < ctx->park_reads_srcs.size(); ++i) {
+        const ggml_tensor * t = ctx->park_reads_srcs[i];
+        if (!t || !t->buffer || !ggml_backend_buffer_is_vk(t->buffer)) { return; }
+        auto * buf_ctx = static_cast<ggml_backend_vk_buffer_context *>(t->buffer->context);
+        if (!buf_ctx || !buf_ctx->dev_buffer || buf_ctx->dev_buffer->device != ctx->device) { return; }
+        cursor = (cursor + 3u) & ~size_t(3);
+        regions.push_back({ vk_tensor_offset(t) + t->view_offs, cursor, ctx->park_reads_sizes[i] });
+        buffers.push_back(buf_ctx->dev_buffer->buffer);
+        cursor += ctx->park_reads_sizes[i];
+    }
+    if (!park.read_staging || !park.read_staging->ptr || park.read_staging->size < cursor) {
+        ggml_vk_destroy_buffer(park.read_staging);
+        park.read_staging = ggml_vk_create_buffer_check(ctx->device, std::max(cursor, size_t(64 * 1024)),
+                vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent | vk::MemoryPropertyFlagBits::eHostCached,
+                vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent);
+    }
+    if (!park.read_staging || !park.read_staging->ptr) { return; }
+    vk::CommandBuffer cmd = compute_ctx->s->buffer->buf;
+    ggml_vk_sync_buffers(ctx, compute_ctx);
+    for (size_t i = 0; i < regions.size(); ++i) {
+        cmd.copyBuffer(buffers[i], park.read_staging->buffer, regions[i]);
+    }
+    vk::BufferMemoryBarrier host{ vk::AccessFlagBits::eTransferWrite, vk::AccessFlagBits::eHostRead,
+            VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED, park.read_staging->buffer, 0, VK_WHOLE_SIZE };
+    cmd.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer, vk::PipelineStageFlagBits::eHost, {}, nullptr, host, nullptr);
+    park.read_srcs = ctx->park_reads_srcs;
+    park.read_sizes = ctx->park_reads_sizes;
+    park.reads_recorded = true;
+}
+
 static void ggml_vk_record_suffix_reads(ggml_backend_vk_context * ctx, vk_context & compute_ctx) {
     if (!ctx || ctx->suffix_reads.empty() || !compute_ctx || !compute_ctx->s || !ctx->suffix_staging) {
         return;
@@ -14061,6 +14111,8 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
         // to be submitted.
         if (last_node && !ctx->park_mode) {
             ggml_vk_record_suffix_reads(ctx, compute_ctx);
+        } else if (last_node) {
+            ggml_vk_record_park_reads(ctx, compute_ctx);
         }
         ggml_vk_ctx_end(compute_ctx);
         if (ctx->park_mode) {
@@ -14186,6 +14238,9 @@ static void ggml_vk_cleanup(ggml_backend_vk_context * ctx) {
     ggml_vk_destroy_buffer(ctx->prealloc_add_rms_partials);
     ggml_vk_destroy_buffer(ctx->sync_staging);
     ggml_vk_destroy_buffer(ctx->suffix_staging);
+    for (auto & park : ctx->parks) {
+        ggml_vk_destroy_buffer(park.read_staging);
+    }
 
     ctx->prealloc_y_last_pipeline_used = nullptr;
 
@@ -16737,6 +16792,10 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
         vk_instance.pfn_vkQueueBeginDebugUtilsLabelEXT(ctx->device->compute_queue.queue, reinterpret_cast<VkDebugUtilsLabelEXT*>(&dul));
     }
 
+    if (!ctx->park_mode) {
+        // GPU work after the last park: its reads may be stale
+        ctx->park_reads_slot = -1;
+    }
     ctx->prealloc_size_add_rms_partials_offset = 0;
     ctx->do_add_rms_partials = false;
     ctx->do_add_rms_partials_offset_calculation = false;
@@ -17516,6 +17575,9 @@ static void ggml_vk_park_reset_slot(ggml_backend_vk_context::decode_park & slot)
         slot.cmd_early = nullptr;
     }
     slot.early_submitted = false;
+    slot.reads_recorded = false;
+    slot.read_srcs.clear();
+    slot.read_sizes.clear();
     slot.held.reset();
     slot.recorded = false;
     slot.set_idx = 0;
@@ -17544,6 +17606,8 @@ extern "C" bool ggml_vk_park_record_late(ggml_backend_t backend, ggml_cgraph * g
     }
     const bool ok = ggml_vk_park_record(backend, graph);
     if (ctx) {
+        ctx->park_reads_srcs.clear();
+        ctx->park_reads_sizes.clear();
         if (ok && folded) { *folded = ctx->park_folded; }
         ctx->park_late.clear();
         ctx->park_late_src.clear();
@@ -17665,6 +17729,7 @@ extern "C" bool ggml_vk_park_submit(ggml_backend_t backend) {
     for (auto & mem : park.held->in_memcpys) { memcpy(mem.dst, mem.src, mem.n); }
     ggml_vk_submit(park.held, {});
     ctx->submit_pending = true;
+    ctx->park_reads_slot = park.reads_recorded ? ctx->park_ready : -1;
     park.in_flight = true;
     park.recorded = false;
     ctx->park_ready = -1;
@@ -17689,6 +17754,45 @@ extern "C" bool ggml_vk_park_submit_early(ggml_backend_t backend) {
     park.held->seqs = std::move(rest);
     park.early_submitted = true;
     ctx->submit_pending = true;
+    return true;
+}
+
+// The next CPU split's reads for the next park record; n == 0 records none.
+extern "C" void ggml_vk_park_reads(ggml_backend_t backend, const ggml_tensor * const * srcs, const size_t * sizes, int n) {
+    if (!backend) { return; }
+    auto * ctx = static_cast<ggml_backend_vk_context *>(backend->context);
+    if (!ctx) { return; }
+    static const bool off = getenv("INFERSSD_NO_PARK_READS") != nullptr;
+    ctx->park_reads_srcs.clear();
+    ctx->park_reads_sizes.clear();
+    if (off || !srcs || !sizes || n <= 0) { return; }
+    ctx->park_reads_srcs.assign(srcs, srcs + n);
+    ctx->park_reads_sizes.assign(sizes, sizes + n);
+}
+
+// After the caller has synchronized the backend: the reads the last submitted park copied at its end, if they are
+// these. Otherwise false, and the caller reads them itself.
+extern "C" bool ggml_vk_park_take_reads(ggml_backend_t backend, const ggml_tensor * const * srcs, void * const * dsts,
+                                        const size_t * sizes, int n) {
+    if (!backend || !srcs || !dsts || !sizes || n <= 0) { return false; }
+    std::lock_guard<std::recursive_mutex> compute_lock(vk_compute_mutex);
+    auto * ctx = static_cast<ggml_backend_vk_context *>(backend->context);
+    if (!ctx || ctx->park_reads_slot < 0) { return false; }
+    auto & park = ctx->parks[ctx->park_reads_slot];
+    ctx->park_reads_slot = -1;
+    if (!park.reads_recorded || !park.read_staging || !park.read_staging->ptr || park.read_srcs.size() != size_t(n)) {
+        return false;
+    }
+    for (int i = 0; i < n; ++i) {
+        if (park.read_srcs[size_t(i)] != srcs[i] || park.read_sizes[size_t(i)] != sizes[i] || !dsts[i]) { return false; }
+    }
+    size_t cursor = 0;
+    for (int i = 0; i < n; ++i) {
+        cursor = (cursor + 3u) & ~size_t(3);
+        std::memcpy(dsts[i], static_cast<const uint8_t *>(park.read_staging->ptr) + cursor, sizes[i]);
+        cursor += sizes[i];
+    }
+    park.reads_recorded = false;
     return true;
 }
 
@@ -19060,6 +19164,12 @@ static void * ggml_backend_vk_reg_get_proc_address(ggml_backend_reg_t reg, const
     }
     if (name && strcmp(name, "ggml_vk_park_submit_early") == 0) {
         return (void *) ggml_vk_park_submit_early;
+    }
+    if (name && strcmp(name, "ggml_vk_park_reads") == 0) {
+        return (void *) ggml_vk_park_reads;
+    }
+    if (name && strcmp(name, "ggml_vk_park_take_reads") == 0) {
+        return (void *) ggml_vk_park_take_reads;
     }
     if (name && strcmp(name, "ggml_vk_park_drop") == 0) {
         return (void *) ggml_vk_park_drop;

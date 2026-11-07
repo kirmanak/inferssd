@@ -1821,6 +1821,8 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         bool (*early)(ggml_backend_t) = nullptr;
         bool (*record_late)(ggml_backend_t, ggml_cgraph *, const ggml_tensor * const *, const ggml_tensor * const *, int,
                 bool *) = nullptr;
+        void (*reads)(ggml_backend_t, const ggml_tensor * const *, const size_t *, int) = nullptr;
+        bool (*take_reads)(ggml_backend_t, const ggml_tensor * const *, void * const *, const size_t *, int) = nullptr;
         bool enabled = false;
         bool looked = false;
     } park;
@@ -1829,6 +1831,40 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
     // the parked record copies its inputs from other backends itself, see ggml_vk_park_record_late
     bool parked_folded = false;
     bool (*read_batch)(const ggml_tensor * const *, void **, const size_t *, int) = nullptr;
+    // The GPU tensors a CPU split reads, as one batch: what read_batch copies.
+    auto collect_reads = [&](const ggml_backend_sched_split * sp, const ggml_tensor ** srcs, void ** dsts, size_t * sizes,
+                             int * ids, ggml_backend_t & producer, bool & one_producer) -> int {
+        int nbatch = 0;
+        for (int input_id = 0; input_id < sp->n_inputs; ++input_id) {
+            ggml_tensor * input = sp->inputs[input_id];
+            if (!input || (input->flags & GGML_TENSOR_FLAG_INPUT)) { continue; }
+            if (ggml_backend_sched_drive_home(sched, input)) { continue; }
+            if (input->buffer && ggml_backend_buffer_is_host(input->buffer) &&
+                    ggml_backend_buffer_get_usage(input->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS) {
+                continue;
+            }
+            ggml_backend_t input_backend = ggml_backend_sched_get_tensor_backend(sched, input);
+            if (!input_backend ||
+                    ggml_backend_dev_type(ggml_backend_get_device(input_backend)) != GGML_BACKEND_DEVICE_TYPE_GPU) {
+                continue;
+            }
+            ggml_tensor * input_cpy = tensor_copy(input, sp->backend_id, sched->cur_copy);
+            if (!input_cpy || !input_cpy->data || !input_cpy->buffer ||
+                    !ggml_backend_buffer_is_host(input_cpy->buffer)) {
+                continue;
+            }
+            const size_t n = ggml_nbytes(input);
+            if (n == 0) { continue; }
+            if (producer && producer != input_backend) { one_producer = false; }
+            producer = input_backend;
+            srcs[nbatch] = input;
+            dsts[nbatch] = input_cpy->data;
+            sizes[nbatch] = n;
+            ids[nbatch] = input_id;
+            ++nbatch;
+        }
+        return nbatch;
+    };
     auto lookup_park = [&](ggml_backend_t backend) {
         if (park.looked || !backend || !ggml_backend_sched_single_token_input(sched->graph)) { return; }
         // The CPU backend has no Vulkan park hooks. Latching here left every
@@ -1847,6 +1883,10 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         park.early = (bool (*)(ggml_backend_t)) ggml_backend_reg_get_proc_address(reg, "ggml_vk_park_submit_early");
         park.record_late = (bool (*)(ggml_backend_t, ggml_cgraph *, const ggml_tensor * const *,
                 const ggml_tensor * const *, int, bool *)) ggml_backend_reg_get_proc_address(reg, "ggml_vk_park_record_late");
+        park.reads = (void (*)(ggml_backend_t, const ggml_tensor * const *, const size_t *, int))
+                ggml_backend_reg_get_proc_address(reg, "ggml_vk_park_reads");
+        park.take_reads = (bool (*)(ggml_backend_t, const ggml_tensor * const *, void * const *, const size_t *, int))
+                ggml_backend_reg_get_proc_address(reg, "ggml_vk_park_take_reads");
         park.enabled = park.record && park.submit && park.drop;
         read_batch = (bool (*)(const ggml_tensor * const *, void **, const size_t *, int))
                 ggml_backend_reg_get_proc_address(reg, "ggml_vk_read_batch");
@@ -1870,35 +1910,8 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             size_t nbytes = 0;
             ggml_backend_t producer = nullptr;
             bool one_producer = true;
-            for (int input_id = 0; input_id < split->n_inputs; ++input_id) {
-                ggml_tensor * input = split->inputs[input_id];
-                if (!input || (input->flags & GGML_TENSOR_FLAG_INPUT)) { continue; }
-                if (ggml_backend_sched_drive_home(sched, input)) { continue; }
-                if (input->buffer && ggml_backend_buffer_is_host(input->buffer) &&
-                        ggml_backend_buffer_get_usage(input->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS) {
-                    continue;
-                }
-                ggml_backend_t input_backend = ggml_backend_sched_get_tensor_backend(sched, input);
-                if (!input_backend ||
-                        ggml_backend_dev_type(ggml_backend_get_device(input_backend)) != GGML_BACKEND_DEVICE_TYPE_GPU) {
-                    continue;
-                }
-                ggml_tensor * input_cpy = tensor_copy(input, split_backend_id, sched->cur_copy);
-                if (!input_cpy || !input_cpy->data || !input_cpy->buffer ||
-                        !ggml_backend_buffer_is_host(input_cpy->buffer)) {
-                    continue;
-                }
-                const size_t n = ggml_nbytes(input);
-                if (n == 0) { continue; }
-                if (producer && producer != input_backend) { one_producer = false; }
-                producer = input_backend;
-                srcs[nbatch] = input;
-                dsts[nbatch] = input_cpy->data;
-                sizes[nbatch] = n;
-                ids[nbatch] = input_id;
-                nbytes += n;
-                ++nbatch;
-            }
+            nbatch = collect_reads(split, srcs, dsts, sizes, ids, producer, one_producer);
+            for (int i = 0; i < nbatch; ++i) { nbytes += sizes[i]; }
             static int copy_logged = 0;
             if (one_producer && nbatch > 1 && producer) {
                 if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
@@ -1925,7 +1938,9 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                 if (vk_upload_window) { vk_upload_window(0); }
                 const double sync_us = (double) (ggml_time_us() - sync_t0);
                 const int64_t batch_t0 = ggml_time_us();
-                const bool batched = read_batch(srcs, dsts, sizes, nbatch);
+                // The parked record that produced these copied them at its end; that copy is done by now.
+                const bool batched = (park.take_reads && park.take_reads(producer, srcs, dsts, sizes, nbatch)) ||
+                    read_batch(srcs, dsts, sizes, nbatch);
                 const double batch_us = (double) (ggml_time_us() - batch_t0);
                 if (copy_logged < 6) {
                     std::fprintf(stderr, "[kimi_copy_batch] inputs=%d batch=%d bytes=%zu sync_us=%.0f copy_us=%.0f ok=%d %s\n",
@@ -2200,6 +2215,22 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                                 late[n_late++] = cpy;
                             }
                         }
+                    }
+                    // what the CPU split after it reads from it, copied at the end of the record
+                    if (park.reads && next + 1 < sched->n_splits) {
+                        const ggml_backend_sched_split * after = &splits[next + 1];
+                        const ggml_tensor * rsrcs[GGML_SCHED_MAX_SPLIT_INPUTS];
+                        void * rdsts[GGML_SCHED_MAX_SPLIT_INPUTS];
+                        size_t rsizes[GGML_SCHED_MAX_SPLIT_INPUTS];
+                        int rids[GGML_SCHED_MAX_SPLIT_INPUTS];
+                        ggml_backend_t rproducer = nullptr;
+                        bool rone = true;
+                        int nr = 0;
+                        if (ggml_backend_dev_type(ggml_backend_get_device(sched->backends[after->backend_id])) !=
+                                GGML_BACKEND_DEVICE_TYPE_GPU && after->n_inputs > 1) {
+                            nr = collect_reads(after, rsrcs, rdsts, rsizes, rids, rproducer, rone);
+                        }
+                        park.reads(split_backend, rsrcs, rsizes, rone && rproducer == split_backend && nr > 1 ? nr : 0);
                     }
                     bool folded = false;
                     const bool recorded = park.record_late ?
