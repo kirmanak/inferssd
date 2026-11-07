@@ -1633,7 +1633,9 @@ struct decode_cache {
         constexpr size_t reserve = 256ull << 20;
         size_t budget = free_bytes > reserve ? free_bytes - reserve : 0;
         if (budget > (10ull << 30)) { budget = 10ull << 30; }
-        const int want = int(budget / k_stride);
+        // Whole windows only: a layer binds its slots 28 at a time, and slots past the last whole window of a slab
+        // are never used.
+        const int want = int(budget / k_stride) / k_window * k_window;
         if (want < 64 || !buft) {
             failed = true;
             std::fprintf(stderr, "[kimi_vk_decode] no cache free=%zu budget=%zu\n", free_bytes, budget);
@@ -1641,15 +1643,16 @@ struct decode_cache {
         }
         size_t left = size_t(want) * k_stride;
         constexpr size_t slab_cap = 2ull << 30;
-        while (left >= k_stride) {
-            size_t chunk = std::min(left, slab_cap - (slab_cap % k_stride));
-            chunk = (chunk / k_stride) * k_stride;
-            if (chunk < k_stride) { break; }
+        constexpr size_t window_bytes = size_t(k_window) * k_stride;
+        while (left >= window_bytes) {
+            size_t chunk = std::min(left, slab_cap - (slab_cap % window_bytes));
+            chunk = (chunk / window_bytes) * window_bytes;
+            if (chunk < window_bytes) { break; }
             ggml_backend_buffer_t buf = nullptr;
             try { buf = ggml_backend_buft_alloc_buffer(buft, chunk); }
             catch (...) { buf = nullptr; }
-            if (!buf && chunk > k_stride * 128) {
-                chunk = k_stride * 128;
+            if (!buf && chunk > window_bytes * 4) {
+                chunk = window_bytes * 4;
                 try { buf = ggml_backend_buft_alloc_buffer(buft, chunk); }
                 catch (...) { buf = nullptr; }
             }
