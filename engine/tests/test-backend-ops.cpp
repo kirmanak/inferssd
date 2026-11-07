@@ -4101,6 +4101,73 @@ struct test_gated_delta_net_state : public test_case {
     }
 };
 
+// A conv state gathered from a cache row, the new column appended, GGML_OP_SSM_CONV (and a SILU) on that, and the last
+// columns copied back into the cache, as the DeltaNet layers do; a backend may fold the gather and the copy into the conv
+struct test_ssm_conv_state : public test_case {
+    const int64_t channels;
+    const int64_t n_rows;
+    const int32_t src_row;
+    const int64_t dst_row;
+    const bool silu;
+    const bool cpy_first;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "SSM_CONV_STATE";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    std::string vars() override {
+        return VARS_TO_STR6(channels, n_rows, src_row, dst_row, silu, cpy_first);
+    }
+
+    test_ssm_conv_state(int64_t channels = 10240, int64_t n_rows = 3, int32_t src_row = 2, int64_t dst_row = 2,
+            bool silu = true, bool cpy_first = true)
+        : channels(channels), n_rows(n_rows), src_row(src_row), dst_row(dst_row), silu(silu), cpy_first(cpy_first) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int64_t d_conv = 4;
+        ggml_tensor * x0 = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, channels, 1);
+        ggml_tensor * b  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, channels, 1);
+        ggml_tensor * kernel = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, d_conv, channels);
+        ggml_tensor * cache = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, (d_conv - 1) * channels, n_rows);
+        ggml_tensor * ids = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 1);
+        ggml_set_name(cache, "cache");
+        ggml_set_name(ids, "ids");
+
+        // a computed column, and a chain of them, as a backend may fuse only in graphs of more than a few nodes
+        ggml_tensor * x = x0;
+        for (int i = 0; i < 40; ++i) {
+            x = ggml_add(ctx, x, b);
+        }
+        ggml_tensor * state = ggml_reshape_3d(ctx, ggml_get_rows(ctx, cache, ids), d_conv - 1, channels, 1);
+        ggml_tensor * input = ggml_concat(ctx, state, ggml_transpose(ctx, x), 0);
+        ggml_tensor * tail = ggml_view_3d(ctx, input, d_conv - 1, channels, 1, input->nb[1], input->nb[2],
+                ggml_element_size(input));
+        ggml_tensor * stored = ggml_cpy(ctx, tail,
+                ggml_view_1d(ctx, cache, (d_conv - 1) * channels, dst_row * cache->nb[1]));
+        ggml_tensor * conv = ggml_ssm_conv(ctx, input, kernel);
+        if (silu) {
+            conv = ggml_silu(ctx, conv);
+        }
+        conv = ggml_reshape_1d(ctx, conv, channels);
+        ggml_tensor * out = cpy_first ? ggml_concat(ctx, stored, conv, 0) : ggml_concat(ctx, conv, stored, 0);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->type == GGML_TYPE_I32) {
+                ggml_backend_tensor_set(t, &src_row, 0, sizeof(src_row));
+            } else {
+                init_tensor_uniform(t, -0.5f, 0.5f);
+            }
+        }
+    }
+};
+
 // GGML_OP_GATED_LINEAR_ATTN
 struct test_gla : public test_case {
     const ggml_type type;
@@ -9665,6 +9732,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_gated_delta_net_state(4, 32, 1, 3, 2, 0));
     test_cases.emplace_back(new test_gated_delta_net_state(48, 128, 1, 2, 1, 1));
     test_cases.emplace_back(new test_gated_delta_net_state(8, 64, 5, 3, 0, 2));
+    test_cases.emplace_back(new test_ssm_conv_state(10240, 3, 2, 2, true, true));
+    test_cases.emplace_back(new test_ssm_conv_state(10240, 3, 2, 0, true, false));
+    test_cases.emplace_back(new test_ssm_conv_state(256, 2, 0, 1, false, true));
+    test_cases.emplace_back(new test_ssm_conv_state(256, 4, 3, 3, false, false));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 16, 1, 1));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 16, 1, 1, 1, true, true));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 16, 1, 1, 1, false, true));
