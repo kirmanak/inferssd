@@ -1655,11 +1655,11 @@ llama_expert_gating_func_type gating_op,
         }
         probs = ggml_add(ctx0, probs, next_exp_probs_b);
     }
-    // every rank the next router selects: the sink reads the first GGML_KIMI_CPU_SINK_PREFETCH of them and keeps
-    // statistics of all (a full sort, so the first k are the same at any width)
-    ggml_tensor * hint = ggml_argsort_top_k(ctx0, probs, int(std::min<int64_t>(hparams.n_expert_used, n_expert)));
-    cb(hint, "ffn_moe_prefetch_hint", il);
-    return hint;
+    // The scores themselves: the sink ranks them on the CPU, where the 512 of a row take about a microsecond, and
+    // a device sort took 11 us a layer. It reads the first prefetch.depth ranks and keeps statistics of the
+    // n_expert_used best.
+    cb(probs, "ffn_moe_prefetch_hint", il);
+    return probs;
 }
 
 ggml_tensor * llm_graph_context::build_moe_ffn(

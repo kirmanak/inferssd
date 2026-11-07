@@ -381,6 +381,21 @@ struct llama_kimi_cpu_sink_call {
     llama_kimi_cpu_sink_call & operator=(const llama_kimi_cpu_sink_call &) = delete;
 };
 
+// The k best of n scores into best, best first; an earlier index first on a tie, as a stable descending sort.
+// A NaN never enters a full list. Returns min(k, n).
+inline int llama_kimi_cpu_sink_rank(const float * score, int n, int k, int32_t * best) {
+    k = std::max(0, std::min(k, n));
+    int m = 0;
+    for (int i = 0; i < n && k > 0; ++i) {
+        const float v = score[i];
+        if (m == k && !(v > score[best[k - 1]])) { continue; }
+        int at = m < k ? m++ : k - 1;
+        while (at > 0 && v > score[best[at - 1]]) { best[at] = best[at - 1]; --at; }
+        best[at] = i;
+    }
+    return m;
+}
+
 inline void llama_kimi_cpu_sink_compute(ggml_tensor * dst, int ith, int nth, void * userdata) {
     // Every CPU-backend ggml thread enters (n_tasks = GGML_N_TASKS_MAX). No C++
     // exception may escape this callback.
@@ -457,10 +472,13 @@ inline void llama_kimi_cpu_sink_compute(ggml_tensor * dst, int ith, int nth, voi
     } else {
         GGML_ASSERT(ntokens == 1);
         // the next layer's predicted experts, for the sink's prefetch
+        // the next router's scores: its nslots best experts
         if (const ggml_tensor * hint = dst->src[5]; hint && runtime.prefetch_hint) {
-            GGML_ASSERT(hint->type == GGML_TYPE_I32 && ggml_is_contiguous(hint));
-            runtime.prefetch_hint(runtime.sink, node.layer + 1, static_cast<const int32_t *>(hint->data),
-                static_cast<int>(ggml_nelements(hint)));
+            GGML_ASSERT(hint->type == GGML_TYPE_F32 && ggml_is_contiguous(hint));
+            int32_t best[64];
+            const int m = llama_kimi_cpu_sink_rank(static_cast<const float *>(hint->data),
+                static_cast<int>(ggml_nelements(hint)), std::min(nslots, 64), best);
+            runtime.prefetch_hint(runtime.sink, node.layer + 1, best, m);
         }
         ok = runtime.run_activation(runtime.sink, &node.up, &node.gate, &node.down,
             static_cast<const float *>(input->data), static_cast<const int32_t *>(ids->data),

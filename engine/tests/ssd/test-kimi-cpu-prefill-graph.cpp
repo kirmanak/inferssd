@@ -6,6 +6,7 @@
 #include "ggml-cpu.h"
 #include "../../src/ssd/cpu-runtime.h"
 
+#include <cmath>
 #include <cstdio>
 #include <memory>
 #include <set>
@@ -145,8 +146,9 @@ static void graph_case(ggml_backend_t cpu, int ntokens, bool prefill, bool decod
         require(ggml_backend_sched_get_tensor_backend(scheduler.get(), output) == cpu, "custom node not assigned to CPU");
         require(bool(output->src[5]) == predicted, "the custom node must carry the prediction it was given");
         if (predicted) {
-            require(output->src[5]->type == GGML_TYPE_I32 && output->src[5]->ne[0] == slots,
-                    "the prediction must rank as many experts as the router selects");
+            // the next router's scores, one per expert: the runtime ranks them
+            require(output->src[5]->type == GGML_TYPE_F32 && output->src[5]->ne[0] == experts &&
+                    ggml_is_contiguous(output->src[5]), "the prediction must score every expert of the next router");
         }
         require(output->src[0] && output->src[1] && output->src[2] && !output->src[3], "custom node source count mismatch");
         for (int source = 0; source < 3; ++source) {
@@ -171,10 +173,23 @@ static void graph_case(ggml_backend_t cpu, int ntokens, bool prefill, bool decod
         label, ntokens, use_sink ? 1 : 0, ggml_graph_n_nodes(result.get_gf()));
 }
 
+// The sink ranks the next router's scores itself: best first, an earlier expert first on a tie.
+static void rank_case() {
+    const float score[] = { 0.5f, 2.0f, -1.0f, 2.0f, 7.0f, NAN, 0.5f, 3.0f };
+    int32_t best[8];
+    require(llama_kimi_cpu_sink_rank(score, 8, 4, best) == 4 &&
+            best[0] == 4 && best[1] == 7 && best[2] == 1 && best[3] == 3, "ranked scores out of order");
+    require(llama_kimi_cpu_sink_rank(score, 3, 8, best) == 3 && best[0] == 1 && best[1] == 0 && best[2] == 2,
+            "a short row must rank all of its scores");
+    require(llama_kimi_cpu_sink_rank(score, 8, 0, best) == 0, "no ranks asked, none given");
+    std::printf("case=rank status=PASS\n");
+}
+
 int main() {
     try {
         std::unique_ptr<ggml_backend, decltype(&ggml_backend_free)> cpu(ggml_backend_cpu_init(), ggml_backend_free);
         require(bool(cpu), "CPU backend initialization failed");
+        rank_case();
         graph_case(cpu.get(), 0, true, false, "prefill_empty_output");
         graph_case(cpu.get(), 25, true, false, "prefill_ub25");
         graph_case(cpu.get(), 64, true, false, "prefill_ub64");
