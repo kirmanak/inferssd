@@ -79,6 +79,9 @@ struct ggml_vk_expert_api_v1 {
     bool (*decode_prepare)(void * session, struct ggml_vk_decode_batch * batch);
     bool (*decode_launch)(void * session);
     bool (*decode_wait)(void * session, struct ggml_vk_decode_batch * batch);
+    // The keys the running ahead fill's layer will read. Before the join, the
+    // fill skips every other item it has not started. Null on an older build.
+    void (*ahead_need)(void * session, const void * const * keys, int count);
 };
 
 struct ggml_vk_device_expert {

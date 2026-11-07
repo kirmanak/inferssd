@@ -16,6 +16,7 @@
 #include <new>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -79,6 +80,9 @@ struct expert_session {
     std::unordered_map<const void *, size_t> ahead_at;
     std::unordered_map<const void *, size_t> ahead_bytes;
     int ahead_used = 0;
+    // Set once per fill, before its join; the fill reads it after the flag.
+    std::unordered_set<const void *> ahead_need;
+    std::atomic<bool> ahead_trim{false};
     // Least free device memory seen while a prompt ran. The decode cache sizes
     // from this, not from what the prompt released at the phase change.
     size_t prefill_min_free = SIZE_MAX;
@@ -114,6 +118,8 @@ struct expert_session {
         if (!ahead_thread.joinable()) { return; }
         const auto t0 = std::chrono::steady_clock::now();
         ahead_thread.join();
+        ahead_trim.store(false, std::memory_order_relaxed);
+        ahead_need.clear();
         const double join_us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count();
         std::fprintf(stderr, "[kimi_vk_ahead] join_us=%.0f\n", join_us);
         if (ahead_filling >= 0) {
@@ -570,8 +576,13 @@ bool expert_ahead(void * raw, const ggml_vk_expert_ahead * items, int count) {
         void * base = ggml_backend_buffer_get_base(filled.buffer);
         const auto t0 = std::chrono::steady_clock::now();
         size_t bytes = 0;
-        int queued = 0;
+        int queued = 0, skipped = 0;
         for (const auto & item : plan) {
+            // The layer's routing is known: nothing it does not read crosses the link.
+            if (session->ahead_trim.load(std::memory_order_acquire) && !session->ahead_need.count(item.key)) {
+                ++skipped;
+                continue;
+            }
             ggml_tensor * tensor = ggml_new_tensor_1d(ctx, GGML_TYPE_I8, int64_t(item.bytes));
             if (!tensor) { break; }
             if (ggml_backend_tensor_alloc(filled.buffer, tensor,
@@ -582,11 +593,21 @@ bool expert_ahead(void * raw, const ggml_vk_expert_ahead * items, int count) {
             bytes += item.bytes;
             ++queued;
         }
-        std::fprintf(stderr, "[kimi_vk_ahead] queued=%d bytes=%zu set_us=%.0f\n", queued, bytes,
+        std::fprintf(stderr, "[kimi_vk_ahead] queued=%d skipped=%d bytes=%zu set_us=%.0f\n", queued, skipped, bytes,
                 std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count());
         ggml_free(ctx);
     });
     return true;
+}
+
+void expert_ahead_need(void * raw, const void * const * keys, int count) {
+    auto * session = static_cast<expert_session *>(raw);
+    if (!session || count < 0 || (count > 0 && !keys)) { return; }
+    std::lock_guard<std::mutex> lock(session->api_mutex);
+    if (!session->ahead_thread.joinable() || session->ahead_trim.load(std::memory_order_relaxed)) { return; }
+    session->ahead_need.clear();
+    session->ahead_need.insert(keys, keys + count);
+    session->ahead_trim.store(true, std::memory_order_release);
 }
 
 // Experts with the same padded token count share one mul_mat. That is the
@@ -2722,6 +2743,7 @@ extern "C" const ggml_vk_expert_api_v1 * ggml_backend_vk_expert_api_v1(void) {
         reinterpret_cast<bool (*)(void *, ggml_vk_decode_batch *)>(decode_prepare),
         reinterpret_cast<bool (*)(void *)>(decode_launch),
         reinterpret_cast<bool (*)(void *, ggml_vk_decode_batch *)>(decode_wait),
+        reinterpret_cast<void (*)(void *, const void * const *, int)>(expert_ahead_need),
     };
     return &api;
 }

@@ -1093,6 +1093,26 @@ struct expert_cache {
             }
         }
     }
+    // The cached_weights keys of this layer's resident entries whose id is in ids.
+    void resident_keys(int32_t layer_id, const int32_t * ids, int n, std::vector<const void *> & out) const {
+        out.clear();
+        if (!arena || layers.empty() || !ids || n <= 0) { return; }
+        const auto found = std::find_if(layers.begin(), layers.end(), [&](const layer & l) { return l.id == layer_id; });
+        if (found == layers.end()) { return; }
+        const size_t layer_index = size_t(found - layers.begin());
+        std::vector<int32_t> wanted(ids, ids + n);
+        std::sort(wanted.begin(), wanted.end());
+        for (size_t i = 0; i < entries.size(); ++i) {
+            const auto & e = entries[i];
+            if (!e.valid || !e.resident || e.layer_index != layer_index ||
+                    !std::binary_search(wanted.begin(), wanted.end(), e.id)) {
+                continue;
+            }
+            for (int role = 0; role < 3; ++role) {
+                out.push_back(data(int(i), role) + size_t(e.source[role].offset % 4096));
+            }
+        }
+    }
     char * data(int index, int role) const {
         size_t offset = size_t(index) * stride;
         for (int r = 0; r < role; ++r) { offset += role_bytes[r]; }

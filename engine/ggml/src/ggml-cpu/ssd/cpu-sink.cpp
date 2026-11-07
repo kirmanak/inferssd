@@ -3289,6 +3289,16 @@ bool kimi_cpu_sink_stream_hybrid(struct kimi_cpu_sink * sink,
         sink->cache.protect_layer(0, false);
     };
     if (sink->vulkan_api && sink->vulkan_api->ahead && sink->vulkan_session) {
+        // The running fill is this layer's. Its routing is known now, so the
+        // cached experts no token picked are not copied.
+        int need_layer = -1, need_end = 0;
+        if (sink->vulkan_api->ahead_need && up && ids && nexperts > 0 &&
+                std::sscanf(up->name, "blk.%d.ffn_up_exps.weight%n", &need_layer, &need_end) == 1 &&
+                need_end && !up->name[need_end]) {
+            std::vector<const void *> keys;
+            sink->cache.resident_keys(need_layer, ids, nexperts, keys);
+            sink->vulkan_api->ahead_need(sink->vulkan_session, keys.data(), int(keys.size()));
+        }
         sink->vulkan_api->ahead(sink->vulkan_session, nullptr, 0);
         if (up) {
             int layer = -1, consumed = 0;
