@@ -3591,6 +3591,94 @@ struct test_sigmoid_mul : public test_case {
     }
 };
 
+// GGML_OP_SSM_CONV + GGML_OP_UNARY(SILU), which a backend may fuse
+struct test_ssm_conv_silu : public test_case {
+    const std::array<int64_t, 4> ne_a;
+    const std::array<int64_t, 4> ne_b;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "SSM_CONV_SILU";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    std::string vars() override {
+        return VARS_TO_STR2(ne_a, ne_b);
+    }
+
+    test_ssm_conv_silu(std::array<int64_t, 4> ne_a = {4, 8192, 1, 1}, std::array<int64_t, 4> ne_b = {4, 8192, 1, 1})
+        : ne_a(ne_a), ne_b(ne_b) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * a = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne_a.data());
+        ggml_tensor * d = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne_a.data());
+        ggml_tensor * b = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne_b.data());
+        ggml_set_name(a, "a");
+        ggml_set_name(d, "d");
+        ggml_set_name(b, "b");
+        // a computed input and a chain of nodes, as a backend may fuse only in graphs of more than a few nodes
+        ggml_tensor * x = a;
+        for (int i = 0; i < 40; ++i) {
+            x = ggml_add(ctx, x, d);
+        }
+        ggml_tensor * out = ggml_silu(ctx, ggml_ssm_conv(ctx, x, b));
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            init_tensor_uniform(t, -0.5f, 0.5f);
+        }
+    }
+};
+
+// GGML_OP_ADD of a row + GGML_OP_UNARY(SOFTPLUS) + GGML_OP_MUL by a row, the DeltaNet gate, which a backend may fuse
+struct test_add_softplus_mul : public test_case {
+    const std::array<int64_t, 4> ne_a;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "ADD_SOFTPLUS_MUL";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    std::string vars() override {
+        return VARS_TO_STR1(ne_a);
+    }
+
+    test_add_softplus_mul(std::array<int64_t, 4> ne_a = {48, 1, 1, 1}) : ne_a(ne_a) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * a = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne_a.data());
+        ggml_tensor * d = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne_a.data());
+        ggml_tensor * b = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, ne_a[0]);
+        ggml_tensor * c = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, ne_a[0]);
+        ggml_set_name(a, "a");
+        ggml_set_name(d, "d");
+        ggml_set_name(b, "b");
+        ggml_set_name(c, "c");
+        ggml_tensor * x = a;
+        for (int i = 0; i < 40; ++i) {
+            x = ggml_add(ctx, x, d);
+        }
+        // not an ADD before the gate's ADD, which a backend may take into a chain of adds
+        x = ggml_neg(ctx, x);
+        ggml_tensor * out = ggml_mul(ctx, ggml_softplus(ctx, ggml_add(ctx, x, b)), c);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            // the 40 adds take a's values well past the softplus switch to the identity at 20
+            init_tensor_uniform(t, -1.0f, 1.0f);
+        }
+    }
+};
+
 // GGML_OP_RMS_NORM + GGML_OP_SCALE, which a backend may fuse
 struct test_rms_norm_scale : public test_case {
     const std::array<int64_t, 4> ne;
@@ -8690,6 +8778,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_sigmoid_mul({ 128, 48, 1, 1 }, { 128, 48, 1, 1 }));
     test_cases.emplace_back(new test_sigmoid_mul({ 6144, 3, 1, 1 }, { 6144, 3, 1, 1 }));
     test_cases.emplace_back(new test_sigmoid_mul({ 1000, 7, 3, 2 }, { 1, 7, 1, 2 }));
+    test_cases.emplace_back(new test_ssm_conv_silu({ 4, 8192, 1, 1 }, { 4, 8192, 1, 1 }));
+    test_cases.emplace_back(new test_ssm_conv_silu({ 3 + 7, 8192, 2, 1 }, { 4, 8192, 1, 1 }));
+    test_cases.emplace_back(new test_add_softplus_mul({ 48, 1, 1, 1 }));
+    test_cases.emplace_back(new test_add_softplus_mul({ 48, 7, 1, 1 }));
+    test_cases.emplace_back(new test_add_softplus_mul({ 1000, 3, 2, 1 }));
     test_cases.emplace_back(new test_rms_norm_scale({ 128, 16, 1, 1 }, 0.0883883f, 0.0f));
     test_cases.emplace_back(new test_rms_norm_scale({ 1000, 7, 3, 2 }, -1.5f, 0.0f));
     test_cases.emplace_back(new test_rms_norm_scale({ 64, 5, 4, 3 }, 2.0f, 0.5f)); // a bias: not fused

@@ -1,0 +1,28 @@
+#version 450
+
+// ADD of a row vector, SOFTPLUS, and MUL by another row vector, as one dispatch: d = softplus(a + b) * c with b and c
+// one row of a's row length, the expressions add.comp, softplus.comp and mul.comp use. Offsets in floats.
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout (push_constant) uniform parameter
+{
+    uint ne;
+    uint ne0;
+    uint offs_a; uint offs_b; uint offs_c; uint offs_d;
+} p;
+
+layout (binding = 0) readonly buffer A {float data_a[];};
+layout (binding = 1) readonly buffer B {float data_b[];};
+layout (binding = 2) readonly buffer C {float data_c[];};
+layout (binding = 3) writeonly buffer D {float data_d[];};
+
+void main() {
+    const uint i = gl_GlobalInvocationID.x;
+    if (i >= p.ne) {
+        return;
+    }
+    const uint i0 = i % p.ne0;
+    const float x = data_a[p.offs_a + i] + data_b[p.offs_b + i0];
+    const float sp = (x > 20.0f) ? x : log(1.0f + exp(x));
+    data_d[p.offs_d + i] = sp * data_c[p.offs_c + i0];
+}

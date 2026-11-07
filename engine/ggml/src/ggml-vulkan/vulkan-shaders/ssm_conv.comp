@@ -18,6 +18,8 @@ layout(push_constant) uniform PushConstants {
     uint nb11;
     uint dst_nb0; uint dst_nb1; uint dst_nb2;
     uint nc; uint ncs; uint nr; uint n_t; uint n_s;
+    // 1: a SILU after the conv is fused, computed as silu.comp does
+    uint apply_silu;
 };
 
 void main() {
@@ -46,5 +48,8 @@ void main() {
     }
 
     const uint dst_idx = i3 * (dst_nb2 / 4) + i2 * (dst_nb1 / 4) + i1;
+    if (apply_silu != 0) {
+        sum = sum / (1.0f + exp(-sum));
+    }
     dst[dst_idx] = sum;
 }
