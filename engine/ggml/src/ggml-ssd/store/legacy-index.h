@@ -8,6 +8,7 @@
 #include <cstring>
 #include <memory>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -48,8 +49,21 @@ public:
     // does not store it; the caller's tensor context supplies that information.
     bool locate(const char * name, int expert, size_t bytes, extent & result, bool include_identity = true) const {
         if (!state_->enabled || !name || !name[0] || expert < 0 || !bytes) { return false; }
+        const auto & entries = state_->entries;
         size_t lo = 0;
-        size_t hi = state_->entries.size();
+        size_t hi = entries.size();
+        // A tensor whose experts are one entry each in order holds expert e at its first entry plus e. That entry is
+        // the binary search's answer when it has the key and the entry before it does not (the list is sorted).
+        const auto first = first_entry_.find(std::string_view(name));
+        if (first != first_entry_.end() && size_t(expert) < entries.size() - first->second) {
+            const size_t i = first->second + size_t(expert);
+            const auto & item = entries[i];
+            const auto & before = entries[i - (i > first->second)];
+            if (item.expert_idx == expert && item.nbytes == bytes && !std::strcmp(item.tensor, name) &&
+                    (i == first->second || before.expert_idx != expert || before.nbytes != bytes)) {
+                lo = hi = i;
+            }
+        }
         while (lo < hi) {
             const size_t mid = lo + (hi - lo) / 2;
             const auto & item = state_->entries[mid];
@@ -82,8 +96,15 @@ public:
     const std::vector<expert_pack_entry> & entries_for_test() const { return state_->entries; }
     source_identity source_identity_for_test(size_t i) const { return identity(state_->sources.at(i)); }
 private:
-    explicit expert_index(std::unique_ptr<parser_state> state) : state_(std::move(state)) {}
+    explicit expert_index(std::unique_ptr<parser_state> state) : state_(std::move(state)) {
+        const auto & entries = state_->entries;
+        for (size_t i = 0; i < entries.size(); ++i) {
+            if (!i || std::strcmp(entries[i - 1].tensor, entries[i].tensor)) { first_entry_.emplace(entries[i].tensor, i); }
+        }
+    }
     std::unique_ptr<const parser_state> state_;
+    // Each tensor's first entry. The views point into the entries, which do not change after open.
+    std::unordered_map<std::string_view, size_t> first_entry_;
 };
 
 namespace detail {

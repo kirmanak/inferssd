@@ -148,14 +148,15 @@ struct sink_buffer {
 
 // Whether a descriptor reads directly at the granule the ranges are padded to.
 // The alignment is a device query on Windows: ask once per descriptor in a run.
+// One check lives for one batch of resolves, whose roles mostly share a descriptor: the last one that passed is not
+// asked again (is_direct is a system call).
 struct sink_direct_check {
     int aligned = -1;
     bool operator()(int fd) {
+        if (fd >= 0 && fd == aligned) { return true; }
         if (!ssd::platform::is_direct(fd)) { return false; }
-        if (fd != aligned) {
-            if (sink_direct_granule % ssd::platform::direct_alignment(fd) != 0) { return false; }
-            aligned = fd;
-        }
+        if (sink_direct_granule % ssd::platform::direct_alignment(fd) != 0) { return false; }
+        aligned = fd;
         return true;
     }
 };
