@@ -262,6 +262,10 @@ constexpr int sink_node_spin_us = 20;
 // on 60 threads of a KVM guest that took decode from 152 to 272 ms a token, where 1 ms already reaches the plateau
 // and 10 ms gains nothing. Other machines gain a little more from 3 ms than from 1.
 constexpr int sink_production_poll_us = 3000;
+// The poll after a parallel phase that is not the run's last, on both sides. The next phase follows within
+// microseconds (decode's down after its up/gate, with only SWIGLU between them), and a park there cost every
+// thread a wakeup: 2 us of a decode expert's 32 us down projection.
+constexpr int sink_parallel_poll_us = 200;
 
 // The CPUs this process may run on; 1 when they cannot be read.
 static int sink_process_cpus() {
@@ -1594,7 +1598,7 @@ struct kimi_cpu_sink {
             }
             seen = now.generation();
             poll_next = now.is(sink_phase::last) ? std::max(poll_us, sink_node_spin_us) :
-                now.is(sink_phase::parallel) ? 0 : poll_us;
+                now.is(sink_phase::parallel) ? sink_parallel_poll_us : poll_us;
             if (ith >= now.active()) { continue; }
             if (profile_enabled) { worker_profiles[ith].no_work_wakeups += idle_wakeups; }
             idle_wakeups = 0;
@@ -2291,7 +2295,7 @@ struct kimi_cpu_sink {
 
     void wait_workers() {
         const auto done = [&] { return pending.load() == 0; };
-        if (poll_us && !parallel_fn) { sink_poll(poll_us, done); }
+        sink_poll(parallel_fn ? sink_parallel_poll_us : poll_us, done);
         while (!done()) { coordinator.park(done); }
     }
 
