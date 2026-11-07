@@ -11398,7 +11398,9 @@ static void ggml_vk_l2_norm(ggml_backend_vk_context * ctx, vk_context& subctx, c
 }
 
 static void ggml_vk_unary(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, ggml_tensor * dst) {
-    ggml_vk_op_f32<vk_op_push_constants>(ctx, subctx, src0, nullptr, nullptr, nullptr, dst, GGML_OP_UNARY, { (uint32_t)ggml_nelements(src0), 0, 0.0f, 0.0f, 0.0f, 0.0f });
+    // SILU scales its input by param1 (a fused SCALE's); alone, by one
+    const float param1 = ggml_get_unary_op(dst) == GGML_UNARY_OP_SILU ? 1.0f : 0.0f;
+    ggml_vk_op_f32<vk_op_push_constants>(ctx, subctx, src0, nullptr, nullptr, nullptr, dst, GGML_OP_UNARY, { (uint32_t)ggml_nelements(src0), 0, param1, 0.0f, 0.0f, 0.0f });
 }
 
 static void ggml_vk_xielu(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, ggml_tensor * dst) {
@@ -13349,7 +13351,12 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
 
         break;
     case GGML_OP_SCALE:
-        ggml_vk_scale(ctx, compute_ctx, src0, node);
+        if (ctx->num_additional_fused_ops == 1) {
+            ggml_vk_op_f32<vk_op_push_constants>(ctx, compute_ctx, src0, nullptr, nullptr, nullptr, cgraph->nodes[node_idx + 1], GGML_OP_UNARY,
+                { (uint32_t)ggml_nelements(src0), 0, ggml_get_op_params_f32(node, 0), ggml_get_op_params_f32(node, 1), 0.0f, 0.0f });
+        } else {
+            ggml_vk_scale(ctx, compute_ctx, src0, node);
+        }
 
         break;
     case GGML_OP_SQR:
@@ -15759,6 +15766,18 @@ static bool ggml_vk_tensors_overlap(const ggml_tensor * a, const ggml_tensor * b
     return false;
 }
 
+// SCALE into SILU: the SILU shader applies the scale and bias to its input itself.
+static bool ggml_vk_can_fuse_scale_silu(const struct ggml_cgraph * cgraph, int node_idx) {
+    if (!ggml_can_fuse(cgraph, node_idx, { GGML_OP_SCALE, GGML_OP_UNARY })) {
+        return false;
+    }
+    const ggml_tensor * scale = cgraph->nodes[node_idx];
+    const ggml_tensor * silu = cgraph->nodes[node_idx + 1];
+    return ggml_get_unary_op(silu) == GGML_UNARY_OP_SILU && silu->src[0] == scale &&
+           scale->src[0]->type == GGML_TYPE_F32 && silu->type == GGML_TYPE_F32 &&
+           ggml_is_contiguous(scale->src[0]) && ggml_is_contiguous(silu);
+}
+
 static bool ggml_vk_can_fuse_rms_norm_mul_rope(ggml_backend_vk_context * ctx, const struct ggml_cgraph * cgraph,
                                                int node_idx) {
     GGML_UNUSED(ctx);
@@ -16048,6 +16067,11 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 op_srcs_fused_elementwise[0] = false;
                 op_srcs_fused_elementwise[1] = true;
                 op_srcs_fused_elementwise[2] = true;
+            } else if (ggml_vk_can_fuse_scale_silu(cgraph, i)) {
+                ctx->num_additional_fused_ops = 1;
+                fusion_string = "SCALE_SILU";
+                op_srcs_fused_elementwise[0] = true;
+                op_srcs_fused_elementwise[1] = true;
             } else if (ggml_vk_can_fuse(ctx, cgraph, i, { GGML_OP_MUL_MAT_ID, GGML_OP_ADD_ID })) {
                 ctx->num_additional_fused_ops = 1;
                 fusion_string = "MUL_MAT_ID_ADD_ID";

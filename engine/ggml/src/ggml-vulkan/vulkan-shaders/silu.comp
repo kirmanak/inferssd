@@ -17,6 +17,7 @@ void main() {
         return;
     }
 
-    const float xi = float(data_a[i]);
+    // param1 and param2: a fused SCALE's factor and bias (1 and 0 alone)
+    const float xi = float(data_a[i]) * p.param1 + p.param2;
     data_d[i] = D_TYPE(xi / (1.0f + exp(-xi)));
 }
