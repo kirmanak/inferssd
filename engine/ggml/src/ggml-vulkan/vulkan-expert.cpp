@@ -132,6 +132,10 @@ size_t align_up(size_t value, size_t alignment) {
     return (value + alignment - 1) & ~(alignment - 1);
 }
 
+size_t round_up(size_t value, size_t multiple) {
+    return (value + multiple - 1) / multiple * multiple;
+}
+
 void note_free(expert_session * session) {
     size_t free_bytes = 0, total = 0;
     ggml_backend_dev_memory(ggml_backend_get_device(session->backend), &free_bytes, &total);
@@ -591,7 +595,7 @@ bool expert_ahead(void * raw, const ggml_vk_expert_ahead * items, int count) {
 bool expert_buckets_compute(expert_session * session, const ggml_tensor * activation,
         int32_t up_type, int32_t down_type, int64_t latent, int64_t hidden,
         size_t up_bytes, size_t down_bytes, const ggml_vk_device_expert * experts, int n_experts,
-        std::vector<size_t> & down_off, std::vector<int> & down_cols) {
+        std::vector<size_t> & down_off, std::vector<int> & down_cols, size_t & used) {
     if (n_experts < 32) { return false; }
     static const int k_pads[] = { 8, 16, 32, 64, 128, 256, 512 };
     struct bucket { int pad = 0; std::vector<int> which; };
@@ -686,6 +690,8 @@ bool expert_buckets_compute(expert_session * session, const ggml_tensor * activa
         lay.up_out_at = take(lay.up_out);
         lay.gate_out_at = take(lay.gate_out);
         lay.hidden_at = take(lay.hidden_out);
+        // Whole rows from the buffer base, so the reduce can address them by row.
+        if (row_bytes % alignment == 0) { cursor = round_up(cursor, row_bytes); }
         lay.down_out_at = take(lay.down_out);
     }
     if (cursor == 0 || cursor > k_batch_cap || input_bytes == 0 || input_bytes % 4 != 0) {
@@ -698,6 +704,7 @@ bool expert_buckets_compute(expert_session * session, const ggml_tensor * activa
         ggml_free(ctx);
         return false;
     }
+    used = cursor;
     const size_t act_base = size_t(static_cast<char *>(activation->data) - static_cast<char *>(ggml_backend_buffer_get_base(activation->buffer)));
     std::vector<size_t> act_src, act_dst, act_sz;
     std::vector<size_t> w_src, w_dst, w_sz;
@@ -794,6 +801,87 @@ bool expert_buckets_compute(expert_session * session, const ggml_tensor * activa
     return true;
 }
 
+// The weighted slot sums of a device layer, reading the expert outputs by row
+// where the compute left them. Per slot: get_rows into the slot buffer, the
+// weight multiply and the add into slot 0 in place. The same products and
+// slot-order sums as scatter plus reduce, without the row copies (3.3 ms of a
+// warm layer). Tokens a slot does not route read a zeroed row. False leaves
+// output untouched.
+bool reduce_by_rows(expert_session * session, const ggml_vk_device_route * routes, int n_routes, int n_experts,
+        int nslots, int ntokens, int64_t latent, const std::vector<size_t> & down_off,
+        const std::vector<int> & down_cols, size_t used, float * output, double & reduce_us) {
+    const auto t0 = std::chrono::steady_clock::now();
+    const size_t row_bytes = size_t(latent) * sizeof(float);
+    const size_t slot_need = size_t(ntokens) * row_bytes;
+    const size_t small = round_up(size_t(ntokens) * sizeof(float), 256);
+    const size_t ids_at = round_up(slot_need, 256);
+    if (!session->batch_buffer || session->slot_bytes < ids_at + 2 * small) { return false; }
+    for (int e = 0; e < n_experts; ++e) {
+        if (down_off[size_t(e)] % row_bytes != 0) { return false; }
+    }
+    const size_t zero_at = round_up(used, row_bytes);
+    const size_t zero_row = zero_at / row_bytes;
+    if (zero_at + row_bytes > session->batch_staging || zero_row > size_t(INT32_MAX)) { return false; }
+    const size_t n_slot = size_t(nslots), n_tok = size_t(ntokens);
+    std::vector<std::vector<int32_t>> ids(n_slot, std::vector<int32_t>(n_tok, static_cast<int32_t>(zero_row)));
+    std::vector<std::vector<float>> weights(n_slot, std::vector<float>(n_tok, 0.0f));
+    for (int r = 0; r < n_routes; ++r) {
+        const auto & route = routes[r];
+        if (route.slot < 0 || route.slot >= nslots || route.token < 0 || route.token >= ntokens) { continue; }
+        weights[size_t(route.slot)][size_t(route.token)] = route.weight;
+        if (route.expert < 0 || route.expert >= n_experts || route.column < 0 ||
+                route.column >= down_cols[size_t(route.expert)]) {
+            continue;
+        }
+        ids[size_t(route.slot)][size_t(route.token)] =
+            int32_t((down_off[size_t(route.expert)] + size_t(route.column) * row_bytes) / row_bytes);
+    }
+    if (!ggml_vk_fill_and_copy(session->batch_buffer, zero_at, row_bytes, nullptr, nullptr, nullptr, nullptr, 0)) {
+        return false;
+    }
+    const int nodes = nslots * 4 + 16;
+    ggml_context * ctx = ggml_init({ ggml_tensor_overhead() * size_t(nslots * 6 + 4) + ggml_graph_overhead_custom(nodes, false),
+            nullptr, true });
+    if (!ctx) { return false; }
+    ggml_tensor * all = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, latent, int64_t(zero_row) + 1);
+    std::vector<ggml_tensor *> id_tensor(n_slot), w_tensor(n_slot), rows(n_slot), views;
+    ggml_tensor * acc = nullptr;
+    for (int s = 0; s < nslots && all; ++s) {
+        id_tensor[size_t(s)] = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, ntokens);
+        w_tensor[size_t(s)] = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 1, ntokens);
+        rows[size_t(s)] = ggml_get_rows(ctx, all, id_tensor[size_t(s)]);
+        ggml_tensor * scaled = ggml_mul_inplace(ctx, rows[size_t(s)], w_tensor[size_t(s)]);
+        views.push_back(scaled);
+        acc = acc ? ggml_add_inplace(ctx, acc, scaled) : scaled;
+        if (acc != scaled) { views.push_back(acc); }
+    }
+    ggml_cgraph * graph = acc ? ggml_new_graph_custom(ctx, nodes, false) : nullptr;
+    bool ok = graph && ggml_backend_tensor_alloc(session->batch_buffer, all,
+            ggml_backend_buffer_get_base(session->batch_buffer)) == GGML_STATUS_SUCCESS;
+    for (int s = 0; s < nslots && ok; ++s) {
+        char * base = static_cast<char *>(ggml_backend_buffer_get_base(session->slot_buf[s]));
+        ok = ggml_backend_tensor_alloc(session->slot_buf[s], rows[size_t(s)], base) == GGML_STATUS_SUCCESS &&
+            ggml_backend_tensor_alloc(session->slot_buf[s], id_tensor[size_t(s)], base + ids_at) == GGML_STATUS_SUCCESS &&
+            ggml_backend_tensor_alloc(session->slot_buf[s], w_tensor[size_t(s)], base + ids_at + small) == GGML_STATUS_SUCCESS;
+    }
+    for (size_t v = 0; v < views.size() && ok; ++v) { ok = ggml_backend_view_init(views[v]) == GGML_STATUS_SUCCESS; }
+    if (ok) {
+        for (int s = 0; s < nslots; ++s) {
+            ggml_backend_tensor_set(id_tensor[size_t(s)], ids[size_t(s)].data(), 0, size_t(ntokens) * sizeof(int32_t));
+            ggml_backend_tensor_set(w_tensor[size_t(s)], weights[size_t(s)].data(), 0, size_t(ntokens) * sizeof(float));
+        }
+        ggml_build_forward_expand(graph, acc);
+        ok = ggml_backend_graph_compute(session->backend, graph) == GGML_STATUS_SUCCESS;
+    }
+    if (ok) {
+        ggml_backend_synchronize(session->backend);
+        ggml_backend_tensor_get(acc, output, 0, slot_need);
+    }
+    ggml_free(ctx);
+    reduce_us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count();
+    return ok;
+}
+
 bool expert_device_layer(void * raw, const ggml_tensor * activation, int32_t up_type, int32_t down_type,
         int64_t latent, int64_t hidden, size_t up_bytes, size_t down_bytes,
         const ggml_vk_device_expert * experts, int n_experts, const ggml_vk_device_route * routes, int n_routes,
@@ -811,20 +899,22 @@ bool expert_device_layer(void * raw, const ggml_tensor * activation, int32_t up_
     }
     const size_t row_bytes = size_t(latent) * sizeof(float);
     const size_t slot_need = size_t(ntokens) * row_bytes;
+    // Room after the rows for reduce_by_rows' indices and weights.
+    const size_t slot_alloc = round_up(slot_need, 256) + 2 * round_up(size_t(ntokens) * sizeof(float), 256);
     ggml_backend_buffer_type_t buft = ggml_backend_get_default_buffer_type(session->backend);
-    if (session->slot_bytes < slot_need) {
+    if (session->slot_bytes < slot_alloc) {
         for (auto & buf : session->slot_buf) {
             if (buf) { ggml_backend_buffer_free(buf); buf = nullptr; }
         }
         session->slot_bytes = 0;
         for (int s = 0; s < nslots; ++s) {
-            session->slot_buf[s] = ggml_backend_buft_alloc_buffer(buft, slot_need);
+            session->slot_buf[s] = ggml_backend_buft_alloc_buffer(buft, slot_alloc);
             if (!session->slot_buf[s]) {
                 set_error(error, error_size, "vulkan device layer slot buffer failed");
                 return false;
             }
         }
-        session->slot_bytes = slot_need;
+        session->slot_bytes = slot_alloc;
     }
     const auto t0 = std::chrono::steady_clock::now();
     const size_t alignment = std::max<size_t>(ggml_backend_buft_get_alignment(buft), 128);
@@ -832,8 +922,9 @@ bool expert_device_layer(void * raw, const ggml_tensor * activation, int32_t up_
     std::vector<int> down_cols(size_t(n_experts), 0);
     std::vector<size_t> down_off(size_t(n_experts), 0);
     double compute_us = 0;
+    size_t used = 0;
     if (expert_buckets_compute(session, activation, up_type, down_type, latent, hidden,
-                up_bytes, down_bytes, experts, n_experts, down_off, down_cols)) {
+                up_bytes, down_bytes, experts, n_experts, down_off, down_cols, used)) {
         compute_us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count();
     } else {
     const int graph_nodes = n_experts * 32 + 256;
@@ -906,9 +997,12 @@ bool expert_device_layer(void * raw, const ggml_tensor * activation, int32_t up_
             sets.back().bytes = bytes;
             return true;
         };
-        if (!place_weight(up_w, item.up, up_bytes) || !place_weight(gate_w, item.gate, up_bytes) ||
-                !place_weight(down_w, item.down, down_bytes) || !take(rows) || !take(up_out) ||
-                !take(gate_out) || !take(hidden_out) || !take(down_out)) {
+        bool placed = place_weight(up_w, item.up, up_bytes) && place_weight(gate_w, item.gate, up_bytes) &&
+                place_weight(down_w, item.down, down_bytes) && take(rows) && take(up_out) &&
+                take(gate_out) && take(hidden_out);
+        // Whole rows from the buffer base, so the reduce can address them by row.
+        if (placed && row_bytes % alignment == 0) { cursor = round_up(cursor, row_bytes); }
+        if (!placed || !take(down_out)) {
             ggml_free(ctx);
             set_error(error, error_size, "vulkan device layer staging cap");
             return false;
@@ -922,6 +1016,7 @@ bool expert_device_layer(void * raw, const ggml_tensor * activation, int32_t up_
         set_error(error, error_size, "vulkan device layer staging allocation failed");
         return false;
     }
+    used = cursor;
     void * base = ggml_backend_buffer_get_base(session->batch_buffer);
     void * ahead_base = session->ahead_buffer ? ggml_backend_buffer_get_base(session->ahead_buffer) : nullptr;
     for (const auto & item : sets) {
@@ -954,6 +1049,15 @@ bool expert_device_layer(void * raw, const ggml_tensor * activation, int32_t up_
     ggml_backend_synchronize(session->backend);
     compute_us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count();
     ggml_free(ctx);
+    }
+
+    double rows_us = 0;
+    if (reduce_by_rows(session, routes, n_routes, n_experts, nslots, ntokens, latent, down_off, down_cols, used,
+                output, rows_us)) {
+        std::fprintf(stderr, "[kimi_vk_device] experts=%d routes=%d compute_us=%.0f rows_us=%.0f\n",
+                n_experts, n_routes, compute_us, rows_us);
+        note_free(session);
+        return true;
     }
 
     const auto t1 = std::chrono::steady_clock::now();
