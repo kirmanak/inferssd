@@ -1818,6 +1818,8 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         bool (*record)(ggml_backend_t, ggml_cgraph *) = nullptr;
         bool (*submit)(ggml_backend_t) = nullptr;
         void (*drop)(ggml_backend_t) = nullptr;
+        bool (*early)(ggml_backend_t) = nullptr;
+        bool (*record_late)(ggml_backend_t, ggml_cgraph *, const ggml_tensor * const *, int) = nullptr;
         bool enabled = false;
         bool looked = false;
     } park;
@@ -1839,6 +1841,9 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         park.record = (bool (*)(ggml_backend_t, ggml_cgraph *)) ggml_backend_reg_get_proc_address(reg, "ggml_vk_park_record");
         park.submit = (bool (*)(ggml_backend_t)) ggml_backend_reg_get_proc_address(reg, "ggml_vk_park_submit");
         park.drop = (void (*)(ggml_backend_t)) ggml_backend_reg_get_proc_address(reg, "ggml_vk_park_drop");
+        park.early = (bool (*)(ggml_backend_t)) ggml_backend_reg_get_proc_address(reg, "ggml_vk_park_submit_early");
+        park.record_late = (bool (*)(ggml_backend_t, ggml_cgraph *, const ggml_tensor * const *, int))
+                ggml_backend_reg_get_proc_address(reg, "ggml_vk_park_record_late");
         park.enabled = park.record && park.submit && park.drop;
         read_batch = (bool (*)(const ggml_tensor * const *, void **, const size_t *, int))
                 ggml_backend_reg_get_proc_address(reg, "ggml_vk_read_batch");
@@ -2072,6 +2077,11 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         if (sched->ssd_hooks && !sched->ssd_hooks->fence(sched->ssd_userdata, split_backend)) {
             return GGML_STATUS_FAILED;
         }
+        // The parked split's nodes that read none of its inputs (the shared expert) run on the GPU while this
+        // split computes on another backend. Its inputs are copied by now, so the GPU work cannot hold them up.
+        if (park.enabled && park.early && parked_backend && parked_backend != split_backend && parked_split > split_id) {
+            park.early(parked_backend);
+        }
         bool skipped_compute = false;
         if (park.enabled && parked_split == split_id && parked_backend == split_backend) {
             if (park.submit(split_backend)) {
@@ -2152,7 +2162,22 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                 }
                 if (next >= 0) {
                     const int64_t park_t0 = ggml_time_us();
-                    if (park.record(split_backend, &splits[next].graph)) {
+                    // the next split's inputs from other backends: they are copied after the splits between
+                    const ggml_tensor * late[GGML_SCHED_MAX_SPLIT_INPUTS];
+                    int n_late = 0;
+                    const ggml_backend_sched_split & ns = splits[next];
+                    for (int i = 0; i < ns.n_inputs; ++i) {
+                        if (ggml_backend_sched_get_tensor_backend(sched, ns.inputs[i]) != split_backend) {
+                            const ggml_tensor * cpy = tensor_copy(ns.inputs[i], ns.backend_id, sched->cur_copy);
+                            if (cpy) {
+                                late[n_late++] = cpy;
+                            }
+                        }
+                    }
+                    const bool recorded = park.record_late ?
+                        park.record_late(split_backend, &splits[next].graph, late, n_late) :
+                        park.record(split_backend, &splits[next].graph);
+                    if (recorded) {
                         park_us += (double) (ggml_time_us() - park_t0);
                         parked_split = next;
                         parked_backend = split_backend;

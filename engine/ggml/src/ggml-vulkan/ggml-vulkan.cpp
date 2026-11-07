@@ -2080,6 +2080,10 @@ struct ggml_backend_vk_context {
         bool reusable = false;
         vk_context held;
         vk_command_buffer * cmd = nullptr;
+        // The record's first command buffer when it was cut: the nodes before the first one that reads an input
+        // from another backend, which ggml_vk_park_submit_early submits while that backend computes it.
+        vk_command_buffer * cmd_early = nullptr;
+        bool early_submitted = false;
         std::vector<vk::DescriptorPool> pools;
         std::vector<vk::DescriptorSet> sets;
         uint32_t set_idx = 0;
@@ -2087,6 +2091,8 @@ struct ggml_backend_vk_context {
         bool sem_ready = false;
     };
     decode_park parks[2];
+    // the parked split's inputs that another backend writes after the record, see ggml_vk_park_record_late
+    std::vector<const ggml_tensor *> park_late;
     int park_slot = -1;
     int park_ready = -1;
     bool park_mode = false;
@@ -16857,6 +16863,30 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
             kimi_op_time = false;
         }
     }
+    // A parked decode record is cut before the first node that reads one of the split's inputs from another
+    // backend, which that backend writes after the record. The nodes before the cut can be submitted early, see
+    // ggml_vk_park_submit_early.
+    int park_cut = -1;
+    if (ctx->park_mode && !ctx->park_late.empty()) {
+        const auto is_late = [&](const ggml_tensor * t) {
+            while (t->view_src) {
+                t = t->view_src;
+            }
+            return std::find(ctx->park_late.begin(), ctx->park_late.end(), t) != ctx->park_late.end();
+        };
+        for (int j = 0; j < cgraph->n_nodes && park_cut < 0; ++j) {
+            const ggml_tensor * node = cgraph->nodes[j];
+            if (ggml_op_is_empty(node->op)) {
+                continue;
+            }
+            for (int k = 0; k < GGML_MAX_SRC; ++k) {
+                if (node->src[k] && is_late(node->src[k])) {
+                    park_cut = j;
+                    break;
+                }
+            }
+        }
+    }
     for (int i = 0; i < cgraph->n_nodes; i++) {
         if (first_node_in_batch) {
             submit_node_idx = i;
@@ -17126,6 +17156,21 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 ctx->fused_rms_norm_scale = false;
                 ctx->fused_rms_norm_gate = false;
             }
+        }
+
+        // Cut the parked record before the fused group that reaches the first late node, if anything comes before
+        // it. The second command buffer starts with a barrier: the first may still run when the second starts.
+        if (park_cut > 0 && i + ctx->num_additional_fused_ops >= park_cut) {
+            if (i > 0) {
+                auto & park = ctx->parks[ctx->park_slot];
+                if (park.held && park.held->s) {
+                    ggml_vk_ctx_begin(ctx->device, park.held);
+                    ctx->unsynced_nodes_written.clear();
+                    ctx->unsynced_nodes_read.clear();
+                    ggml_vk_sync_buffers(ctx, park.held);
+                }
+            }
+            park_cut = -1;
         }
 
         // Signal the almost_ready fence when the graph is mostly complete (< 20% remaining)
@@ -17426,10 +17471,35 @@ static void ggml_vk_park_reset_slot(ggml_backend_vk_context::decode_park & slot)
         slot.cmd->in_use = false;
         slot.cmd = nullptr;
     }
+    if (slot.cmd_early) {
+        slot.cmd_early->buf.reset();
+        slot.cmd_early->in_use = false;
+        slot.cmd_early = nullptr;
+    }
+    slot.early_submitted = false;
     slot.held.reset();
     slot.recorded = false;
     slot.set_idx = 0;
     slot.reusable = false;
+}
+
+extern "C" bool ggml_vk_park_record(ggml_backend_t backend, ggml_cgraph * graph);
+
+// As ggml_vk_park_record, with the graph's inputs that another backend writes after the record: the record is cut
+// before the first node that reads one, and ggml_vk_park_submit_early submits the nodes before it.
+extern "C" bool ggml_vk_park_record_late(ggml_backend_t backend, ggml_cgraph * graph,
+                                         const ggml_tensor * const * late, int n_late) {
+    if (!backend) { return false; }
+    auto * ctx = static_cast<ggml_backend_vk_context *>(backend->context);
+    static const bool off = getenv("INFERSSD_NO_PARK_EARLY") != nullptr;
+    if (ctx && !off && late && n_late > 0) {
+        ctx->park_late.assign(late, late + n_late);
+    }
+    const bool ok = ggml_vk_park_record(backend, graph);
+    if (ctx) {
+        ctx->park_late.clear();
+    }
+    return ok;
 }
 
 extern "C" bool ggml_vk_park_record(ggml_backend_t backend, ggml_cgraph * graph) {
@@ -17497,6 +17567,7 @@ extern "C" bool ggml_vk_park_record(ggml_backend_t backend, ggml_cgraph * graph)
             return false;
         }
         park.cmd = park.held->seqs.back().back().buffer;
+        park.cmd_early = park.held->seqs.size() == 2 ? park.held->seqs.front().front().buffer : nullptr;
         park.recorded = true;
         ctx->park_ready = slot;
         return true;
@@ -17550,10 +17621,35 @@ extern "C" bool ggml_vk_park_submit(ggml_backend_t backend) {
     return true;
 }
 
+// Submits the parked record's first command buffer, when the record was cut: the nodes before the first that reads
+// an input from another backend. They run while that backend computes the input.
+extern "C" bool ggml_vk_park_submit_early(ggml_backend_t backend) {
+    if (!backend) { return false; }
+    std::lock_guard<std::recursive_mutex> compute_lock(vk_compute_mutex);
+    auto * ctx = static_cast<ggml_backend_vk_context *>(backend->context);
+    if (!ctx || ctx->park_ready < 0) { return false; }
+    auto & park = ctx->parks[ctx->park_ready];
+    if (!park.recorded || park.early_submitted || !park.cmd_early || !park.held || park.held->seqs.size() != 2 ||
+            !park.held->in_memcpys.empty()) {
+        return false;
+    }
+    std::vector<std::vector<vk_submission>> rest = { std::move(park.held->seqs.back()) };
+    park.held->seqs.pop_back();
+    ggml_vk_submit(park.held, {});
+    park.held->seqs = std::move(rest);
+    park.early_submitted = true;
+    ctx->submit_pending = true;
+    return true;
+}
+
 extern "C" void ggml_vk_park_drop(ggml_backend_t backend) {
     if (!backend) { return; }
     auto * ctx = static_cast<ggml_backend_vk_context *>(backend->context);
     if (!ctx || ctx->park_ready < 0) { return; }
+    // An early part on the queue still runs from its command buffer: wait before the reset.
+    if (ctx->parks[ctx->park_ready].early_submitted) {
+        ggml_vk_synchronize(ctx);
+    }
     ggml_vk_park_reset_slot(ctx->parks[ctx->park_ready]);
     ctx->park_ready = -1;
 }
@@ -18908,6 +19004,12 @@ static void * ggml_backend_vk_reg_get_proc_address(ggml_backend_reg_t reg, const
     }
     if (name && strcmp(name, "ggml_vk_park_submit") == 0) {
         return (void *) ggml_vk_park_submit;
+    }
+    if (name && strcmp(name, "ggml_vk_park_record_late") == 0) {
+        return (void *) ggml_vk_park_record_late;
+    }
+    if (name && strcmp(name, "ggml_vk_park_submit_early") == 0) {
+        return (void *) ggml_vk_park_submit_early;
     }
     if (name && strcmp(name, "ggml_vk_park_drop") == 0) {
         return (void *) ggml_vk_park_drop;
