@@ -811,7 +811,10 @@ ggml_tensor * llm_build_qwen4exp::build_layer_ffn(ggml_tensor * cur, const int i
     GGML_ASSERT(model.layers[il].ffn_gate_inp != nullptr);
 
     if (il + 1 < n_layer) {
-        cpu_sink_prefetch_hint = build_moe_prefetch_hint(cur, nullptr, model.layers[il + 1].ffn_gate_inp, nullptr,
+        // the loader's Q8_0 copy of the next router where it made one
+        const auto & next = model.layers[il + 1];
+        ggml_tensor * next_gate_inp = next.ffn_gate_inp_hint ? next.ffn_gate_inp_hint : next.ffn_gate_inp;
+        cpu_sink_prefetch_hint = build_moe_prefetch_hint(cur, nullptr, next_gate_inp, nullptr,
             LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX, n_expert, il);
     }
 

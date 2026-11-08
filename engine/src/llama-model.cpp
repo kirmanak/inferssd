@@ -8965,6 +8965,62 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
                 skipped_non_mmap, failures);
     }
 
+    // The decode prefetch hint scores the next layer's F32 router against the current stream before the CPU split, on
+    // the path each token waits on. A Q8_0 copy reads under a third of the bytes there. Only the hint reads it: the
+    // routing keeps the F32 weights, so only which experts the sink prefetches can change.
+    if (arch == LLM_ARCH_QWEN4EXP && !ml.no_alloc && getenv("INFERSSD_NO_HINT_Q8") == nullptr) {
+        std::vector<int> hint_layers;
+        ggml_backend_buffer_type_t hint_buft = nullptr;
+        for (int il = 1; il < (int) layers.size(); ++il) {
+            const ggml_tensor * w = layers[il].ffn_gate_inp;
+            if (!w || w->type != GGML_TYPE_F32 || !w->buffer || ggml_backend_buffer_is_host(w->buffer) ||
+                    ggml_n_dims(w) != 2 || w->ne[0] % ggml_blck_size(GGML_TYPE_Q8_0) != 0) {
+                continue;
+            }
+            ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(w->buffer);
+            if (hint_buft && buft != hint_buft) {
+                continue;
+            }
+            hint_buft = buft;
+            hint_layers.push_back(il);
+        }
+        if (!hint_layers.empty()) {
+            ggml_init_params params = {
+                /*.mem_size   =*/ ggml_tensor_overhead() * hint_layers.size(),
+                /*.mem_buffer =*/ nullptr,
+                /*.no_alloc   =*/ true,
+            };
+            ggml_context_ptr hint_ctx { ggml_init(params) };
+            for (int il : hint_layers) {
+                const ggml_tensor * w = layers[il].ffn_gate_inp;
+                ggml_tensor * t = ggml_new_tensor_2d(hint_ctx.get(), GGML_TYPE_Q8_0, w->ne[0], w->ne[1]);
+                ggml_format_name(t, "blk.%d.ffn_gate_inp_hint", il);
+                layers[il].ffn_gate_inp_hint = t;
+            }
+            ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(hint_ctx.get(), hint_buft);
+            if (buf == nullptr) {
+                throw std::runtime_error(format("unable to allocate %s buffer", ggml_backend_buft_name(hint_buft)));
+            }
+            ggml_backend_buffer_set_usage(buf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+            std::vector<float> src;
+            std::vector<uint8_t> dst;
+            for (int il : hint_layers) {
+                const ggml_tensor * w = layers[il].ffn_gate_inp;
+                ggml_tensor * t = layers[il].ffn_gate_inp_hint;
+                src.resize(ggml_nelements(w));
+                dst.resize(ggml_nbytes(t));
+                ggml_backend_tensor_get(w, src.data(), 0, ggml_nbytes(w));
+                ggml_quantize_chunk(GGML_TYPE_Q8_0, src.data(), dst.data(), 0, w->ne[1], w->ne[0], nullptr);
+                ggml_backend_tensor_set(t, dst.data(), 0, dst.size());
+            }
+            LLAMA_LOG_INFO("%s: Q8_0 prefetch hint routers: %zu layers, %.2f MiB on %s\n", __func__, hint_layers.size(),
+                    ggml_backend_buffer_get_size(buf) / 1024.0 / 1024.0, ggml_backend_buft_name(hint_buft));
+            std::vector<ggml_backend_buffer_ptr> hint_bufs;
+            hint_bufs.emplace_back(buf);
+            pimpl->ctxs_bufs.emplace_back(std::move(hint_ctx), std::move(hint_bufs));
+        }
+    }
+
     if (defer_expert_mmap) {
         ml.drop_mmap_expert_pages();
         LLAMA_LOG_INFO("%s: dense parameters loaded, expert mmap pages deferred/dropped (dense %.2f GiB, deferred %.2f GiB)\n",
