@@ -225,6 +225,8 @@ struct vk_command_pool {
     // Using deque so the pointers to command buffers
     // remain valid even if we add more
     std::deque<vk_command_buffer> cmd_buffers;
+    // its command buffers may be submitted more than once (a cached park record)
+    bool reusable = false;
 
     vk_queue *q;
 
@@ -942,6 +944,9 @@ void vk_command_pool::destroy(vk::Device& device) {
     cmd_buffers.clear();
 }
 
+// Bumped whenever a device buffer is destroyed: a cached park record may hold its address, see ggml_vk_park_record.
+static std::atomic<uint64_t> vk_buffer_epoch{0};
+
 struct vk_buffer_struct {
     vk::Buffer buffer = VK_NULL_HANDLE;
     vk::DeviceMemory device_memory = VK_NULL_HANDLE;
@@ -956,6 +961,7 @@ struct vk_buffer_struct {
         if (size == 0) {
             return;
         }
+        vk_buffer_epoch.fetch_add(1, std::memory_order_relaxed);
         VK_LOG_DEBUG("~vk_buffer_struct(" << buffer << ", " << size << ")");
 
         device->device.freeMemory(device_memory);
@@ -2116,8 +2122,20 @@ struct ggml_backend_vk_context {
         uint32_t set_idx = 0;
         vk_semaphore copy_sem {};
         bool sem_ready = false;
+        // A cached record of one split, submitted again while its key matches: the graph's fingerprint when it was
+        // recorded, its submissions before the first submit took them, and what the record told the scheduler.
+        uint64_t key = 0;
+        bool cached = false;
+        std::vector<std::vector<vk_submission>> saved_seqs;
+        bool saved_folded = false;
+        bool saved_reads = false;
+        // the record's dispatches hashed, for INFERSSD_PARK_CACHE_VERIFY
+        uint64_t trace = 0;
     };
-    decode_park parks[2];
+    // Two slots for records that are not cached, then one per cached split.
+    std::deque<decode_park> parks = std::deque<decode_park>(2);
+    std::unordered_map<const ggml_cgraph *, int> park_by_graph;
+    uint64_t park_trace = 0;
     // the parked split's inputs that another backend writes after the record, and their sources, see
     // ggml_vk_park_record_late
     std::vector<const ggml_tensor *> park_late;
@@ -3043,6 +3061,7 @@ static void ggml_vk_sync_buffers(ggml_backend_vk_context* ctx, vk_context& subct
     const bool transfer_queue = subctx->p->q->transfer_only;
 
     if (ctx) {
+        if (ctx->park_mode) { ctx->park_trace = (ctx->park_trace ^ 0x5a5a5a5aull) * 0xff51afd7ed558ccdull; }
         ctx->prealloc_x_need_sync = ctx->prealloc_y_need_sync = ctx->prealloc_split_k_need_sync = false;
     }
 
@@ -6796,6 +6815,29 @@ static vk_submission ggml_vk_begin_submission(vk_device& device, vk_command_pool
     return s;
 }
 
+// A fast hash of words and of tensors (each tensor's fields up to its name), for the park cache.
+struct ggml_vk_park_hash {
+    uint64_t a = 0x9e3779b97f4a7c15ull, b = 0xc2b2ae3d27d4eb4full, c = 0x165667b19e3779f9ull, d = 0x27d4eb2f165667c5ull;
+    void word(uint64_t v) { a = (a ^ v) * 0xff51afd7ed558ccdull; a ^= a >> 29; }
+    void tensor(const ggml_tensor * t) {
+        word((uint64_t) (uintptr_t) t);
+        if (!t) { return; }
+        constexpr size_t n = offsetof(ggml_tensor, name) / sizeof(uint64_t);
+        uint64_t w[n];
+        memcpy(w, t, sizeof(w));
+        size_t k = 0;
+        for (; k + 4 <= n; k += 4) {
+            a = (a ^ w[k + 0]) * 0xff51afd7ed558ccdull;
+            b = (b ^ w[k + 1]) * 0xc4ceb9fe1a85ec53ull;
+            c = (c ^ w[k + 2]) * 0xff51afd7ed558ccdull;
+            d = (d ^ w[k + 3]) * 0xc4ceb9fe1a85ec53ull;
+            a ^= a >> 31; b ^= b >> 29; c ^= c >> 31; d ^= d >> 29;
+        }
+        for (; k < n; ++k) { word(w[k]); }
+    }
+    uint64_t value() const { return a ^ (b * 3) ^ (c * 5) ^ (d * 7); }
+};
+
 template <typename T> size_t push_constant_size(const T &t) {
     static_assert(std::is_class<T>::value, "T must be a struct/class");
     GGML_UNUSED(t);
@@ -6851,6 +6893,19 @@ static void ggml_vk_dispatch_pipeline(ggml_backend_vk_context* ctx, vk_context& 
         GGML_ASSERT(ctx->descriptor_set_idx < ctx->descriptor_sets.size());
         descriptor_set = ctx->descriptor_sets[ctx->descriptor_set_idx++];
     }
+    if (ctx->park_mode) {
+        ggml_vk_park_hash h;
+        h.a = ctx->park_trace;
+        h.word((uint64_t) (uintptr_t) (VkPipeline) pipeline->pipeline);
+        h.word(wg0); h.word(wg1); h.word(wg2);
+        const size_t pc = push_constant_size(push_constants);
+        const uint8_t * pd = reinterpret_cast<const uint8_t *>(push_constant_data(push_constants));
+        for (size_t k = 0; k < pc; k += 4) { uint32_t v = 0; memcpy(&v, pd + k, std::min<size_t>(4, pc - k)); h.word(v); }
+        for (const auto & b : descriptor_buffer_infos) {
+            h.word((uint64_t) (uintptr_t) (VkBuffer) b.buffer); h.word(b.offset); h.word(b.range);
+        }
+        ctx->park_trace = h.a;
+    }
     vk::WriteDescriptorSet write_descriptor_set{ descriptor_set, 0, 0, pipeline->parameter_count, vk::DescriptorType::eStorageBuffer, nullptr, descriptor_buffer_infos.begin() };
     ctx->device->device.updateDescriptorSets({ write_descriptor_set }, {});
 
@@ -6887,7 +6942,7 @@ static void ggml_vk_ctx_begin(vk_device& device, vk_context& subctx) {
         ggml_vk_ctx_end(subctx);
     }
 
-    subctx->seqs.push_back({ ggml_vk_begin_submission(device, *subctx->p) });
+    subctx->seqs.push_back({ ggml_vk_begin_submission(device, *subctx->p, !subctx->p->reusable) });
     subctx->s = subctx->seqs[subctx->seqs.size() - 1].data();
 }
 
@@ -17972,6 +18027,9 @@ static void ggml_vk_park_reset_slot(ggml_backend_vk_context::decode_park & slot)
     slot.recorded = false;
     slot.set_idx = 0;
     slot.reusable = false;
+    slot.key = 0;
+    slot.cached = false;
+    slot.saved_seqs.clear();
 }
 
 extern "C" bool ggml_vk_park_record(ggml_backend_t backend, ggml_cgraph * graph);
@@ -18006,6 +18064,30 @@ extern "C" bool ggml_vk_park_record_late(ggml_backend_t backend, ggml_cgraph * g
     return ok;
 }
 
+// Everything a parked record depends on, hashed: the graph's nodes and their sources (each tensor's fields up to
+// its name: type, buffer, shape, strides, op, op params, flags, sources, view and data), the late inputs and reads
+// the scheduler handed over, the scratch buffers, and the count of destroyed buffers.
+static uint64_t ggml_vk_park_fingerprint(ggml_backend_vk_context * ctx, const ggml_cgraph * graph) {
+    ggml_vk_park_hash h;
+    h.word((uint64_t) graph->n_nodes);
+    for (int i = 0; i < graph->n_nodes; ++i) {
+        const ggml_tensor * n = graph->nodes[i];
+        h.tensor(n);
+        for (int k = 0; k < GGML_MAX_SRC; ++k) { if (n->src[k]) { h.tensor(n->src[k]); } }
+    }
+    for (const ggml_tensor * t : ctx->park_late) { h.word((uint64_t) (uintptr_t) t); }
+    for (const ggml_tensor * t : ctx->park_late_src) { h.tensor(t); }
+    for (const ggml_tensor * t : ctx->park_reads_srcs) { h.word((uint64_t) (uintptr_t) t); }
+    for (size_t z : ctx->park_reads_sizes) { h.word((uint64_t) z); }
+    for (const vk_buffer * b : { &ctx->prealloc_x, &ctx->prealloc_y, &ctx->prealloc_split_k, &ctx->prealloc_add_rms_partials }) {
+        h.word((uint64_t) (uintptr_t) (*b ? (VkBuffer) (*b)->buffer : VK_NULL_HANDLE));
+        h.word((uint64_t) (*b ? (*b)->size : 0));
+    }
+    // a destroyed buffer's handle and address can come back for a new one
+    h.word(vk_buffer_epoch.load(std::memory_order_relaxed));
+    return h.value();
+}
+
 extern "C" bool ggml_vk_park_record(ggml_backend_t backend, ggml_cgraph * graph) {
     if (!backend || !graph || !ggml_vk_graph_is_decode_one(graph)) { return false; }
     // The perf logger times a live compute context; a parked record has none and crashed on the first decode token.
@@ -18025,15 +18107,49 @@ extern "C" bool ggml_vk_park_record(ggml_backend_t backend, ggml_cgraph * graph)
     // The decode graph is already on the queue. Submit its fence now. A wait
     // here does not overlap the record on this driver.
     ggml_vk_submit_pending_fence(ctx, false);
+    // A decode split records the same commands every token while its graph and buffers stay. Its record is kept
+    // and submitted again while the fingerprint matches. INFERSSD_PARK_CACHE_VERIFY records anyway and compares
+    // the dispatches.
+    static const bool cache_on = getenv("INFERSSD_NO_PARK_CACHE") == nullptr;
+    static const bool verify = getenv("INFERSSD_PARK_CACHE_VERIFY") != nullptr;
     int slot = -1;
-    for (int i = 0; i < 2; ++i) {
-        if (!ctx->parks[i].in_flight) { slot = i; break; }
+    uint64_t key = 0;
+    uint64_t verify_trace = 0;
+    if (cache_on) {
+        key = ggml_vk_park_fingerprint(ctx, graph);
+        auto it = ctx->park_by_graph.find(graph);
+        if (it == ctx->park_by_graph.end()) {
+            ctx->parks.emplace_back();
+            slot = int(ctx->parks.size()) - 1;
+            ctx->park_by_graph[graph] = slot;
+        } else {
+            slot = it->second;
+        }
+        auto & park = ctx->parks[slot];
+        if (park.in_flight) { return false; }
+        if (park.cached && park.key == key && park.held && !park.saved_seqs.empty()) {
+            if (!verify) {
+                park.held->seqs = park.saved_seqs;
+                park.early_submitted = false;
+                park.reads_recorded = park.saved_reads;
+                park.recorded = true;
+                ctx->park_folded = park.saved_folded;
+                ctx->park_ready = slot;
+                return true;
+            }
+            verify_trace = park.trace;
+        }
+    } else {
+        for (int i = 0; i < 2; ++i) {
+            if (!ctx->parks[i].in_flight) { slot = i; break; }
+        }
     }
     if (slot < 0) { return false; }
     auto & park = ctx->parks[slot];
     try {
         if (!park.pool_ready) {
             park.pool.init(ctx->device, &ctx->device->compute_queue);
+            park.pool.reusable = cache_on && slot >= 2;
             park.pool_ready = true;
             vk::SemaphoreTypeCreateInfo tci{ vk::SemaphoreType::eTimeline, 0 };
             vk::SemaphoreCreateInfo ci{};
@@ -18054,6 +18170,7 @@ extern "C" bool ggml_vk_park_record(ggml_backend_t backend, ggml_cgraph * graph)
         const bool saved_k = ctx->prealloc_split_k_need_sync;
         ctx->park_mode = true;
         ctx->park_slot = slot;
+        ctx->park_trace = 0;
         struct clear_mode {
             ggml_backend_vk_context * ctx;
             ~clear_mode() { ctx->park_mode = false; }
@@ -18073,6 +18190,33 @@ extern "C" bool ggml_vk_park_record(ggml_backend_t backend, ggml_cgraph * graph)
         park.cmd = park.held->seqs.back().back().buffer;
         park.cmd_early = park.held->seqs.size() == 2 ? park.held->seqs.front().front().buffer : nullptr;
         park.recorded = true;
+        park.trace = ctx->park_trace;
+        if (verify_trace != 0) {
+            static int checked = 0, mismatched = 0;
+            ++checked;
+            if (verify_trace != park.trace) { ++mismatched; }
+            if (checked % 500 == 0 || (verify_trace != park.trace && mismatched <= 5)) {
+                std::fprintf(stderr, "[kimi_vk_park_cache] verify checked=%d mismatched=%d\n", checked, mismatched);
+            }
+        }
+        // Only a record of one or two plain submissions with no host copies is kept: each is submitted as recorded.
+        if (cache_on && slot >= 2) {
+            size_t n_subs = 0;
+            for (const auto & seq : park.held->seqs) { n_subs += seq.size(); }
+            park.cached = park.held->in_memcpys.empty() && park.held->out_memcpys.empty() && n_subs <= 2 &&
+                    park.held->seqs.size() <= 2;
+            for (const auto & seq : park.held->seqs) {
+                for (const auto & sub : seq) {
+                    if (!sub.wait_semaphores.empty() || !sub.signal_semaphores.empty()) { park.cached = false; }
+                }
+            }
+            if (park.cached) {
+                park.key = key;
+                park.saved_seqs = park.held->seqs;
+                park.saved_folded = ctx->park_folded;
+                park.saved_reads = park.reads_recorded;
+            }
+        }
         ctx->park_ready = slot;
         return true;
     } catch (...) {
