@@ -18504,12 +18504,16 @@ static void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * 
 
                 int rope_idx = j;
 
-                // When we've found RMS_NORM + MUL, try to find a ROPE that uses it
+                // When we've found RMS_NORM + MUL, try to find a ROPE that uses it. Only a ROPE that RMS_NORM_MUL_ROPE
+                // can take: pulled up unfused, it waits on the MUL, and the chains of several norms run one after another.
+                static const bool rope_any = getenv("INFERSSD_REORDER_ROPE_ANY") != nullptr;
                 if (j > 0 &&
                     graph->nodes[j]->op == GGML_OP_MUL &&
                     graph->nodes[j-1]->op == GGML_OP_RMS_NORM) {
                     for (int k = j + 1; k < std::min(j + 15, graph->n_nodes); ++k) {
+                        const int rope_mode = graph->nodes[k]->op == GGML_OP_ROPE ? ((const int32_t *) graph->nodes[k]->op_params)[2] : -1;
                         if (graph->nodes[k]->op == GGML_OP_ROPE &&
+                            (rope_any || rope_mode == GGML_ROPE_TYPE_NEOX || rope_mode == GGML_ROPE_TYPE_NORMAL) &&
                             graph->nodes[k]->src[0] == graph->nodes[j] &&
                             // Check that other srcs are already valid
                             graph->nodes[k]->src[1]->op == GGML_OP_NONE &&
