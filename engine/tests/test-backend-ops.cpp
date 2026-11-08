@@ -3780,6 +3780,92 @@ struct test_sigmoid_mul_add_hc_post : public test_case {
     }
 };
 
+// The gated DSV4_HC_POST of a block output, after a SIGMOID + MUL + ADD (sma) or not, and the grouped RMS_NORM + MUL
+// by a [n_embd, hc] gamma of its output: a hyper-connection combine and the next block's norm, which a backend may
+// fuse. Both the combine and the norm are checked.
+struct test_hc_post_norm : public test_case {
+    const int64_t n_embd;
+    const int64_t hc;
+    const int64_t n_tokens;
+    const bool sma;
+    const bool identity;
+    // the residual is a node whose block the outputs may take, as the previous combine's is in a model
+    const bool r_node;
+    ggml_tensor * post = nullptr;
+    ggml_tensor * normed = nullptr;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "HC_POST_NORM";
+    }
+
+    bool run_whole_graph() override { return true; }
+    std::vector<ggml_tensor *> fusion_test_nodes() override { return { post, normed }; }
+
+    std::string vars() override {
+        return VARS_TO_STR6(n_embd, hc, n_tokens, sma, identity, r_node);
+    }
+
+    test_hc_post_norm(int64_t n_embd = 2560, int64_t hc = 4, int64_t n_tokens = 1, bool sma = false, bool identity = true,
+                      bool r_node = false)
+        : n_embd(n_embd), hc(hc), n_tokens(n_tokens), sma(sma), identity(identity), r_node(r_node) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * a = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_tokens);
+        ggml_tensor * b = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_tokens);
+        ggml_tensor * r = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, hc, n_tokens);
+        ggml_tensor * w = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hc, n_tokens);
+        ggml_tensor * gamma = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, hc);
+        ggml_set_name(a, "a");
+        ggml_set_name(r, "r");
+        ggml_set_name(w, "w");
+        ggml_set_name(gamma, "gamma");
+        // a computed input and a chain of nodes, as a backend may fuse only in graphs of more than a few nodes
+        ggml_tensor * x = a;
+        for (int i = 0; i < 40; ++i) {
+            x = ggml_add(ctx, x, b);
+        }
+        x = ggml_neg(ctx, x);
+        if (r_node) {
+            r = ggml_neg(ctx, r);
+        }
+        if (sma) {
+            ggml_tensor * c = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_tokens);
+            ggml_tensor * g = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 1);
+            ggml_set_name(c, "c");
+            ggml_set_name(g, "g");
+            x = ggml_add(ctx, c, ggml_mul(ctx, x, ggml_sigmoid(ctx, g)));
+        }
+        if (identity) {
+            post = ggml_dsv4_hc_post_gated(ctx, x, r, w, nullptr, 1.0f / (float) hc, 2.0f);
+        } else {
+            ggml_tensor * comb = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, hc, hc, n_tokens);
+            ggml_set_name(comb, "comb");
+            post = ggml_dsv4_hc_post(ctx, x, r, w, comb);
+        }
+        ggml_set_name(post, "post");
+        // the gamma is a leaf, so the multiply directly follows the norm
+        normed = ggml_mul(ctx, ggml_rms_norm(ctx, post, 1e-6f), gamma);
+        ggml_set_name(normed, "normed");
+        // both outputs are read after the norm
+        ggml_tensor * out = ggml_add(ctx, normed, ggml_scale(ctx, post, 0.37f));
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (std::string(ggml_get_name(t)) == "gamma") {
+                init_tensor_uniform(t, 0.5f, 1.5f);
+            } else if (std::string(ggml_get_name(t)) == "comb") {
+                init_tensor_uniform(t, 0.0f, 1.0f);
+            } else {
+                init_tensor_uniform(t, -1.0f, 1.0f);
+            }
+        }
+    }
+};
+
 // GGML_OP_RMS_NORM + GGML_OP_MUL by a weight row, times the GGML_OP_UNARY(SIGMOID) of a gate: the gated norm after
 // a DeltaNet layer, which a backend may fuse
 struct test_rms_norm_mul_sigmoid_mul : public test_case {
@@ -9173,6 +9259,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_sigmoid_mul_add_hc_post(2560, 4, true));
     test_cases.emplace_back(new test_sigmoid_mul_add_hc_post(2560, 4, false));
     test_cases.emplace_back(new test_sigmoid_mul_add_hc_post(1000, 3, true));
+    test_cases.emplace_back(new test_hc_post_norm(2560, 4, 1, false, true));
+    test_cases.emplace_back(new test_hc_post_norm(2560, 4, 1, true, true));
+    test_cases.emplace_back(new test_hc_post_norm(1000, 3, 1, true, true));
+    test_cases.emplace_back(new test_hc_post_norm(2560, 4, 17, false, true));
+    test_cases.emplace_back(new test_hc_post_norm(700, 4, 5, false, false));
+    test_cases.emplace_back(new test_hc_post_norm(2560, 4, 1, false, true, true));
+    test_cases.emplace_back(new test_hc_post_norm(2560, 4, 1, true, true, true));
+    test_cases.emplace_back(new test_hc_post_norm(2560, 4, 17, false, true, true));
+    test_cases.emplace_back(new test_hc_post_norm(700, 4, 5, false, false, true));
     test_cases.emplace_back(new test_rms_norm_mul_sigmoid_mul({ 128, 32, 1, 1 }));
     test_cases.emplace_back(new test_rms_norm_mul_sigmoid_mul({ 128, 32, 2, 1 }));
     test_cases.emplace_back(new test_rms_norm_mul_sigmoid_mul({ 1000, 7, 3, 1 }));

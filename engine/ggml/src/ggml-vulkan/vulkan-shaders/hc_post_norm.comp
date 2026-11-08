@@ -1,0 +1,112 @@
+#version 450
+
+#extension GL_EXT_control_flow_attributes : enable
+#extension GL_KHR_shader_subgroup_basic : enable
+#extension GL_KHR_shader_subgroup_arithmetic : enable
+
+// A hyper-connection combine and the grouped RMS norm after it, as one dispatch: d is the DSV4_HC_POST output, n the
+// RMS_NORM and MUL by gamma of each of d's streams. One workgroup a stream of a token. The combine's sum is
+// dsv4_hc_post.comp's (SIGMOID_MUL_ADD: sigmoid_mul_add.comp's with HC_POST), the norm rms_norm.comp's, its sum of
+// squares reduced by subgroups. Other workgroups still read the sources while one writes, so the caller keeps the
+// outputs apart from them.
+// flag bit 0: a comb is bound; bit 1: the weight is param2 * sigmoid(param * p); bit 2: the block output is
+// c + a * sigmoid(g), with g one value or a's shape (SIGMOID_MUL_ADD), else x.
+// Offsets and strides in floats; d, n and gamma are contiguous.
+
+#define BLOCK_SIZE 512
+// columns a thread holds
+#define MAX_ITERS 8
+
+layout(local_size_x = BLOCK_SIZE, local_size_y = 1, local_size_z = 1) in;
+
+layout (push_constant) uniform parameter
+{
+    uint ne0; uint hc; uint flag; uint g_one;
+    float param; float param2; float eps;
+    uint offs_x; uint offs_g; uint offs_c; uint offs_r; uint offs_p; uint offs_comb; uint offs_d; uint offs_gm; uint offs_n;
+    uint nb01;
+    uint nb11; uint nb12;
+    uint nb20; uint nb21;
+    uint nb30; uint nb31; uint nb32;
+} p;
+
+layout (binding = 0) readonly buffer X {float data_x[];};
+layout (binding = 1) readonly buffer G {float data_g[];};
+layout (binding = 2) readonly buffer C {float data_c[];};
+layout (binding = 3) readonly buffer R {float data_r[];};
+layout (binding = 4) readonly buffer P {float data_p[];};
+layout (binding = 5) readonly buffer Q {float data_comb[];};
+layout (binding = 6) readonly buffer W {float data_gm[];};
+layout (binding = 7) writeonly buffer D {float data_d[];};
+layout (binding = 8) writeonly buffer N {float data_n[];};
+
+shared float partial[BLOCK_SIZE];
+
+void main() {
+    const uint tid = gl_LocalInvocationID.x;
+    const uint s   = gl_WorkGroupID.x;
+    const uint it  = gl_WorkGroupID.y;
+    const uint num_iters = (p.ne0 + BLOCK_SIZE - 1) / BLOCK_SIZE;
+
+    float w = data_p[p.offs_p + s*p.nb20 + it*p.nb21];
+    if ((p.flag & 2u) != 0) {
+        w = p.param2 * float(1. / (1 + exp(-1. * float(w * p.param))));
+    }
+
+    float v[MAX_ITERS];
+    float sum = 0.0;
+    [[unroll]] for (uint idx = 0; idx < MAX_ITERS; ++idx) {
+        const uint i0 = tid + idx*BLOCK_SIZE;
+        v[idx] = 0.0;
+        if (idx >= num_iters || i0 >= p.ne0) {
+            continue;
+        }
+        float x;
+        if ((p.flag & 4u) != 0) {
+            const float g = data_g[p.offs_g + (p.g_one != 0 ? 0 : i0)];
+            const float sg = float(1. / (1 + exp(-1. * g)));
+            precise const float m = data_x[p.offs_x + i0] * sg;
+            x = data_c[p.offs_c + i0] + m;
+        } else {
+            x = data_x[p.offs_x + i0 + it*p.nb01];
+        }
+        float y = x * w;
+        if ((p.flag & 1u) != 0) {
+            for (uint isrc = 0; isrc < p.hc; ++isrc) {
+                y += data_r[p.offs_r + i0 + isrc*p.nb11 + it*p.nb12] *
+                     data_comb[p.offs_comb + s*p.nb30 + isrc*p.nb31 + it*p.nb32];
+            }
+        } else {
+            y += data_r[p.offs_r + i0 + s*p.nb11 + it*p.nb12];
+        }
+        v[idx] = y;
+        sum += y * y;
+    }
+
+    // the subgroups' sums, then their sum
+    sum = subgroupAdd(sum);
+    if (gl_SubgroupInvocationID == 0) {
+        partial[gl_SubgroupID] = sum;
+    }
+    barrier();
+    if (gl_SubgroupID == 0) {
+        sum = gl_SubgroupInvocationID < gl_NumSubgroups ? partial[gl_SubgroupInvocationID] : 0.0;
+        sum = subgroupAdd(sum);
+        if (gl_SubgroupInvocationID == 0) {
+            partial[0] = sum;
+        }
+    }
+    barrier();
+
+    const float mean = partial[0] / float(p.ne0);
+    const float scale = inversesqrt(mean + p.eps);
+    const uint base = it*p.ne0*p.hc + s*p.ne0;
+    [[unroll]] for (uint idx = 0; idx < MAX_ITERS; ++idx) {
+        const uint i0 = tid + idx*BLOCK_SIZE;
+        if (idx >= num_iters || i0 >= p.ne0) {
+            continue;
+        }
+        data_d[p.offs_d + base + i0] = v[idx];
+        data_n[p.offs_n + base + i0] = scale * v[idx] * data_gm[p.offs_gm + s*p.ne0 + i0];
+    }
+}

@@ -887,6 +887,7 @@ void process_shaders() {
     string_to_spv("add_softplus_mul_f32", "add_softplus_mul.comp", {});
     string_to_spv("sigmoid_mul_add_f32", "sigmoid_mul_add.comp", {});
     string_to_spv("sigmoid_mul_add_hc_post_f32", "sigmoid_mul_add.comp", {{"HC_POST", "1"}});
+    string_to_spv("hc_post_norm_f32", "hc_post_norm.comp", {});
 
     string_to_spv("add1_f16_f16",   "add1.comp",        {{"A_TYPE", "float16_t"},   {"B_TYPE", "float16_t"}, {"D_TYPE", "float16_t"}, {"FLOAT_TYPE", "float"}});
     string_to_spv("add1_f16_f32",   "add1.comp",        {{"A_TYPE", "float16_t"},   {"B_TYPE", "float"}, {"D_TYPE", "float16_t"}, {"FLOAT_TYPE", "float"}});

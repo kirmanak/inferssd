@@ -864,6 +864,7 @@ struct vk_device_struct {
     vk_pipeline pipeline_add_softplus_mul_f32;
     vk_pipeline pipeline_sigmoid_mul_add_f32;
     vk_pipeline pipeline_sigmoid_mul_add_hc_post_f32;
+    vk_pipeline pipeline_hc_post_norm_f32;
     vk_pipeline pipeline_opt_step_adamw_f32;
     vk_pipeline pipeline_opt_step_sgd_f32;
     std::map<vk_conv2d_pipeline_state, vk_pipeline> pipeline_conv2d_f32[CONV_SHAPE_COUNT];
@@ -1587,6 +1588,17 @@ struct vk_op_sigmoid_mul_add_push_constants {
     // a fused DSV4_HC_POST's streams, residual and gate offsets, and gate parameters
     uint32_t hc, offs_r, offs_p;
     float param, param2;
+};
+
+// DSV4_HC_POST, or SIGMOID_MUL_ADD and DSV4_HC_POST, then RMS_NORM and MUL; see hc_post_norm.comp
+struct vk_op_hc_post_norm_push_constants {
+    uint32_t ne0, hc, flag, g_one;
+    float param, param2, eps;
+    uint32_t offs_x, offs_g, offs_c, offs_r, offs_p, offs_comb, offs_d, offs_gm, offs_n;
+    uint32_t nb01;
+    uint32_t nb11, nb12;
+    uint32_t nb20, nb21;
+    uint32_t nb30, nb31, nb32;
 };
 
 // ADD + SOFTPLUS + MUL; see add_softplus_mul.comp
@@ -4950,6 +4962,10 @@ static void ggml_vk_load_shaders(vk_device& device) {
     ggml_vk_create_pipeline(device, device->pipeline_add_softplus_mul_f32, "add_softplus_mul_f32", add_softplus_mul_f32_len, add_softplus_mul_f32_data, "main", 4, sizeof(vk_op_add_softplus_mul_push_constants), {256, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_sigmoid_mul_add_f32, "sigmoid_mul_add_f32", sigmoid_mul_add_f32_len, sigmoid_mul_add_f32_data, "main", 4, sizeof(vk_op_sigmoid_mul_add_push_constants), {256, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_sigmoid_mul_add_hc_post_f32, "sigmoid_mul_add_hc_post_f32", sigmoid_mul_add_hc_post_f32_len, sigmoid_mul_add_hc_post_f32_data, "main", 6, sizeof(vk_op_sigmoid_mul_add_push_constants), {256, 1, 1}, {}, 1);
+    // its partial sums fit one subgroup
+    if (device->subgroup_arithmetic && device->subgroup_size >= 16) {
+        ggml_vk_create_pipeline(device, device->pipeline_hc_post_norm_f32, "hc_post_norm_f32", hc_post_norm_f32_len, hc_post_norm_f32_data, "main", 9, sizeof(vk_op_hc_post_norm_push_constants), {1, 1, 1}, {}, 1);
+    }
 
     ggml_vk_create_pipeline(device, device->pipeline_opt_step_adamw_f32, "opt_step_adamw_f32", opt_step_adamw_f32_len, opt_step_adamw_f32_data, "main", 5, sizeof(vk_op_push_constants), {512, 1, 1}, {}, 1);
 
@@ -11145,6 +11161,69 @@ static void ggml_vk_sigmoid_mul_add(ggml_backend_vk_context * ctx, vk_context& s
     ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { a_buf, g_buf, c_buf, d_buf }, pc, { pc.ne, 1, 1 });
 }
 
+// The DSV4_HC_POST at node_idx + post_off, after a SIGMOID_MUL_ADD when post_off is 3, and the RMS_NORM and MUL
+// after it; see hc_post_norm.comp
+static void ggml_vk_hc_post_norm(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_cgraph * cgraph, int node_idx,
+                                 int post_off) {
+    const ggml_tensor * post = cgraph->nodes[node_idx + post_off];
+    const ggml_tensor * norm = cgraph->nodes[node_idx + post_off + 1];
+    const ggml_tensor * mul  = cgraph->nodes[node_idx + post_off + 2];
+    const ggml_tensor * r    = post->src[1];
+    const ggml_tensor * w    = post->src[2];
+    const ggml_tensor * comb = post->src[3];
+
+    vk_pipeline pipeline = ctx->device->pipeline_hc_post_norm_f32;
+    ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
+
+    const auto sub = [&](const ggml_tensor * t, uint32_t & offs) {
+        const vk_subbuffer buf = ggml_vk_tensor_subbuffer(ctx, t, true);
+        offs = (uint32_t)((buf.size - ggml_nbytes(t)) / sizeof(float));
+        return buf;
+    };
+    vk_op_hc_post_norm_push_constants pc {};
+    pc.ne0 = (uint32_t)post->ne[0];
+    pc.hc = (uint32_t)post->ne[1];
+    pc.flag = (comb ? 1u : 0u) | (ggml_get_op_params_i32(post, 0) ? 2u : 0u) | (post_off ? 4u : 0u);
+    pc.param = ggml_get_op_params_f32(post, 1);
+    pc.param2 = ggml_get_op_params_f32(post, 2);
+    pc.eps = ggml_get_op_params_f32(norm, 0);
+
+    vk_subbuffer x_buf, g_buf, c_buf;
+    if (post_off) {
+        const ggml_tensor * sig = cgraph->nodes[node_idx];
+        const ggml_tensor * m   = cgraph->nodes[node_idx + 1];
+        const ggml_tensor * add = cgraph->nodes[node_idx + 2];
+        x_buf = sub(m->src[0], pc.offs_x);
+        g_buf = sub(sig->src[0], pc.offs_g);
+        c_buf = sub(add->src[0] == m ? add->src[1] : add->src[0], pc.offs_c);
+        pc.g_one = ggml_nelements(sig->src[0]) == 1 ? 1u : 0u;
+    } else {
+        x_buf = sub(post->src[0], pc.offs_x);
+        g_buf = x_buf;
+        c_buf = x_buf;
+        pc.nb01 = (uint32_t)(post->src[0]->nb[1] / sizeof(float));
+    }
+    const vk_subbuffer r_buf = sub(r, pc.offs_r);
+    pc.nb11 = (uint32_t)(r->nb[1] / sizeof(float));
+    pc.nb12 = (uint32_t)(r->nb[2] / sizeof(float));
+    const vk_subbuffer p_buf = sub(w, pc.offs_p);
+    pc.nb20 = (uint32_t)(w->nb[0] / sizeof(float));
+    pc.nb21 = (uint32_t)(w->nb[1] / sizeof(float));
+    vk_subbuffer comb_buf = r_buf;
+    if (comb) {
+        comb_buf = sub(comb, pc.offs_comb);
+        pc.nb30 = (uint32_t)(comb->nb[0] / sizeof(float));
+        pc.nb31 = (uint32_t)(comb->nb[1] / sizeof(float));
+        pc.nb32 = (uint32_t)(comb->nb[2] / sizeof(float));
+    }
+    const vk_subbuffer gm_buf = sub(mul->src[1], pc.offs_gm);
+    const vk_subbuffer d_buf = sub(post, pc.offs_d);
+    const vk_subbuffer n_buf = sub(mul, pc.offs_n);
+
+    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { x_buf, g_buf, c_buf, r_buf, p_buf, comb_buf, gm_buf, d_buf, n_buf }, pc,
+                              { pc.hc, (uint32_t)post->ne[2], 1 });
+}
+
 // ADD, SOFTPLUS and MUL as the last of the fused nodes; see add_softplus_mul.comp
 static void ggml_vk_add_softplus_mul(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_cgraph * cgraph, int node_idx) {
     const ggml_tensor * add = cgraph->nodes[node_idx];
@@ -13893,6 +13972,10 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
     case GGML_OP_DSV4_HC_COMB:
     case GGML_OP_DSV4_HC_PRE:
     case GGML_OP_DSV4_HC_POST:
+        if (node->op == GGML_OP_DSV4_HC_POST && ctx->num_additional_fused_ops == 2) {
+            ggml_vk_hc_post_norm(ctx, compute_ctx, cgraph, node_idx, 0);
+            break;
+        }
         ggml_vk_dsv4_hc(ctx, compute_ctx, node);
 
         break;
@@ -13940,6 +14023,10 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
     case GGML_OP_UNARY:
         if (ctx->fused_topk_moe_mode != TOPK_MOE_COUNT) {
             ggml_vk_topk_moe(ctx, compute_ctx, cgraph, node_idx);
+            break;
+        }
+        if (ctx->num_additional_fused_ops == 5 && ggml_get_unary_op(node) == GGML_UNARY_OP_SIGMOID) {
+            ggml_vk_hc_post_norm(ctx, compute_ctx, cgraph, node_idx, 3);
             break;
         }
         if ((ctx->num_additional_fused_ops == 2 || ctx->num_additional_fused_ops == 3) &&
@@ -16481,6 +16568,81 @@ static bool ggml_vk_can_fuse_sigmoid_mul_add_hc_post(const struct ggml_cgraph * 
     return true;
 }
 
+// The DSV4_HC_POST at node_idx + post_off, after the SIGMOID_MUL_ADD it fuses when post_off is 3, followed by an
+// RMS_NORM of its output and a MUL by a [ne0, hc] gamma: the hyper-connection combine and the next block's grouped
+// norm; see hc_post_norm.comp.
+static bool ggml_vk_can_fuse_hc_post_norm(const ggml_backend_vk_context * ctx, const struct ggml_cgraph * cgraph, int node_idx,
+                                          int post_off) {
+    static const bool off = getenv("INFERSSD_NO_HC_POST_NORM") != nullptr;
+    if (off || !ctx->device->pipeline_hc_post_norm_f32 || node_idx + post_off + 2 >= cgraph->n_nodes) {
+        return false;
+    }
+    if (post_off == 3 && !ggml_vk_can_fuse_sigmoid_mul_add_hc_post(cgraph, node_idx)) {
+        return false;
+    }
+    const ggml_tensor * post = cgraph->nodes[node_idx + post_off];
+    const ggml_tensor * norm = cgraph->nodes[node_idx + post_off + 1];
+    const ggml_tensor * mul  = cgraph->nodes[node_idx + post_off + 2];
+    const auto compute = [](const ggml_tensor * t) { return (t->flags & GGML_TENSOR_FLAG_COMPUTE) != 0; };
+    if (post->op != GGML_OP_DSV4_HC_POST || norm->op != GGML_OP_RMS_NORM || mul->op != GGML_OP_MUL ||
+            !compute(post) || !compute(norm) || !compute(mul) || norm->src[0] != post || mul->src[0] != norm ||
+            !ggml_node_has_n_uses(cgraph, node_idx + post_off + 1, 1) || (norm->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+        return false;
+    }
+    const ggml_tensor * x    = post->src[0];
+    const ggml_tensor * r    = post->src[1];
+    const ggml_tensor * w    = post->src[2];
+    const ggml_tensor * comb = post->src[3];
+    const ggml_tensor * gm   = mul->src[1];
+    const auto f32 = [](const ggml_tensor * t) { return t->type == GGML_TYPE_F32 && ggml_is_contiguous(t); };
+    const int64_t ne0 = post->ne[0];
+    const int64_t hc  = post->ne[1];
+    const int64_t nt  = post->ne[2];
+    if (!f32(post) || !f32(mul) || !f32(gm) || !ggml_are_same_shape(post, mul) || post->ne[3] != 1 ||
+            ne0 > 512*8 || hc > 4 || gm->ne[0] != ne0 || gm->ne[1] != hc || gm->ne[2] != 1 || gm->ne[3] != 1) {
+        return false;
+    }
+    if (x->type != GGML_TYPE_F32 || r->type != GGML_TYPE_F32 || w->type != GGML_TYPE_F32 ||
+            (comb && comb->type != GGML_TYPE_F32) || r->nb[0] != sizeof(float) || r->ne[0] != ne0 || r->ne[1] != hc) {
+        return false;
+    }
+    if (post_off == 0 && (x->nb[0] != sizeof(float) || x->ne[0] != ne0 || x->ne[1] != nt)) {
+        return false;
+    }
+    // A workgroup writes its stream while the others still read theirs, so the outputs take no source's memory. The
+    // one exception: with an identity comb, an output that starts where a contiguous residual starts, as the
+    // allocator places one in the dying residual's block. Each invocation writes only the elements it read.
+    if (ggml_vk_tensors_overlap(post, mul, false)) {
+        return false;
+    }
+    const auto base = [](const ggml_tensor * t) { return vk_tensor_offset(t) + t->view_offs; };
+    const bool r_in_place = !comb && ggml_is_contiguous(r) && ggml_are_same_shape(r, post);
+    for (const ggml_tensor * o : { post, mul }) {
+        if (ggml_vk_tensors_overlap(r, o, false) && !(r_in_place && base(r) == base(o))) {
+            return false;
+        }
+    }
+    std::vector<const ggml_tensor *> srcs = { x, w, gm };
+    if (comb) {
+        srcs.push_back(comb);
+    }
+    if (post_off) {
+        // the SIGMOID_MUL_ADD's sources; its MUL and ADD are not written
+        const ggml_tensor * sig = cgraph->nodes[node_idx];
+        const ggml_tensor * m   = cgraph->nodes[node_idx + 1];
+        const ggml_tensor * add = cgraph->nodes[node_idx + 2];
+        srcs.push_back(sig->src[0]);
+        srcs.push_back(m->src[0]);
+        srcs.push_back(add->src[0] == m ? add->src[1] : add->src[0]);
+    }
+    for (const ggml_tensor * t : srcs) {
+        if (ggml_vk_tensors_overlap(t, post, false) || ggml_vk_tensors_overlap(t, mul, false)) {
+            return false;
+        }
+    }
+    return true;
+}
+
 // A SIGMOID whose only use is the second source of the MUL after it: the MUL shader applies it. Unlike
 // ggml_can_fuse this lets the MUL broadcast the sigmoid, as the binary shader does with its second source.
 static bool ggml_vk_can_fuse_sigmoid_mul(const struct ggml_cgraph * cgraph, int node_idx) {
@@ -17270,6 +17432,19 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 op_srcs_fused_elementwise[0] = false;
                 op_srcs_fused_elementwise[1] = true;
                 op_srcs_fused_elementwise[2] = false;
+            } else if (ggml_vk_can_fuse_hc_post_norm(ctx, cgraph, i, 3)) {
+                ctx->num_additional_fused_ops = 5;
+                fusion_string = "SIGMOID_MUL_ADD_HC_POST_NORM";
+                // the combine's output is the second; the detector checked the overlaps
+                ctx->fused_ops_write_mask |= 1 << 3;
+                fused_overlap_checked = true;
+                std::fill_n(op_srcs_fused_elementwise, 6, false);
+            } else if (ggml_vk_can_fuse_hc_post_norm(ctx, cgraph, i, 0)) {
+                ctx->num_additional_fused_ops = 2;
+                fusion_string = "HC_POST_NORM";
+                ctx->fused_ops_write_mask |= 1 << 0;
+                fused_overlap_checked = true;
+                std::fill_n(op_srcs_fused_elementwise, 3, false);
             } else if (ggml_vk_can_fuse_sigmoid_mul_add_hc_post(cgraph, i)) {
                 ctx->num_additional_fused_ops = 3;
                 fusion_string = "SIGMOID_MUL_ADD_HC_POST";
