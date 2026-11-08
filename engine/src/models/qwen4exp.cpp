@@ -359,6 +359,7 @@ ggml_tensor * llm_build_qwen4exp::build_qsa_sel(
         ggml_tensor *                           cur,
         ggml_tensor *                           inp_pos,
         int *                                   sections,
+        const std::vector<ggml_tensor *> &      beside,
         int                                     il) {
     const llama_kv_cache_context * mctx_idx = mctx_hyb->get_idx();
 
@@ -370,13 +371,30 @@ ggml_tensor * llm_build_qwen4exp::build_qsa_sel(
 
     GGML_ASSERT(hparams.dsv4_compress_ratios[il] == kpool);
 
+    // the products go first and the raw key's write right after them; the query chain and the nodes beside come next,
+    // and the backend runs them in the stages of the long pooled-key chain below
     // cache rows store raw key | pooled key: pooling precedes norm and rotation, so the raw key gets neither
     ggml_tensor * k_raw = build_lora_mm(model.layers[il].index_k_proj, cur);
     cb(k_raw, "indexer_k_raw", il);
 
+    ggml_tensor * q = build_lora_mm(model.layers[il].index_q_proj, cur);
+    ggml_build_forward_expand(gf, k_raw);
+    ggml_build_forward_expand(gf, q);
+
     ggml_tensor * pzero  = ggml_fill(ctx0, ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, idx_dim, n_tokens), 0.0f);
     ggml_tensor * packed = ggml_reshape_3d(ctx0, ggml_concat(ctx0, k_raw, pzero, 0), 2*idx_dim, 1, n_tokens);
     ggml_build_forward_expand(gf, mctx_idx->cpy_k(ctx0, packed, inp_kpool->k_idxs, il));
+
+    q = ggml_reshape_3d(ctx0, q, idx_dim, n_idx_h, n_tokens);
+    q = build_norm(q, model.layers[il].index_q_norm, nullptr, LLM_NORM_RMS, il);
+    q = ggml_rope_multi(ctx0, q, inp_pos, nullptr,
+            n_rot, sections, rope_type, n_ctx_orig, freq_base, freq_scale,
+            ext_factor, attn_factor, beta_fast, beta_slow);
+    cb(q, "indexer_q", il);
+    ggml_build_forward_expand(gf, q);
+    for (ggml_tensor * t : beside) {
+        ggml_build_forward_expand(gf, t);
+    }
 
     // the raw keys and the persistent pooled slots, see llama_memory_hybrid_idx::mem_idx_stale
     auto kpool_cache = mctx_hyb->get_kpool_access(ctx0, il, idx_dim);
@@ -385,13 +403,8 @@ ggml_tensor * llm_build_qwen4exp::build_qsa_sel(
     ggml_tensor * rows = kpool_cache.gather_keys(inp_kpool->new_pool_idxs);
     rows = ggml_reshape_3d(ctx0, rows, idx_dim, kpool, n_new);
 
-    // mean over the members; kpool is small, so summing slices beats a transpose plus sum_rows
-    ggml_tensor * pooled_new = nullptr;
-    for (int64_t i = 0; i < kpool; ++i) {
-        ggml_tensor * slice = ggml_view_2d(ctx0, rows, idx_dim, n_new, rows->nb[2], i*rows->nb[1]);
-        pooled_new = pooled_new ? ggml_add(ctx0, pooled_new, slice) : ggml_cont(ctx0, slice);
-    }
-    pooled_new = ggml_scale(ctx0, pooled_new, 1.0f/(float) kpool);
+    // the mean over the members in one op
+    ggml_tensor * pooled_new = ggml_pool_2d(ctx0, rows, GGML_OP_POOL_AVG, 1, kpool, 1, kpool, 0, 0); // [idx_dim, 1, n_new]
     pooled_new = build_norm(pooled_new, model.layers[il].index_k_norm, nullptr, LLM_NORM_RMS, il);
 
     pooled_new = ggml_reshape_3d(ctx0, pooled_new, idx_dim, 1, n_new);
@@ -402,19 +415,13 @@ ggml_tensor * llm_build_qwen4exp::build_qsa_sel(
     cb(pooled_new, "indexer_pool_k_new", il);
 
     // scatter the fresh pooled keys into their rep rows, then gather all n_pool of them by cell:
-    // the older pools come from the rows earlier ubatches wrote
-    ggml_build_forward_expand(gf, kpool_cache.scatter_pooled(pooled_new, inp_kpool->new_pool_rep));
-    ggml_tensor * pooled = kpool_cache.gather_pooled(inp_kpool->pool_cells);
+    // the older pools come from the rows earlier ubatches wrote. the gather reads the scatter's result, so that no
+    // backend reordering runs it before the scatter
+    ggml_tensor * scattered = kpool_cache.scatter_pooled(pooled_new, inp_kpool->new_pool_rep);
+    ggml_build_forward_expand(gf, scattered);
+    ggml_tensor * pooled = ggml_get_rows(ctx0, scattered, inp_kpool->pool_cells);
     pooled = ggml_reshape_3d(ctx0, pooled, idx_dim, 1, n_pool);
     cb(pooled, "indexer_k", il);
-
-    ggml_tensor * q = build_lora_mm(model.layers[il].index_q_proj, cur);
-    q = ggml_reshape_3d(ctx0, q, idx_dim, n_idx_h, n_tokens);
-    q = build_norm(q, model.layers[il].index_q_norm, nullptr, LLM_NORM_RMS, il);
-    q = ggml_rope_multi(ctx0, q, inp_pos, nullptr,
-            n_rot, sections, rope_type, n_ctx_orig, freq_base, freq_scale,
-            ext_factor, attn_factor, beta_fast, beta_slow);
-    cb(q, "indexer_q", il);
 
     // the reference sums the rectified head scores unweighted, scaled by 1/sqrt(head_dim),
     // which is the lightning indexer with every head weight set to that scale
@@ -588,8 +595,6 @@ ggml_tensor * llm_build_qwen4exp::build_layer_attn(
     // indexer reads the same block input as q/k/v; no cache or no ratio means dense
     const bool qsa = inp_kpool != nullptr && hparams.dsv4_compress_ratios[il] > 0;
 
-    ggml_tensor * sel = qsa ? build_qsa_sel(mctx_hyb, inp_kpool, cur, inp_pos, sections, il) : nullptr;
-
     // Qwen3Next uses a single Q projection that outputs query + gate
     ggml_tensor * Qcur_full = build_lora_mm(model.layers[il].wq, cur, model.layers[il].wq_s); // [ (n_embd_head * 2) * n_head, n_tokens ]
     cb(Qcur_full, "Qcur_full", il);
@@ -604,9 +609,11 @@ ggml_tensor * llm_build_qwen4exp::build_layer_attn(
 
     ggml_tensor * Kcur = build_lora_mm(model.layers[il].wk, cur, model.layers[il].wk_s);
     cb(Kcur, "Kcur", il);
+    ggml_tensor * k_mm = Kcur;
 
     ggml_tensor * Vcur = build_lora_mm(model.layers[il].wv, cur, model.layers[il].wv_s);
     cb(Vcur, "Vcur", il);
+    ggml_tensor * v_mm = Vcur;
 
     Kcur = ggml_reshape_3d(ctx0, Kcur, n_embd_head, n_head_kv, n_tokens);
     Kcur = build_norm(Kcur, model.layers[il].attn_k_norm, nullptr, LLM_NORM_RMS, il);
@@ -637,6 +644,15 @@ ggml_tensor * llm_build_qwen4exp::build_layer_attn(
     cb(Qcur, "Qcur", il);
     cb(Kcur, "Kcur", il);
     cb(Vcur, "Vcur", il);
+
+    // the attention's products join the indexer's, and its q and k chains run beside the indexer's
+    ggml_tensor * sel = nullptr;
+    if (qsa) {
+        ggml_build_forward_expand(gf, Qcur_full);
+        ggml_build_forward_expand(gf, k_mm);
+        ggml_build_forward_expand(gf, v_mm);
+        sel = build_qsa_sel(mctx_hyb, inp_kpool, cur, inp_pos, sections, { Qcur, Kcur }, il);
+    }
 
     const float kq_scale = hparams.f_attention_scale == 0.0f ? 1.0f / sqrtf(float(n_embd_head)) : hparams.f_attention_scale;
 

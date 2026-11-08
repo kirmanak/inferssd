@@ -840,6 +840,7 @@ struct llm_build_qwen4exp : public llm_build_delta_net_base {
                     ggml_tensor * cur,
                     ggml_tensor * inp_pos,
                             int * sections,
+const std::vector<ggml_tensor *> & beside,
                             int   il);
 
         ggml_tensor * build_layer_attn_linear(
