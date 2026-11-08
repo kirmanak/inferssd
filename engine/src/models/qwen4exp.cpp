@@ -79,9 +79,9 @@ ggml_tensor * llm_build_qwen4exp::build_hc_mix(
     if (inject) {
         *inject = build_lora_mm(w_inject, xn);
         cb(*inject, "hc_inject", il);
-        // Into the graph now, not where the combine reads it: placed late, the allocator can hand it a block a
-        // node just before still reads, and the mat-vec then waits alone behind a barrier.
-        ggml_build_forward_expand(gf, *inject);
+        // Into the graph where the combine reads it, not here: here its mat-vec runs beside the hc down product
+        // and slows that stage, which the whole chain waits on. Later the graph optimizer runs it beside the block's
+        // larger mat-vecs.
     }
 
     return mixed;
