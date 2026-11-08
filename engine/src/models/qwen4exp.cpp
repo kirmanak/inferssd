@@ -51,6 +51,11 @@ ggml_tensor * llm_build_qwen4exp::build_hc_mix(
                 ggml_reshape_3d(ctx0, gate, n_embd, hc, nt), 1.0f / (float) hc);
         if (!fused_supported(mixed, il)) {
             mixed = nullptr;
+        } else {
+            // Kept to the end of the graph, 1.3 KB a mix: freed after the gate's product, its block went to the
+            // HC_PRE output, and a backend that computes the HC_PRE in the product's epilogue (Vulkan's
+            // MUL_MAT_HC_PRE) cannot write the vector it is still reading.
+            ggml_set_output(lo);
         }
     }
     if (!mixed) {

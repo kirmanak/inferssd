@@ -50,7 +50,7 @@ void iter(inout FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], const uint first_row, const
         uint ibi = first_row*p.ncols;
         [[unroll]] for (uint n = 0; n < num_rows; ++n) {
             const uint ib = (ibi + col)/QUANT_K; // block index
-            ibi += p.ncols;
+            ibi += p.ncols * mmv_row_step();
 
 #if K_PER_ITER == 8
             vec4 v = dequantize4(ib, iqs, a_offset);
@@ -156,6 +156,12 @@ void main() {
 #ifdef NEEDS_INIT_IQ_SHMEM
     init_iq_shmem(gl_WorkGroupSize);
 #endif
+
+    if (HC_PRE) {
+        // a workgroup an embedding element, all NUM_ROWS of its streams
+        compute_outputs(gl_WorkGroupID.x, NUM_ROWS);
+        return;
+    }
 
     // do NUM_ROWS at a time, unless there aren't enough remaining rows
     if (first_row + NUM_ROWS <= p.stride_d) {

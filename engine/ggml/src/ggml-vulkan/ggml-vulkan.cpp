@@ -715,6 +715,8 @@ struct vk_device_struct {
     vk_pipeline pipeline_dequant_mul_mat_vec_f16_f32[DMMV_WG_SIZE_COUNT][GGML_TYPE_COUNT][mul_mat_vec_max_cols];
     // q8_0 with two rows a workgroup, for the products with few rows or a short row
     vk_pipeline pipeline_dequant_mul_mat_vec_q8_0_2rows_f32_f32[DMMV_WG_SIZE_COUNT][mul_mat_vec_max_cols];
+    // the q8_0 product of MUL_MAT_HC_PRE, four rows (the streams) a workgroup
+    vk_pipeline pipeline_dequant_mul_mat_vec_q8_0_hc_pre_f32_f32[DMMV_WG_SIZE_COUNT];
     vk_pipeline pipeline_dequant_mul_mat_vec_q8_0_2rows_f16_f32[DMMV_WG_SIZE_COUNT][mul_mat_vec_max_cols];
     vk_pipeline pipeline_dequant_mul_mat_vec_id_f32[DMMV_WG_SIZE_COUNT][GGML_TYPE_COUNT];
 
@@ -4342,6 +4344,9 @@ static void ggml_vk_load_shaders(vk_device& device) {
             ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f32_f32[w][GGML_TYPE_Q5_1][i], "mul_mat_vec_q5_1_f32_f32", arr_dmmv_q5_1_f32_f32_len[reduc], arr_dmmv_q5_1_f32_f32_data[reduc], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {2*rm_stdq, 1, 1}, {wg_size_subgroup, 2*rm_stdq, i+1}, 1, true, use_subgroups, force_subgroup_size);
             ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f32_f32[w][GGML_TYPE_Q8_0][i], "mul_mat_vec_q8_0_f32_f32", arr_dmmv_q8_0_f32_f32_len[reduc], arr_dmmv_q8_0_f32_f32_data[reduc], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {1*rm_stdq, 1, 1}, {wg_size_subgroup, 1*rm_stdq, i+1}, 1, true, use_subgroups, force_subgroup_size);
             ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_q8_0_2rows_f32_f32[w][i], "mul_mat_vec_q8_0_2rows_f32_f32", arr_dmmv_q8_0_f32_f32_len[reduc], arr_dmmv_q8_0_f32_f32_data[reduc], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {2*rm_stdq, 1, 1}, {wg_size_subgroup, 2*rm_stdq, i+1}, 1, true, use_subgroups, force_subgroup_size);
+            if (i == 0) {
+                ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_q8_0_hc_pre_f32_f32[w], "mul_mat_vec_q8_0_hc_pre_f32_f32", arr_dmmv_q8_0_f32_f32_len[reduc], arr_dmmv_q8_0_f32_f32_data[reduc], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {4, 1, 1}, {wg_size_subgroup, 4, 1, 1}, 1, true, use_subgroups, force_subgroup_size);
+            }
             ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f32_f32[w][GGML_TYPE_Q2_K][i], "mul_mat_vec_q2_k_f32_f32", arr_dmmv_q2_k_f32_f32_len[reduc16], arr_dmmv_q2_k_f32_f32_data[reduc16], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {rm_kq, 1, 1}, {wg_size_subgroup16, rm_kq, i+1}, 1, true, use_subgroups16, force_subgroup_size16);
             ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f32_f32[w][GGML_TYPE_Q3_K][i], "mul_mat_vec_q3_k_f32_f32", arr_dmmv_q3_k_f32_f32_len[reduc16], arr_dmmv_q3_k_f32_f32_data[reduc16], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {rm_kq, 1, 1}, {wg_size_subgroup16, rm_kq, i+1}, 1, true, use_subgroups16, force_subgroup_size16);
             ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f32_f32[w][GGML_TYPE_Q4_K][i], "mul_mat_vec_q4_k_f32_f32", arr_dmmv_q4_k_f32_f32_len[reduc16], arr_dmmv_q4_k_f32_f32_data[reduc16], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {rm_kq, 1, 1}, {wg_size_subgroup16, rm_kq, i+1}, 1, true, use_subgroups16, force_subgroup_size16);
@@ -8127,6 +8132,15 @@ static void ggml_vk_mul_mat_vec_q_f16(ggml_backend_vk_context * ctx, vk_context&
         dmmv = ggml_vk_get_64b_indexing_pipeline(ctx, dmmv);
     }
 
+    // MUL_MAT_HC_PRE: the last fused node is the DSV4_HC_PRE the product feeds (ggml_vk_mul_mat_hc_pre_span)
+    const ggml_tensor * hc_pre = ctx->num_additional_fused_ops > 0 &&
+            cgraph->nodes[node_idx + ctx->num_additional_fused_ops]->op == GGML_OP_DSV4_HC_PRE ?
+            cgraph->nodes[node_idx + ctx->num_additional_fused_ops] : nullptr;
+    if (hc_pre) {
+        GGML_ASSERT(!quantize_y && src0->type == GGML_TYPE_Q8_0 && src1->type == GGML_TYPE_F32);
+        dmmv = ctx->device->pipeline_dequant_mul_mat_vec_q8_0_hc_pre_f32_f32[DMMV_WG_SIZE_SUBGROUP];
+    }
+
     const bool qx_needs_dequant = x_non_contig;
     const bool qy_needs_dequant = !quantize_y && ((src1->type != GGML_TYPE_F16 && !f16_f32_kernel) || y_non_contig);
 
@@ -8248,7 +8262,7 @@ static void ggml_vk_mul_mat_vec_q_f16(ggml_backend_vk_context * ctx, vk_context&
     float fuse_scale = 0.0f;
     float fuse_bias = 0.0f;
     // MUL_MAT_SCALE_SILU: the product goes through the SCALE and the SILU after it
-    const bool scale_silu = ctx->num_additional_fused_ops == 2 && cgraph->nodes[node_idx + 1]->op == GGML_OP_SCALE;
+    const bool scale_silu = !hc_pre && ctx->num_additional_fused_ops == 2 && cgraph->nodes[node_idx + 1]->op == GGML_OP_SCALE;
     if (scale_silu) {
         fusion_flags |= MAT_VEC_FUSION_FLAGS_SCALE_SILU;
         fuse_scale = ggml_get_op_params_f32(cgraph->nodes[node_idx + 1], 0);
@@ -8256,7 +8270,11 @@ static void ggml_vk_mul_mat_vec_q_f16(ggml_backend_vk_context * ctx, vk_context&
     }
 
     vk_subbuffer d_F0 = d_D;
-    if (ctx->num_additional_fused_ops > 0 && !scale_silu) {
+    if (hc_pre) {
+        // the streams the gate weighs, and the HC_PRE scale
+        d_F0 = ggml_vk_tensor_subbuffer(ctx, hc_pre->src[0]);
+        fuse_scale = ggml_get_op_params_f32(hc_pre, 0);
+    } else if (ctx->num_additional_fused_ops > 0 && !scale_silu) {
         const ggml_tensor * add = cgraph->nodes[node_idx + 1];
         const ggml_tensor * bias = add->src[0] == dst ? add->src[1] : add->src[0];
 
@@ -8265,7 +8283,7 @@ static void ggml_vk_mul_mat_vec_q_f16(ggml_backend_vk_context * ctx, vk_context&
     }
 
     vk_subbuffer d_F1 = d_D;
-    if (ctx->num_additional_fused_ops == 2 && !scale_silu) {
+    if (ctx->num_additional_fused_ops == 2 && !scale_silu && !hc_pre) {
         const ggml_tensor * add = cgraph->nodes[node_idx + 2];
         const ggml_tensor * bias = add->src[0] == cgraph->nodes[node_idx + 1] ? add->src[1] : add->src[0];
 
@@ -16254,6 +16272,55 @@ static bool ggml_vk_can_fuse_mul_mat_scale_silu(const ggml_backend_vk_context * 
            ggml_is_contiguous(silu);
 }
 
+// A one-row q8_0 MUL_MAT that ggml_vk_mul_mat_vec_q_f16 takes without quantizing its vector, whose only use is,
+// through a RESHAPE, the gate of a gated DSV4_HC_PRE of four streams a few nodes on, with only empty nodes between: the
+// mat-vec computes the four streams of an embedding element in one workgroup and stores the HC_PRE output itself
+// (HC_PRE in mul_mat_vec_base.glsl). Returns the HC_PRE's distance from the product, 0 when it cannot fuse.
+static int ggml_vk_mul_mat_hc_pre_span(const ggml_backend_vk_context * ctx, const struct ggml_cgraph * cgraph, int node_idx) {
+    const ggml_tensor * mm = cgraph->nodes[node_idx];
+    if (mm->op != GGML_OP_MUL_MAT || !(mm->flags & GGML_TENSOR_FLAG_COMPUTE) || (mm->flags & GGML_TENSOR_FLAG_OUTPUT) ||
+            !ggml_node_has_n_uses(cgraph, node_idx, 1)) {
+        return 0;
+    }
+    const ggml_tensor * src0 = mm->src[0];
+    const ggml_tensor * src1 = mm->src[1];
+    if (src0->type != GGML_TYPE_Q8_0 || !ggml_is_contiguous(src0) || src0->ne[2] != 1 || src0->ne[3] != 1 ||
+            ggml_nbytes(src0) > ctx->device->properties.limits.maxStorageBufferRange ||
+            src1->type != GGML_TYPE_F32 || !ggml_is_contiguous(src1) || mm->type != GGML_TYPE_F32 || ggml_nrows(mm) != 1 ||
+            src0->ne[1] % 4 != 0) {
+        return 0;
+    }
+    if (ctx->device->integer_dot_product && src1->ne[0] % 4 == 0 &&
+            ggml_vk_should_use_mmvq(ctx->device, src0->ne[1], 1, src0->ne[0], src0->type)) {
+        return 0;
+    }
+    int gate_idx = -1;
+    for (int k = node_idx + 1; k < cgraph->n_nodes && k <= node_idx + 6; ++k) {
+        const ggml_tensor * t = cgraph->nodes[k];
+        if (t->op != GGML_OP_DSV4_HC_PRE) {
+            if (!ggml_op_is_empty(t->op)) {
+                return 0;
+            }
+            if (t->op == GGML_OP_RESHAPE && t->src[0] == mm) {
+                gate_idx = k;
+            }
+            continue;
+        }
+        const ggml_tensor * x = t->src[0];
+        const ggml_tensor * gate = t->src[1];
+        // the RESHAPE is a view, which ggml_node_has_n_uses refuses: the product's one use is it, and its one use the HC_PRE
+        if (gate_idx < 0 || gate != cgraph->nodes[gate_idx] || ggml_node_get_use_count(cgraph, gate_idx) != 1 ||
+                (gate->flags & GGML_TENSOR_FLAG_OUTPUT) || !(t->flags & GGML_TENSOR_FLAG_COMPUTE) ||
+                ggml_get_op_params_i32(t, 1) == 0 || x->type != GGML_TYPE_F32 || !ggml_is_contiguous(x) ||
+                x->ne[1] != 4 || x->ne[2] != 1 || x->ne[0] * 4 != mm->ne[0] ||
+                t->type != GGML_TYPE_F32 || !ggml_is_contiguous(t)) {
+            return 0;
+        }
+        return k - node_idx;
+    }
+    return 0;
+}
+
 // SCALE into SILU: the SILU shader applies the scale and bias to its input itself.
 static bool ggml_vk_can_fuse_scale_silu(const struct ggml_cgraph * cgraph, int node_idx) {
     if (!ggml_can_fuse(cgraph, node_idx, { GGML_OP_SCALE, GGML_OP_UNARY })) {
@@ -17032,6 +17099,11 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 op_srcs_fused_elementwise[0] = false;
                 op_srcs_fused_elementwise[1] = true;
                 op_srcs_fused_elementwise[2] = true;
+            } else if (const int hc_span = ggml_vk_mul_mat_hc_pre_span(ctx, cgraph, i); hc_span > 0 && !getenv("INFERSSD_NO_MMV_HC_PRE")) {
+                ctx->num_additional_fused_ops = hc_span;
+                fusion_string = "MUL_MAT_HC_PRE";
+                // every other row of the product feeds an output element: any overlap of the output disables it
+                std::fill_n(op_srcs_fused_elementwise, hc_span + 1, false);
             } else if (ggml_vk_can_fuse_mul_mat_scale_silu(ctx, cgraph, i)) {
                 ctx->num_additional_fused_ops = 2;
                 fusion_string = "MUL_MAT_SCALE_SILU";
@@ -18083,6 +18155,55 @@ static void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * 
     // Replace the graph with the new order.
     for (int i = 0; i < graph->n_nodes; ++i) {
         graph->nodes[i] = new_order[i];
+    }
+
+    // MUL_MAT_HC_PRE fuses a product with the DSV4_HC_PRE its gate feeds only when nothing but views lies between them.
+    // A node the sets above put between them that depends neither on the product nor on a view after it (a linear
+    // attention layer's conv state GET_ROWS) moves to before the product.
+    for (int i = 0; i < graph->n_nodes; ++i) {
+        ggml_tensor * mm = graph->nodes[i];
+        if (mm->op != GGML_OP_MUL_MAT) {
+            continue;
+        }
+        int pre = -1;
+        for (int k = i + 1; k < std::min(i + 8, graph->n_nodes); ++k) {
+            const ggml_tensor * t = graph->nodes[k];
+            if (t->op == GGML_OP_DSV4_HC_PRE && t->src[1] && t->src[1]->view_src == mm) {
+                pre = k;
+                break;
+            }
+        }
+        if (pre < 0) {
+            continue;
+        }
+        std::vector<ggml_tensor *> moved;
+        std::vector<ggml_tensor *> kept;
+        bool ok = true;
+        for (int k = i + 1; k < pre && ok; ++k) {
+            ggml_tensor * t = graph->nodes[k];
+            if (is_empty(t)) {
+                kept.push_back(t);
+                continue;
+            }
+            ok = !is_src_of(t, mm);
+            for (const ggml_tensor * v : kept) {
+                ok = ok && !is_src_of(t, v);
+            }
+            moved.push_back(t);
+        }
+        if (!ok || moved.empty()) {
+            continue;
+        }
+        int w = i;
+        for (ggml_tensor * t : moved) {
+            graph->nodes[w++] = t;
+        }
+        graph->nodes[w++] = mm;
+        for (ggml_tensor * t : kept) {
+            graph->nodes[w++] = t;
+        }
+        GGML_ASSERT(w == pre);
+        i = pre;
     }
 }
 

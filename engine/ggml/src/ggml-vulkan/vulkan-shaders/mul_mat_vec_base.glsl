@@ -102,6 +102,32 @@ FLOAT_TYPE mmv_fuse_scale_silu(const FLOAT_TYPE v) {
 layout (constant_id = 0) const uint BLOCK_SIZE = 32;
 layout (constant_id = 1) const uint NUM_ROWS = 1;
 layout (constant_id = 2) const uint NUM_COLS = 1;
+// The product feeds a gated DSV4_HC_PRE: a workgroup's NUM_ROWS rows are the hc streams of one embedding element, a
+// stride_d / NUM_ROWS apart, and it stores fuse_scale * sum over them of sigmoid(row) * x, x the HC_PRE input in Fuse0.
+layout (constant_id = 3) const bool HC_PRE = false;
+
+// the distance between a workgroup's rows
+uint mmv_row_step() {
+    return HC_PRE ? p.stride_d / NUM_ROWS : 1;
+}
+
+float hc_sum;
+
+// stores row n of the workgroup, or with HC_PRE adds it to the stream sum and stores that after the last row
+void mmv_store(const uint j, const uint d_offset, const uint first_row, const uint n, const FLOAT_TYPE v) {
+#ifndef MUL_MAT_ID
+    if (HC_PRE) {
+        // as dsv4_hc_pre.comp computes it
+        const float wv = 1.0 / (1.0 + exp(-float(D_TYPE(v))));
+        hc_sum = (n == 0 ? 0.0 : hc_sum) + float(data_fuse0[first_row + n*mmv_row_step()]) * wv;
+        if (n == NUM_ROWS - 1) {
+            data_d[d_offset + first_row] = D_TYPE(p.fuse_scale * hc_sum);
+        }
+        return;
+    }
+#endif
+    data_d[j*p.batch_stride_d + d_offset + first_row + n] = D_TYPE(v);
+}
 
 #ifdef USE_SUBGROUP_ADD_NO_SHMEM
 void reduce_result(inout FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], const in uint32_t d_offset, const in uint32_t first_row, const in uint32_t num_rows, const in uint32_t tid) {
@@ -135,7 +161,7 @@ void reduce_result(inout FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], const in uint32_t 
                 }
                 temp[j][n] = mmv_fuse_scale_silu(temp[j][n]);
 #endif
-                data_d[j*p.batch_stride_d + d_offset + first_row + n] = D_TYPE(temp[j][n]);
+                mmv_store(j, d_offset, first_row, n, temp[j][n]);
             }
         }
     }
@@ -191,7 +217,7 @@ void reduce_result(FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], const in uint32_t d_offs
                 }
                 temp[j][n] = mmv_fuse_scale_silu(temp[j][n]);
 #endif
-                data_d[j*p.batch_stride_d + d_offset + first_row + n] = D_TYPE(temp[j][n]);
+                mmv_store(j, d_offset, first_row, n, temp[j][n]);
             }
         }
     }
@@ -237,7 +263,7 @@ void reduce_result(FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], const in uint32_t d_offs
                 }
                 tmpsh[j][n][0] = mmv_fuse_scale_silu(tmpsh[j][n][0]);
 #endif
-                data_d[j*p.batch_stride_d + d_offset + first_row + n] = D_TYPE(tmpsh[j][n][0]);
+                mmv_store(j, d_offset, first_row, n, tmpsh[j][n][0]);
             }
         }
     }

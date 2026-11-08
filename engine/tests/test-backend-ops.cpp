@@ -3876,6 +3876,62 @@ struct test_mul_mat_scale_silu : public test_case {
     }
 };
 
+// GGML_OP_MUL_MAT into the gate of a gated GGML_OP_DSV4_HC_PRE, as the hyper-connection mix builds it, which a
+// backend may fuse
+struct test_mul_mat_hc_pre : public test_case {
+    const ggml_type type_a;
+    const int64_t n_embd;
+    const int64_t k;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "MUL_MAT_HC_PRE";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    std::string vars() override {
+        return VARS_TO_STR3(type_a, n_embd, k);
+    }
+
+    // The CPU reference quantizes the vector to q8_0 for a q8_0 product; a 320 long one leaves 5e-4 to 5e-3 of that
+    // noise, unfused or not. A wrong stream or row is of the order of one.
+    double max_nmse_err() override {
+        return 1e-2;
+    }
+
+    test_mul_mat_hc_pre(ggml_type type_a = GGML_TYPE_Q8_0, int64_t n_embd = 2560, int64_t k = 320)
+        : type_a(type_a), n_embd(n_embd), k(k) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int64_t hc = 4;
+        ggml_tensor * w = ggml_new_tensor_2d(ctx, type_a, k, n_embd*hc);
+        ggml_tensor * x0 = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, 1);
+        ggml_tensor * s0 = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd*hc, 1);
+        ggml_tensor * d = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, 1);
+        ggml_set_name(w, "w");
+        // computed inputs and a chain of nodes, as a backend may fuse only in graphs of more than a few nodes
+        ggml_tensor * x = x0;
+        for (int i = 0; i < 40; ++i) {
+            x = ggml_add(ctx, x, d);
+        }
+        x = ggml_neg(ctx, x);
+        ggml_tensor * streams = ggml_neg(ctx, s0);
+        ggml_tensor * gate = ggml_mul_mat(ctx, w, x);
+        ggml_tensor * out = ggml_dsv4_hc_pre_gated(ctx,
+                ggml_reshape_3d(ctx, streams, n_embd, hc, 1),
+                ggml_reshape_3d(ctx, gate, n_embd, hc, 1), 1.0f/hc);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            init_tensor_uniform(t, -1.0f, 1.0f);
+        }
+    }
+};
+
 // GGML_OP_RMS_NORM + GGML_OP_SCALE, which a backend may fuse
 struct test_rms_norm_scale : public test_case {
     const std::array<int64_t, 4> ne;
@@ -9055,6 +9111,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_mul_mat_scale_silu(GGML_TYPE_Q8_0, 7, 256, 2.0f, 0.5f));
     test_cases.emplace_back(new test_mul_mat_scale_silu(GGML_TYPE_Q4_K, 320, 2560, 0.5f, 0.0f));
     test_cases.emplace_back(new test_mul_mat_scale_silu(GGML_TYPE_F32, 64, 512, 1.5f, -0.25f));
+    test_cases.emplace_back(new test_mul_mat_hc_pre(GGML_TYPE_Q8_0, 2560, 320));
+    test_cases.emplace_back(new test_mul_mat_hc_pre(GGML_TYPE_Q8_0, 37, 64));
+    test_cases.emplace_back(new test_mul_mat_hc_pre(GGML_TYPE_Q8_0, 64, 2560));
+    test_cases.emplace_back(new test_mul_mat_hc_pre(GGML_TYPE_Q4_K, 64, 256));
     test_cases.emplace_back(new test_ssm_conv_silu({ 4, 8192, 1, 1 }, { 4, 8192, 1, 1 }));
     test_cases.emplace_back(new test_ssm_conv_silu({ 3 + 7, 8192, 2, 1 }, { 4, 8192, 1, 1 }));
     test_cases.emplace_back(new test_add_softplus_mul({ 48, 1, 1, 1 }));
