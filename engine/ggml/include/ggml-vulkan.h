@@ -32,6 +32,8 @@ GGML_BACKEND_API bool ggml_vk_copy_tensors_fenced(const struct ggml_tensor ** te
 GGML_BACKEND_API enum ggml_status ggml_vk_graph_compute_suffix(ggml_backend_t backend, struct ggml_cgraph * graph,
         const struct ggml_tensor ** tensors, const size_t * sizes, int n);
 GGML_BACKEND_API bool ggml_vk_take_suffix_reads(ggml_backend_t backend, void ** dsts, const size_t * sizes, int n);
+// Waits for the suffix reads by a flag written after them, in place of ggml_backend_synchronize. False: synchronize.
+GGML_BACKEND_API bool ggml_vk_wait_suffix_reads(ggml_backend_t backend);
 GGML_BACKEND_API bool ggml_vk_tensor_on_device(const struct ggml_tensor * tensor);
 // Zero dst, then copy rows from src. dst_rows[i] is the destination row. One fence.
 GGML_BACKEND_API bool ggml_vk_scatter_rows(ggml_backend_buffer_t dst, size_t dst_bytes,

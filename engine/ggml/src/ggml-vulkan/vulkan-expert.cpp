@@ -2714,7 +2714,9 @@ bool decode_wait(void * raw, ggml_vk_decode_batch * batch) {
         cache->launched = false;
         const auto t0 = std::chrono::steady_clock::now();
         cache->vulkan_busy.store(1, std::memory_order_release);
-        ggml_backend_synchronize(session->backend);
+        if (!(cache->launched_inplace && ggml_vk_wait_suffix_reads(session->backend))) {
+            ggml_backend_synchronize(session->backend);
+        }
         wait_us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count();
         const int count = int(cache->hit_of.size());
         const bool pooled = cache->launched_inplace && cache->active_inplace >= 0 &&

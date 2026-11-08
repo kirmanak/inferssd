@@ -2096,6 +2096,10 @@ struct ggml_backend_vk_context {
     std::vector<size_t> suffix_sizes;
     vk_buffer suffix_staging;
     bool suffix_ready = false;
+    // The record writes 1 to this word of suffix_staging after the copies (queueing them clears it): the expert
+    // walk waits on it, not on the fence, see ggml_vk_wait_suffix_reads.
+    size_t suffix_flag_off = 0;
+    bool suffix_flag = false;
 
     // A decode graph recorded while the previous one is still on the queue.
     // Its command pool and descriptor sets are not the ones graph_cleanup resets,
@@ -13739,6 +13743,16 @@ static void ggml_vk_record_suffix_reads(ggml_backend_vk_context * ctx, vk_contex
         cmd.copyBuffer(region.src, ctx->suffix_staging->buffer,
                 vk::BufferCopy{ region.src_off, region.dst_off, region.size });
     }
+    static const bool flag_on = getenv("INFERSSD_NO_SUFFIX_FLAG") == nullptr;
+    if (flag_on) {
+        // The copies are done and available to the host before the flag is written.
+        vk::BufferMemoryBarrier data{ vk::AccessFlagBits::eTransferWrite, vk::AccessFlagBits::eHostRead | vk::AccessFlagBits::eTransferWrite,
+                VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED, ctx->suffix_staging->buffer, 0, ctx->suffix_flag_off };
+        cmd.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer, vk::PipelineStageFlagBits::eTransfer | vk::PipelineStageFlagBits::eHost,
+                {}, nullptr, data, nullptr);
+        cmd.fillBuffer(ctx->suffix_staging->buffer, ctx->suffix_flag_off, sizeof(uint32_t), 1);
+    }
+    ctx->suffix_flag = flag_on;
     vk::BufferMemoryBarrier host{ vk::AccessFlagBits::eTransferWrite, vk::AccessFlagBits::eHostRead,
             VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED,
             ctx->suffix_staging->buffer, 0, VK_WHOLE_SIZE };
@@ -17999,13 +18013,18 @@ static bool ggml_vk_queue_suffix_reads_locked(ggml_backend_vk_context * ctx,
         });
         cursor += sizes[i];
     }
-    if (!ctx->suffix_staging || !ctx->suffix_staging->ptr || ctx->suffix_staging->size < total) {
+    const size_t flag_off = (total + 63u) & ~size_t(63);
+    if (!ctx->suffix_staging || !ctx->suffix_staging->ptr || ctx->suffix_staging->size < flag_off + sizeof(uint32_t)) {
         ggml_vk_destroy_buffer(ctx->suffix_staging);
-        ctx->suffix_staging = ggml_vk_create_buffer_check(ctx->device, std::max(total, size_t(256 * 1024)),
+        ctx->suffix_staging = ggml_vk_create_buffer_check(ctx->device, std::max(flag_off + sizeof(uint32_t), size_t(256 * 1024)),
                 vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent | vk::MemoryPropertyFlagBits::eHostCached,
                 vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent);
     }
     if (!ctx->suffix_staging || !ctx->suffix_staging->ptr) { return false; }
+    // The last suffix was waited for before these are queued, so no fill of it is in flight; host-coherent.
+    ctx->suffix_flag_off = flag_off;
+    ctx->suffix_flag = false;
+    *reinterpret_cast<volatile uint32_t *>(static_cast<uint8_t *>(ctx->suffix_staging->ptr) + flag_off) = 0;
     ctx->suffix_reads = std::move(regions);
     ctx->suffix_sizes.assign(sizes, sizes + n);
     return true;
@@ -18022,6 +18041,40 @@ extern "C" enum ggml_status ggml_vk_graph_compute_suffix(ggml_backend_t backend,
         ctx->suffix_sizes.clear();
     }
     return ggml_backend_vk_graph_compute(backend, graph);
+}
+
+// Waits for the suffix reads by the flag the graph writes after them, instead of ggml_backend_synchronize: a fence
+// signals some 20 us after the last write reaches host memory. The flag follows every command on the queue, so the
+// host state of the finished graphs is reset here; the fence, command buffers and descriptor sets are left for the
+// next synchronize. Returns false when the graph has no flag; the caller then synchronizes.
+extern "C" bool ggml_vk_wait_suffix_reads(ggml_backend_t backend) {
+    if (!backend || !ggml_backend_is_vk(backend)) { return false; }
+    auto * ctx = static_cast<ggml_backend_vk_context *>(backend->context);
+    const volatile uint32_t * flag = nullptr;
+    {
+        std::lock_guard<std::recursive_mutex> lock(vk_compute_mutex);
+        if (!ctx->suffix_ready || !ctx->suffix_flag || !ctx->compute_ctx.expired() || !ctx->suffix_staging ||
+                !ctx->suffix_staging->ptr) {
+            return false;
+        }
+        flag = reinterpret_cast<const volatile uint32_t *>(static_cast<const uint8_t *>(ctx->suffix_staging->ptr) +
+                ctx->suffix_flag_off);
+    }
+    // Spun without the lock: the walk's upload threads submit on this device meanwhile.
+    const int64_t t0 = ggml_time_us();
+    for (uint32_t spins = 0; *flag != 1; ++spins) {
+        YIELD();
+        // a lost device or a stuck queue: the fence wait reports it
+        if ((spins & 1023) == 1023 && ggml_time_us() - t0 > 2000000) { return false; }
+    }
+    std::atomic_thread_fence(std::memory_order_acquire);
+    std::lock_guard<std::recursive_mutex> lock(vk_compute_mutex);
+    ctx->prealloc_y_last_pipeline_used = {};
+    ctx->prealloc_y_last_tensor_used = nullptr;
+    ctx->unsynced_nodes_written.clear();
+    ctx->unsynced_nodes_read.clear();
+    ctx->prealloc_x_need_sync = ctx->prealloc_y_need_sync = ctx->prealloc_split_k_need_sync = false;
+    return true;
 }
 
 extern "C" bool ggml_vk_take_suffix_reads(ggml_backend_t backend, void ** dsts, const size_t * sizes, int n) {
