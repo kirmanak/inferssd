@@ -242,6 +242,9 @@ std::pair<ggml_tensor *, ggml_tensor *> llm_build_qwen4exp::build_qkvz(
 
     ggml_tensor * z = build_lora_mm(model.layers[il].wqkv_gate, input, model.layers[il].wqkv_gate_s);
     cb(z, "z", il);
+    // Into the graph now, beside the qkv product that reads the same input. Placed where the gated norm reads it,
+    // after the GATED_DELTA_NET, it took a stage of its own.
+    ggml_build_forward_expand(gf, z);
 
     return { qkv_mixed, z };
 }
