@@ -1239,6 +1239,34 @@ struct decode_cache {
     static_assert(k_stride % 34 == 0, "Q8_0 block");
     static_assert(k_stride % 256 == 0, "alignment");
     static_assert(k_stride >= k_down_off + k_max_down, "slot fits");
+    // 43 of the 48 layers have Q4_K up and gate (921600 bytes) and a Q5_1 down (1228800): 3072000 bytes, 29 % less
+    // than the stride above. Their windows use a stride that is a multiple of those two blocks and of 256 (2304),
+    // 1334 * 2304, and 43 slots: 132.2 MB, still one bind under 128 MiB.
+    static constexpr size_t k_small_stride = 3073536;
+    static constexpr int k_small_window = 43;
+    static constexpr size_t k_small_gate_off = 921600;
+    static constexpr size_t k_small_down_off = 1843200;
+    static_assert(k_small_stride % 144 == 0 && k_small_stride % 24 == 0 && k_small_stride % 256 == 0, "small blocks");
+    static_assert(k_small_stride >= k_small_down_off + 1228800, "small slot fits");
+    static_assert(size_t(k_small_window) * k_small_stride < (size_t(128) << 20), "one bind");
+    static_assert(k_small_window <= 64, "window");
+    struct geometry {
+        size_t stride = k_stride;
+        int window = k_window;
+        size_t gate_off = k_gate_off;
+        size_t down_off = k_down_off;
+        size_t bytes() const { return size_t(window) * stride; }
+    };
+    static geometry big_geometry() { return {}; }
+    static geometry small_geometry() { return { k_small_stride, k_small_window, k_small_gate_off, k_small_down_off }; }
+    // A layer's experts fit the small slot when they are no larger and every block divides its stride and offsets.
+    static bool fits_small(int32_t up_type, int32_t down_type, size_t up_bytes, size_t down_bytes) {
+        const size_t ub = ggml_type_size(static_cast<ggml_type>(up_type));
+        const size_t db = ggml_type_size(static_cast<ggml_type>(down_type));
+        return ub && db && up_bytes <= k_small_gate_off && down_bytes <= k_small_stride - k_small_down_off &&
+                k_small_stride % ub == 0 && k_small_stride % db == 0 && k_small_gate_off % ub == 0 &&
+                k_small_down_off % db == 0;
+    }
 
     struct slot_rec {
         int32_t key = -1;
@@ -1252,10 +1280,18 @@ struct decode_cache {
         // -1 if the upload failed. Not atomic-typed: the slot vector is resized.
         int acquire_done = 1;
     };
+    // One window: its slots sit at origin + i * stride in buffer, a layer's geometry.
     struct slab_rec {
         ggml_backend_buffer_t buffer = nullptr;
         int nslots = 0;
         bool borrowed = false; // a prompt buffer (lend), freed by the session
+        bool owner = false;    // the first window of an allocation frees it
+        size_t origin = 0;
+        size_t stride = k_stride;
+        int window = k_window;
+        size_t gate_off = k_gate_off;
+        size_t down_off = k_down_off;
+        int local(size_t offset) const { return int((offset - origin) / stride); }
     };
     struct layer_home {
         int begin = -1;
@@ -1270,6 +1306,8 @@ struct decode_cache {
         int slot = -1;
         ggml_backend_buffer_t buffer = nullptr;
         size_t offset = 0;
+        size_t gate_off = k_gate_off;
+        size_t down_off = k_down_off;
         // Copied on the worker. The host-cache slot stays until this layer's
         // admit, which is after the worker has been woken.
         const void * up = nullptr;
@@ -1284,6 +1322,8 @@ struct decode_cache {
         int slot = -1;
         ggml_backend_buffer_t buffer = nullptr;
         size_t offset = 0;
+        size_t gate_off = k_gate_off;
+        size_t down_off = k_down_off;
         std::vector<uint8_t> up;
         std::vector<uint8_t> gate;
         std::vector<uint8_t> down;
@@ -1344,6 +1384,44 @@ struct decode_cache {
     // matmul. A stripe that crossed a slab boundary scattered them into several
     // chains, and each chain was a new graph.
     std::vector<layer_home> homes;
+    // 1: the layer's experts fit the small slot, 0: they do not, -1: no decode batch of it seen yet. The cache is
+    // built once every layer is known; until then the layers walk on the CPU.
+    std::vector<int8_t> layer_small = std::vector<int8_t>(size_t(k_layers), int8_t(-1));
+    int layers_known = 0;
+    int geometry_calls = 0;
+    void note_layer(const ggml_vk_decode_batch * batch) {
+        ++geometry_calls;
+        if (!batch || batch->n_experts < 1) { return; }
+        const int layer = batch->experts[0].layer;
+        if (layer < 0 || layer >= k_layers || layer_small[size_t(layer)] >= 0) { return; }
+        layer_small[size_t(layer)] = fits_small(batch->up_type, batch->down_type, batch->up_bytes, batch->down_bytes) ? 1 : 0;
+        ++layers_known;
+    }
+    geometry layer_geometry(int layer) const {
+        return layer >= 0 && layer < k_layers && layer_small[size_t(layer)] == 1 && !getenv("INFERSSD_DECODE_BIG_SLOTS") ?
+            small_geometry() : big_geometry();
+    }
+    // Windows carved from buffer at offset, one slab each, in the order of layers.
+    int add_window(ggml_backend_buffer_t buffer, size_t origin, const geometry & g, bool owner, bool borrowed) {
+        slab_rec slab;
+        slab.buffer = buffer;
+        slab.nslots = g.window;
+        slab.borrowed = borrowed;
+        slab.owner = owner;
+        slab.origin = origin;
+        slab.stride = g.stride;
+        slab.window = g.window;
+        slab.gate_off = g.gate_off;
+        slab.down_off = g.down_off;
+        const int base = int(slots.size());
+        slots.resize(size_t(base + slab.nslots));
+        for (int i = 0; i < slab.nslots; ++i) {
+            slots[size_t(base + i)].slab = int(slabs.size());
+            slots[size_t(base + i)].offset = origin + size_t(i) * g.stride;
+        }
+        slabs.push_back(slab);
+        return base;
+    }
     std::unordered_map<int32_t, int> at;
     std::vector<uint16_t> seen;
     std::mutex mu;
@@ -1420,7 +1498,7 @@ struct decode_cache {
         inplace_pool.clear();
         active_inplace = -1;
         for (auto & slab : slabs) {
-            if (slab.buffer && !slab.borrowed) { ggml_backend_buffer_free(slab.buffer); }
+            if (slab.buffer && slab.owner && !slab.borrowed) { ggml_backend_buffer_free(slab.buffer); }
         }
         for (auto & rec : imports) {
             if (rec.buffer) { ggml_backend_buffer_free(rec.buffer); }
@@ -1472,10 +1550,10 @@ struct decode_cache {
                 offs.push_back(item.offset);
                 srcs.push_back(item.up.data());
                 sizes.push_back(item.up.size());
-                offs.push_back(item.offset + k_gate_off);
+                offs.push_back(item.offset + item.gate_off);
                 srcs.push_back(item.gate.data());
                 sizes.push_back(item.gate.size());
-                offs.push_back(item.offset + k_down_off);
+                offs.push_back(item.offset + item.down_off);
                 srcs.push_back(item.down.data());
                 sizes.push_back(item.down.size());
                 flags.push_back(&slots[size_t(item.slot)].acquire_done);
@@ -1566,8 +1644,8 @@ struct decode_cache {
                 const auto t0 = std::chrono::steady_clock::now();
                 rc = ggml_vk_upload_expert_fast(item.buffer,
                         item.offset, item.up, item.up_bytes,
-                        item.offset + k_gate_off, item.gate, item.up_bytes,
-                        item.offset + k_down_off, item.down, item.down_bytes);
+                        item.offset + item.gate_off, item.gate, item.up_bytes,
+                        item.offset + item.down_off, item.down, item.down_bytes);
                 us = std::chrono::duration_cast<std::chrono::microseconds>(
                         std::chrono::steady_clock::now() - t0).count();
             } else {
@@ -1614,6 +1692,9 @@ struct decode_cache {
     bool ensure(expert_session * session) {
         if (live) { return true; }
         if (failed) { return false; }
+        // A layer shows its experts only once all of them are in host memory. One still unseen after 32 tokens'
+        // worth of layers takes the large slot.
+        if (layers_known < k_layers && geometry_calls <= 32 * k_layers) { return false; }
         const char * off = std::getenv("INFERSSD_DECODE_GPU");
         if (off && off[0] == '0' && off[1] == '\0') { failed = true; return false; }
         const char * inplace = std::getenv("INFERSSD_DECODE_INPLACE");
@@ -1644,77 +1725,70 @@ struct decode_cache {
         constexpr size_t reserve = 256ull << 20;
         size_t budget = free_bytes > reserve ? free_bytes - reserve : 0;
         if (budget > (10ull << 30)) { budget = 10ull << 30; }
-        // Whole windows only: a layer binds its slots 28 at a time, and slots past the last whole window of a slab
-        // are never used.
-        const int want = int(budget / k_stride) / k_window * k_window;
-        if (want < 64 || !buft) {
+        // Whole windows only, each in its layer's geometry: every layer's first window, then a second for as many
+        // layers as the budget holds. A buffer holds a run of windows (2 GB at most: a larger one bound whole
+        // corrupted later dispatches).
+        std::vector<int> plan;
+        size_t planned = 0;
+        for (int pass = 0; pass < 2; ++pass) {
+            for (int layer = 0; layer < k_layers; ++layer) {
+                const size_t bytes = layer_geometry(layer).bytes();
+                if (planned + bytes > budget) { continue; }
+                plan.push_back(layer);
+                planned += bytes;
+            }
+        }
+        if (plan.size() < 2 || !buft) {
             failed = true;
             std::fprintf(stderr, "[kimi_vk_decode] no cache free=%zu budget=%zu\n", free_bytes, budget);
             return false;
         }
-        size_t left = size_t(want) * k_stride;
+        seen.assign(size_t(k_layers * k_experts), 0);
+        graphs.reserve(8);
+        homes.assign(k_layers, {});
         constexpr size_t slab_cap = 2ull << 30;
-        constexpr size_t window_bytes = size_t(k_window) * k_stride;
-        while (left >= window_bytes) {
-            size_t chunk = std::min(left, slab_cap - (slab_cap % window_bytes));
-            chunk = (chunk / window_bytes) * window_bytes;
-            if (chunk < window_bytes) { break; }
+        int assigned = 0, extra = 0;
+        size_t next = 0;
+        while (next < plan.size()) {
+            size_t chunk = 0, last = next;
+            while (last < plan.size() && chunk + layer_geometry(plan[last]).bytes() <= slab_cap) {
+                chunk += layer_geometry(plan[last]).bytes();
+                ++last;
+            }
             ggml_backend_buffer_t buf = nullptr;
             try { buf = ggml_backend_buft_alloc_buffer(buft, chunk); }
             catch (...) { buf = nullptr; }
-            if (!buf && chunk > window_bytes * 4) {
-                chunk = window_bytes * 4;
-                try { buf = ggml_backend_buft_alloc_buffer(buft, chunk); }
-                catch (...) { buf = nullptr; }
-            }
             if (!buf) { break; }
-            slab_rec slab;
-            slab.buffer = buf;
-            slab.nslots = int(ggml_backend_buffer_get_size(buf) / k_stride);
-            const int base = int(slots.size());
-            slots.resize(size_t(base + slab.nslots));
-            for (int i = 0; i < slab.nslots; ++i) {
-                slots[size_t(base + i)].slab = int(slabs.size());
-                slots[size_t(base + i)].offset = size_t(i) * k_stride;
+            size_t origin = 0;
+            for (size_t k = next; k < last; ++k) {
+                const int layer = plan[k];
+                const geometry g = layer_geometry(layer);
+                const int begin = add_window(buf, origin, g, k == next, false);
+                auto & home = homes[size_t(layer)];
+                if (home.begin < 0) {
+                    home.begin = begin; home.slab = int(slabs.size()) - 1; home.base = 0;
+                    ++assigned;
+                } else {
+                    home.begin2 = begin; home.slab2 = int(slabs.size()) - 1; home.base2 = 0;
+                    ++extra;
+                }
+                origin += g.bytes();
             }
-            slabs.push_back(slab);
-            left -= size_t(slab.nslots) * k_stride;
+            next = last;
         }
         if (slots.size() < 64) {
             failed = true;
             std::fprintf(stderr, "[kimi_vk_decode] allocation failed free=%zu slabs=%zu\n", free_bytes, slabs.size());
             return false;
         }
-        seen.assign(size_t(k_layers * k_experts), 0);
-        graphs.reserve(8);
-        homes.assign(k_layers, {});
-        struct window_rec { int begin; int slab; int base; };
-        std::vector<window_rec> windows;
-        int global = 0;
-        for (int s = 0; s < int(slabs.size()); ++s) {
-            const int n = slabs[size_t(s)].nslots;
-            for (int base = 0; base + k_window <= n; base += k_window) {
-                windows.push_back({ global + base, s, base });
-            }
-            global += n;
-        }
-        const int primary = std::min(k_layers, int(windows.size()));
-        for (int i = 0; i < primary; ++i) {
-            homes[size_t(i)] = { windows[size_t(i)].begin, windows[size_t(i)].slab, windows[size_t(i)].base, -1, -1, 0 };
-        }
-        int extra = 0;
-        for (int i = primary; i < int(windows.size()) && extra < k_layers; ++i, ++extra) {
-            auto & home = homes[size_t(extra)];
-            home.begin2 = windows[size_t(i)].begin;
-            home.slab2 = windows[size_t(i)].slab;
-            home.base2 = windows[size_t(i)].base;
-        }
-        int assigned = primary;
         live_cache.store(this, std::memory_order_release);
         worker = std::thread([this] { worker_main(); });
         live = true;
-        std::fprintf(stderr, "[kimi_vk_decode] cache slots=%zu stride=%zu free_was=%zu windows=%d extra=%d\n",
-                slots.size(), k_stride, free_bytes, assigned, extra);
+        int small = 0;
+        for (int layer = 0; layer < k_layers; ++layer) { small += layer_small[size_t(layer)] == 1; }
+        std::fprintf(stderr, "[kimi_vk_decode] cache slots=%zu small_layers=%d known=%d calls=%d free_was=%zu windows=%d extra=%d\n",
+                slots.size(), getenv("INFERSSD_DECODE_BIG_SLOTS") ? 0 : small, layers_known, geometry_calls, free_bytes,
+                assigned, extra);
         return true;
     }
 
@@ -1729,7 +1803,11 @@ struct decode_cache {
             session->batch_buffer };
         if (!lendable[0] && !lendable[1] && !lendable[2]) { return; }
         // Only this thread changes the homes.
+        // a layer the cache had no room for first, then the second windows
         std::vector<int> open;
+        for (int layer = 0; layer < int(homes.size()); ++layer) {
+            if (homes[size_t(layer)].begin < 0) { open.push_back(layer); }
+        }
         for (int layer = 0; layer < int(homes.size()); ++layer) {
             if (homes[size_t(layer)].begin >= 0 && homes[size_t(layer)].begin2 < 0) { open.push_back(layer); }
         }
@@ -1741,26 +1819,26 @@ struct decode_cache {
         size_t next = 0;
         for (ggml_backend_buffer_t buffer : lendable) {
             if (!buffer || next >= open.size() || ggml_backend_buffer_get_type(buffer) != buft) { continue; }
-            const int windows = int(std::min<size_t>(ggml_backend_buffer_get_size(buffer) / (size_t(k_window) * k_stride),
-                    open.size() - next));
-            if (windows <= 0) { continue; }
-            slab_rec slab;
-            slab.buffer = buffer;
-            slab.nslots = windows * k_window;
-            slab.borrowed = true;
-            const int base = int(slots.size());
-            slots.resize(size_t(base + slab.nslots));
-            for (int i = 0; i < slab.nslots; ++i) {
-                slots[size_t(base + i)].slab = int(slabs.size());
-                slots[size_t(base + i)].offset = size_t(i) * k_stride;
+            const size_t size = ggml_backend_buffer_get_size(buffer);
+            size_t origin = 0;
+            while (next < open.size()) {
+                const int layer = open[next];
+                const geometry g = layer_geometry(layer);
+                if (origin + g.bytes() > size) { break; }
+                const int begin = add_window(buffer, origin, g, false, true);
+                auto & home = homes[size_t(layer)];
+                if (home.begin < 0) {
+                    home.begin = begin;
+                    home.slab = int(slabs.size()) - 1;
+                    home.base = 0;
+                } else {
+                    home.begin2 = begin;
+                    home.slab2 = int(slabs.size()) - 1;
+                    home.base2 = 0;
+                }
+                origin += g.bytes();
+                ++next;
             }
-            for (int w = 0; w < windows; ++w) {
-                auto & home = homes[size_t(open[next++])];
-                home.begin2 = base + w * k_window;
-                home.slab2 = int(slabs.size());
-                home.base2 = w * k_window;
-            }
-            slabs.push_back(slab);
         }
         if (int(slabs.size()) == first_slab) { return; }
         lent_slab = first_slab;
@@ -1792,6 +1870,7 @@ struct decode_cache {
         }
         for (auto & home : homes) {
             if (home.begin2 >= lent_slot) { home.begin2 = -1; home.slab2 = -1; home.base2 = 0; }
+            if (home.begin >= lent_slot) { home.begin = -1; home.slab = -1; home.base = 0; }
         }
         slots.resize(size_t(lent_slot));
         slabs.resize(size_t(lent_slab));
@@ -1800,58 +1879,6 @@ struct decode_cache {
         // The last decode token's work read these buffers.
         ggml_backend_synchronize(session->backend);
         std::fprintf(stderr, "[kimi_vk_decode] take_back\n");
-    }
-
-    // Each layer owns a run of windows. Ten hot experts then share one matmul
-    // instead of a chain per scattered slot, which is what made recording the token.
-    int layer_stripe(int layer) const {
-        const int stripe = (int(slots.size()) / k_layers / k_window) * k_window;
-        return stripe >= k_window ? stripe : 0;
-    }
-
-    int free_in_range_locked(int begin, int end) const {
-        if (begin < 0) { begin = 0; }
-        if (end > int(slots.size())) { end = int(slots.size()); }
-        for (int i = begin; i < end; ++i) {
-            if (slots[size_t(i)].key < 0 && !slots[size_t(i)].busy) { return i; }
-        }
-        return -1;
-    }
-
-    int same_window_free_locked(int32_t key) const {
-        const int layer = key / k_experts;
-        if (layer < 0 || layer >= k_layers) { return -1; }
-        const int stripe = layer_stripe(layer);
-        const int origin = stripe ? layer * stripe : 0;
-        const int limit = stripe ? std::min(origin + stripe, int(slots.size())) : int(slots.size());
-        int anchor = -1;
-        for (const auto & ent : at) {
-            if (ent.first / k_experts != layer || ent.second < origin || ent.second >= limit) { continue; }
-            anchor = ent.second;
-            break;
-        }
-        if (anchor >= 0) {
-            const auto & home = slots[size_t(anchor)];
-            if (home.slab >= 0 && home.slab < int(slabs.size())) {
-                const int local = int(home.offset / k_stride);
-                const int base = (local / k_window) * k_window;
-                const int end = std::min(base + k_window, slabs[size_t(home.slab)].nslots);
-                for (int i = origin; i < limit; ++i) {
-                    const auto & slot = slots[size_t(i)];
-                    if (slot.slab != home.slab || slot.key >= 0 || slot.busy) { continue; }
-                    const int loc = int(slot.offset / k_stride);
-                    if (loc >= base && loc < end) { return i; }
-                }
-            }
-        }
-        return free_in_range_locked(origin, limit);
-    }
-
-    int free_slot_locked() const {
-        for (int i = 0; i < int(slots.size()); ++i) {
-            if (slots[size_t(i)].key < 0 && !slots[size_t(i)].busy) { return i; }
-        }
-        return -1;
     }
 
     int victim_in_range_locked(int begin, int end) const {
@@ -1907,6 +1934,8 @@ struct decode_cache {
         item.slot = index;
         item.buffer = slabs[size_t(slot.slab)].buffer;
         item.offset = slot.offset;
+        item.gate_off = slabs[size_t(slot.slab)].gate_off;
+        item.down_off = slabs[size_t(slot.slab)].down_off;
         item.up = up;
         item.gate = gate;
         item.down = down;
@@ -1932,9 +1961,9 @@ struct decode_cache {
         if (layer < 0 || layer >= int(homes.size()) || homes[size_t(layer)].begin < 0) { return false; }
         const auto & home = homes[size_t(layer)];
         const int begin = home.begin;
-        const int end = std::min(begin + k_window, int(slots.size()));
+        const int end = std::min(begin + slabs[size_t(home.slab)].nslots, int(slots.size()));
         const int begin2 = home.begin2;
-        const int end2 = begin2 >= 0 ? std::min(begin2 + k_window, int(slots.size())) : -1;
+        const int end2 = begin2 >= 0 ? std::min(begin2 + slabs[size_t(home.slab2)].nslots, int(slots.size())) : -1;
         auto take_free = [&](int from, int to) {
             for (int i = from; i < to; ++i) {
                 if (slots[size_t(i)].key < 0 && !slots[size_t(i)].busy) { return i; }
@@ -1986,9 +2015,9 @@ struct decode_cache {
     // A type whose block does not divide the slot stride cannot be indexed by
     // the vec shader. Leave those experts on the CPU walk instead of reading
     // the wrong bytes.
-    static bool stride_fits(int32_t type) {
+    static bool stride_fits(int32_t type, size_t stride) {
         const size_t block = ggml_type_size(static_cast<ggml_type>(type));
-        return block != 0 && k_stride % block == 0;
+        return block != 0 && stride % block == 0;
     }
 
     static void bind_weight(ggml_tensor * tensor, ggml_backend_buffer_t buffer, size_t offset) {
@@ -2035,9 +2064,12 @@ struct decode_cache {
                 key.push_back(int(group.local.size()));
                 continue;
             }
-            const int span = std::min(k_window, slabs[size_t(group.slab)].nslots - group.base);
+            const auto & slab = slabs[size_t(group.slab)];
+            const int span = std::min(slab.window, slab.nslots - group.base);
             key.push_back(span);
             key.push_back(int(group.local.size()));
+            // the weights' expert stride is in the graph's tensors
+            key.push_back(int(slab.stride / 256));
         }
         return key;
     }
@@ -2050,20 +2082,21 @@ struct decode_cache {
             if (!chain.up_w || !chain.gate_w || !chain.down_w || !chain.ids) { return false; }
             if (group.slab < 0 || group.slab >= int(slabs.size())) { return false; }
             const auto & slab = slabs[size_t(group.slab)];
-            const int span = std::min(k_window, slab.nslots - group.base);
-            if (!slab.buffer || span != chain.span || int(group.local.size()) != chain.n) { return false; }
+            const int span = std::min(slab.window, slab.nslots - group.base);
+            if (!slab.buffer || span != chain.span || int(group.local.size()) != chain.n ||
+                    chain.up_w->nb[2] != slab.stride) { return false; }
             for (int32_t slot : group.local) {
                 if (slot < 0 || slot >= span) { return false; }
             }
-            const size_t origin = size_t(group.base) * k_stride;
+            const size_t origin = slab.origin + size_t(group.base) * slab.stride;
             char * base = static_cast<char *>(ggml_backend_buffer_get_base(slab.buffer));
             auto poke = [&](ggml_tensor * tensor, size_t role) {
                 tensor->buffer = slab.buffer;
                 tensor->data = base + origin + role;
             };
             poke(chain.up_w, 0);
-            poke(chain.gate_w, k_gate_off);
-            poke(chain.down_w, k_down_off);
+            poke(chain.gate_w, slab.gate_off);
+            poke(chain.down_w, slab.down_off);
         }
         return true;
     }
@@ -2130,10 +2163,10 @@ struct decode_cache {
             return true;
         };
         if (!take(g.input)) { return fail("input place"); }
-        auto view_weight = [&](ggml_tensor * tensor, ggml_backend_buffer_t buffer, size_t role) -> bool {
+        auto view_weight = [&](ggml_tensor * tensor, ggml_backend_buffer_t buffer, size_t role, size_t stride) -> bool {
             if (!tensor || !buffer) { return false; }
-            tensor->nb[2] = k_stride;
-            tensor->nb[3] = k_stride * size_t(tensor->ne[2]);
+            tensor->nb[2] = stride;
+            tensor->nb[3] = stride * size_t(tensor->ne[2]);
             const size_t need = ggml_nbytes(tensor);
             if (role + need > ggml_backend_buffer_get_size(buffer)) {
                 std::fprintf(stderr, "[kimi_vk_decode] inplace view role=%zu need=%zu slab=%zu\n",
@@ -2149,18 +2182,19 @@ struct decode_cache {
             if (group.slab < 0 || group.slab >= int(slabs.size()) || group.local.empty()) { return fail("slab"); }
             const auto & slab = slabs[size_t(group.slab)];
             const int n = int(group.local.size());
-            const int span = std::min(k_window, slab.nslots - group.base);
+            const int span = std::min(slab.window, slab.nslots - group.base);
             if (span < 1 || n > k_max_n || group.base < 0) { return fail("count"); }
             for (int32_t slot : group.local) {
                 if (slot < 0 || slot >= span) { return fail("slot"); }
             }
-            const size_t origin = size_t(group.base) * k_stride;
+            const size_t origin = slab.origin + size_t(group.base) * slab.stride;
             ggml_tensor * up_w = ggml_new_tensor_3d(g.ctx, ggml_type(batch->up_type), batch->latent, batch->hidden, span);
             ggml_tensor * gate_w = ggml_new_tensor_3d(g.ctx, ggml_type(batch->up_type), batch->latent, batch->hidden, span);
             ggml_tensor * down_w = ggml_new_tensor_3d(g.ctx, ggml_type(batch->down_type), batch->hidden, batch->latent, span);
             ggml_tensor * ids = ggml_new_tensor_2d(g.ctx, GGML_TYPE_I32, n, 1);
-            if (!view_weight(up_w, slab.buffer, origin) || !view_weight(gate_w, slab.buffer, origin + k_gate_off) ||
-                    !view_weight(down_w, slab.buffer, origin + k_down_off) || !ids) {
+            if (!view_weight(up_w, slab.buffer, origin, slab.stride) ||
+                    !view_weight(gate_w, slab.buffer, origin + slab.gate_off, slab.stride) ||
+                    !view_weight(down_w, slab.buffer, origin + slab.down_off, slab.stride) || !ids) {
                 return fail("weight view");
             }
             ggml_tensor * up_out = ggml_mul_mat_id(g.ctx, up_w, g.input, ids);
@@ -2196,7 +2230,7 @@ struct decode_cache {
         active_inplace = int(inplace_pool.size()) - 1;
         if (stat_build <= 8) {
             std::fprintf(stderr, "[kimi_vk_decode] inplace graph slabs=%d hits=%d pool=%zu stride=%zu\n",
-                nchains, hits, inplace_pool.size(), k_stride);
+                nchains, hits, inplace_pool.size(), slabs[size_t(groups[0].slab)].stride);
             std::fflush(stderr);
         }
         return &inplace_pool[size_t(active_inplace)];
@@ -2498,6 +2532,7 @@ bool decode_prepare(void * raw, ggml_vk_decode_batch * batch) {
         return false;
     }
     if (!session->decode) { session->decode = new (std::nothrow) decode_cache; }
+    if (session->decode && !session->decode->live) { session->decode->note_layer(batch); }
     if (!session->decode || !session->decode->ensure(session)) { return false; }
     auto * cache = session->decode;
     if (cache->launched) { return false; }
@@ -2562,21 +2597,22 @@ bool decode_prepare(void * raw, ggml_vk_decode_batch * batch) {
                 slot.freq = freq;
                 slot.stamp = cache->stamp;
                 if (!slot.ready || slot.busy) { ++cache->stat_pending; }
-                if (slot.ready && !slot.busy && !cache->inplace_broken &&
-                        decode_cache::stride_fits(batch->up_type) &&
-                        decode_cache::stride_fits(batch->down_type)) {
-                    const int local = int(slot.offset / decode_cache::k_stride);
-                    if (slot.slab < 0 || slot.slab >= int(cache->slabs.size()) || local < 0 ||
-                            local >= cache->slabs[size_t(slot.slab)].nslots) {
+                if (slot.ready && !slot.busy && !cache->inplace_broken && slot.slab >= 0 &&
+                        slot.slab < int(cache->slabs.size()) &&
+                        decode_cache::stride_fits(batch->up_type, cache->slabs[size_t(slot.slab)].stride) &&
+                        decode_cache::stride_fits(batch->down_type, cache->slabs[size_t(slot.slab)].stride)) {
+                    const auto & slab = cache->slabs[size_t(slot.slab)];
+                    const int local = slab.local(slot.offset);
+                    if (local < 0 || local >= slab.nslots) {
                         continue;
                     }
                     decode_cache::gpu_piece piece;
                     piece.index = i;
                     piece.slab = slot.slab;
                     piece.local = local;
-                    piece.up = { cache->slabs[size_t(slot.slab)].buffer, slot.offset };
-                    piece.gate = { piece.up.buffer, slot.offset + decode_cache::k_gate_off };
-                    piece.down = { piece.up.buffer, slot.offset + decode_cache::k_down_off };
+                    piece.up = { slab.buffer, slot.offset };
+                    piece.gate = { piece.up.buffer, slot.offset + slab.gate_off };
+                    piece.down = { piece.up.buffer, slot.offset + slab.down_off };
                     cache->plan.push_back(piece);
                     batch->ran[i] = 1;
                     cache->hit_of.push_back(i);
@@ -2606,7 +2642,8 @@ bool decode_launch(void * raw) {
     std::vector<decode_cache::slab_group> groups;
     for (const auto & piece : cache->plan) {
         if (piece.slab < 0 || piece.local < 0) { continue; }
-        const int base = (piece.local / decode_cache::k_window) * decode_cache::k_window;
+        const int window = cache->slabs[size_t(piece.slab)].window;
+        const int base = (piece.local / window) * window;
         decode_cache::slab_group * group = nullptr;
         for (auto & existing : groups) {
             if (existing.slab == piece.slab && existing.base == base) { group = &existing; break; }
@@ -2639,7 +2676,7 @@ bool decode_launch(void * raw) {
         cache->hit_of.insert(cache->hit_of.end(), group.hit.begin(), group.hit.end());
         cache->launched_real.push_back(real);
         if (!bucket_chain || real < 1 || group.slab < 0 || group.slab >= int(cache->slabs.size())) { continue; }
-        const int span = std::min(decode_cache::k_window, cache->slabs[size_t(group.slab)].nslots - group.base);
+        const int span = std::min(cache->slabs[size_t(group.slab)].window, cache->slabs[size_t(group.slab)].nslots - group.base);
         int bucket = real <= 4 ? 4 : real <= 8 ? 8 : 16;
         if (bucket > span) { bucket = span; }
         if (bucket <= real) { continue; }
