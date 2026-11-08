@@ -2145,6 +2145,11 @@ struct ggml_backend_vk_context {
     std::vector<const ggml_tensor *> park_late;
     std::vector<const ggml_tensor *> park_late_src;
     bool park_folded = false;
+    // A late input the record's shaders read where its source lies in pinned host memory, in place of a copy at
+    // the cut; see the cut in ggml_backend_vk_graph_compute. ggml_vk_tensor_subbuffer binds it.
+    const ggml_tensor * park_host_tensor = nullptr;
+    vk_buffer park_host_buf;
+    size_t park_host_off = 0;
     // the reads for the next record (ggml_vk_park_reads), and the submitted park that holds the last ones
     std::vector<const ggml_tensor *> park_reads_srcs;
     std::vector<size_t> park_reads_sizes;
@@ -6774,7 +6779,10 @@ static vk_subbuffer ggml_vk_tensor_subbuffer(
 
     vk_buffer buffer = nullptr;
     size_t offset = 0;
-    if (ctx->device->uma) {
+    if (ctx->park_host_tensor && tensor == ctx->park_host_tensor) {
+        buffer = ctx->park_host_buf;
+        offset = ctx->park_host_off;
+    } else if (ctx->device->uma) {
         ggml_vk_host_get(ctx->device, tensor->data, buffer, offset);
     }
     if (!buffer) {
@@ -17378,6 +17386,8 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
     struct park_copy { vk_buffer src; size_t src_off; vk_buffer dst; size_t dst_off; size_t size; };
     std::vector<park_copy> park_copies;
     ctx->park_folded = false;
+    ctx->park_host_tensor = nullptr;
+    ctx->park_host_buf = nullptr;
     if (ctx->park_mode && !ctx->park_late.empty() && ctx->park_late_src.size() == ctx->park_late.size()) {
         for (size_t j = 0; j < ctx->park_late.size(); ++j) {
             const ggml_tensor * dst = ctx->park_late[j];
@@ -17722,7 +17732,36 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 ctx->unsynced_nodes_read.clear();
                 ggml_vk_sync_buffers(ctx, park.held);
             }
-            if (!park_copies.empty()) {
+            // One late input whose only reader is this fused combine, which binds its sources with
+            // ggml_vk_tensor_subbuffer: the shader reads it in pinned host memory, with no copy and no barrier.
+            static const bool host_read_on = getenv("INFERSSD_NO_PARK_HOST_READ") == nullptr;
+            bool host_read = false;
+            if (host_read_on && park_copies.size() == 1 && ctx->park_late.size() == 1 && fusion_string &&
+                    (park_copies[0].src_off & (ctx->device->properties.limits.minStorageBufferOffsetAlignment - 1)) == 0 &&
+                    (strcmp(fusion_string, "SIGMOID_MUL_ADD_HC_POST_NORM") == 0 ||
+                     strcmp(fusion_string, "SIGMOID_MUL_ADD_HC_POST") == 0 || strcmp(fusion_string, "SIGMOID_MUL_ADD") == 0)) {
+                const ggml_tensor * late = ctx->park_late[0];
+                int uses = 0;
+                bool in_group = false;
+                for (int j = 0; j < cgraph->n_nodes; ++j) {
+                    for (int k = 0; k < GGML_MAX_SRC; ++k) {
+                        const ggml_tensor * t = cgraph->nodes[j]->src[k];
+                        if (t == late) {
+                            ++uses;
+                            in_group = j >= i && j <= i + ctx->num_additional_fused_ops;
+                        } else if (t && t->view_src == late) {
+                            uses += 2;
+                        }
+                    }
+                }
+                host_read = uses == 1 && in_group;
+            }
+            if (host_read) {
+                ctx->park_host_tensor = ctx->park_late[0];
+                ctx->park_host_buf = park_copies[0].src;
+                ctx->park_host_off = park_copies[0].src_off;
+                ctx->park_folded = true;
+            } else if (!park_copies.empty()) {
                 vk_context held = ggml_vk_get_compute_ctx(ctx);
                 if (held && held->s) {
                     for (const auto & c : park_copies) {
@@ -18198,6 +18237,8 @@ extern "C" bool ggml_vk_park_record(ggml_backend_t backend, ggml_cgraph * graph)
             ~clear_mode() { ctx->park_mode = false; }
         } guard{ctx};
         const ggml_status status = ggml_backend_vk_graph_compute(backend, graph);
+        ctx->park_host_tensor = nullptr;
+        ctx->park_host_buf = nullptr;
         ctx->unsynced_nodes_written = std::move(saved_written);
         ctx->unsynced_nodes_read = std::move(saved_read);
         ctx->descriptor_set_idx = saved_idx;
