@@ -16391,9 +16391,10 @@ static bool ggml_vk_can_fuse_rope_set_rows(ggml_backend_vk_context * ctx, const 
         return false;
     }
 
-    // Only norm/neox/mrope shaders have the fusion code
+    // Only norm/neox/mrope shaders have the fusion code; imrope is the mrope shader
     const int mode = ((const int32_t *) rope->op_params)[2];
-    if (mode != GGML_ROPE_TYPE_NORMAL && mode != GGML_ROPE_TYPE_NEOX && mode != GGML_ROPE_TYPE_MROPE) {
+    if (mode != GGML_ROPE_TYPE_NORMAL && mode != GGML_ROPE_TYPE_NEOX && mode != GGML_ROPE_TYPE_MROPE &&
+        mode != GGML_ROPE_TYPE_IMROPE) {
         return false;
     }
 
@@ -16772,8 +16773,9 @@ static bool ggml_vk_can_fuse_rms_norm_mul_rope(ggml_backend_vk_context * ctx, co
         return false;
     }
 
-    // only norm/neox are handled in the shader
-    if (mode != GGML_ROPE_TYPE_NEOX && mode != GGML_ROPE_TYPE_NORMAL) {
+    // norm, neox and the multi-section ropes (rope_multi) are handled in the shader
+    if (mode != GGML_ROPE_TYPE_NEOX && mode != GGML_ROPE_TYPE_NORMAL && mode != GGML_ROPE_TYPE_MROPE &&
+        mode != GGML_ROPE_TYPE_IMROPE) {
         return false;
     }
 
@@ -17664,6 +17666,10 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                             if (!src || src->op == GGML_OP_NONE) {
                                 continue;
                             }
+                            // a SET_ROWS's third source is the tensor it writes in place, which it never reads
+                            if (s == 2 && cgraph->nodes[i + k]->op == GGML_OP_SET_ROWS) {
+                                continue;
+                            }
                             if (ggml_vk_tensors_overlap(src, dst, op_srcs_fused_elementwise[k])) {
                                 bool found = false;
                                 for (int n = 0; n < k; ++n) {
@@ -18513,7 +18519,8 @@ static void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * 
                     for (int k = j + 1; k < std::min(j + 15, graph->n_nodes); ++k) {
                         const int rope_mode = graph->nodes[k]->op == GGML_OP_ROPE ? ((const int32_t *) graph->nodes[k]->op_params)[2] : -1;
                         if (graph->nodes[k]->op == GGML_OP_ROPE &&
-                            (rope_any || rope_mode == GGML_ROPE_TYPE_NEOX || rope_mode == GGML_ROPE_TYPE_NORMAL) &&
+                            (rope_any || rope_mode == GGML_ROPE_TYPE_NEOX || rope_mode == GGML_ROPE_TYPE_NORMAL ||
+                             rope_mode == GGML_ROPE_TYPE_MROPE || rope_mode == GGML_ROPE_TYPE_IMROPE) &&
                             graph->nodes[k]->src[0] == graph->nodes[j] &&
                             // Check that other srcs are already valid
                             graph->nodes[k]->src[1]->op == GGML_OP_NONE &&

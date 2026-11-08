@@ -407,11 +407,12 @@ ggml_tensor * llm_build_qwen4exp::build_qsa_sel(
     ggml_tensor * pooled_new = ggml_pool_2d(ctx0, rows, GGML_OP_POOL_AVG, 1, kpool, 1, kpool, 0, 0); // [idx_dim, 1, n_new]
     pooled_new = build_norm(pooled_new, model.layers[il].index_k_norm, nullptr, LLM_NORM_RMS, il);
 
-    pooled_new = ggml_reshape_3d(ctx0, pooled_new, idx_dim, 1, n_new);
+    // the norm, rope, flattening view and scatter in the order a backend fuses them (Vulkan's
+    // RMS_NORM_MUL_ROPE_VIEW_SET_ROWS): the rope reads the norm's [idx_dim, 1, n_new] directly
     pooled_new = ggml_rope_multi(ctx0, pooled_new, inp_kpool->new_pool_pos, nullptr,
             n_rot, sections, rope_type, n_ctx_orig, freq_base, freq_scale,
             ext_factor, attn_factor, beta_fast, beta_slow);
-    pooled_new = ggml_reshape_2d(ctx0, pooled_new, idx_dim, n_new);
+    pooled_new = ggml_view_2d(ctx0, pooled_new, idx_dim, n_new, pooled_new->nb[2], 0);
     cb(pooled_new, "indexer_pool_k_new", il);
 
     // scatter the fresh pooled keys into their rep rows, then gather all n_pool of them by cell:

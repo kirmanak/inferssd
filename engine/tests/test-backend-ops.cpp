@@ -2614,12 +2614,27 @@ struct test_rms_norm_mul_rope : public test_case {
         if (multi_add) {
             a = ggml_add(ctx, ggml_add(ctx, a, b), c);
         }
+        if (mode & GGML_ROPE_TYPE_MROPE) {
+            // a backend may fuse only in larger graphs (Vulkan: more than 32 nodes)
+            for (int i = 0; i < 40; ++i) {
+                a = ggml_add(ctx, a, c);
+            }
+        }
 
         a = ggml_mul(ctx, ggml_rms_norm(ctx, a, eps), b);
 
-        ggml_tensor * pos = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, ne[2]);
-
-        ggml_tensor * rope = ggml_rope(ctx, a, pos, ne[0], mode);
+        ggml_tensor * rope;
+        if (mode & GGML_ROPE_TYPE_MROPE) {
+            // partial rotation: a quarter of the head, its pairs in three sections
+            ggml_tensor * pos = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, ne[2] * 4);
+            ggml_set_name(pos, "pos");
+            const int n_dims = (int) ne[0] / 4;
+            int sections[4] = { n_dims / 6 + n_dims / 2 % 3, n_dims / 6, n_dims / 6, 0 };
+            rope = ggml_rope_multi(ctx, a, pos, nullptr, n_dims, sections, mode, 0, 10000.0f, 1.0f, 0.0f, 1.0f, 32.0f, 1.0f);
+        } else {
+            ggml_tensor * pos = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, ne[2]);
+            rope = ggml_rope(ctx, a, pos, ne[0], mode);
+        }
 
         ggml_tensor * out;
 
@@ -2628,12 +2643,24 @@ struct test_rms_norm_mul_rope : public test_case {
 
             ggml_tensor * dst = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, ne[0] * ne[1], ne[2] * ne[3], 1, 1);
             ggml_set_name(dst, "dst");
+            ggml_tensor * wide = nullptr;
+            if (mode & GGML_ROPE_TYPE_MROPE) {
+                // the second half of rows twice as wide, as a cache that keeps two keys a row
+                wide = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 2 * ne[0] * ne[1], ne[2] * ne[3], 1, 1);
+                ggml_set_name(wide, "dst");
+                dst = ggml_view_2d(ctx, wide, ne[0] * ne[1], ne[2] * ne[3], wide->nb[1], ne[0] * ne[1] * ggml_element_size(wide));
+            }
 
             ggml_tensor * row_idxs = ggml_new_tensor_3d(ctx, GGML_TYPE_I64, ne[2], 1, 1);
             ggml_set_name(row_idxs, "row_idxs");
 
             out = ggml_set_rows(ctx, dst, view, row_idxs);
             ggml_set_name(out, "out");
+            if (wide) {
+                // Read the region back through the destination's view, which the graph then visits before the chain,
+                // as a scheduler orders it: the five ops stay adjacent.
+                out = ggml_add(ctx, dst, out);
+            }
         } else {
             out = rope;
         }
@@ -2643,7 +2670,12 @@ struct test_rms_norm_mul_rope : public test_case {
 
     void initialize_tensors(ggml_context * ctx) override {
         for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
-            if (t->type == GGML_TYPE_I64 || t->type == GGML_TYPE_I32) {
+            if (t->type == GGML_TYPE_I32 && strcmp(t->name, "pos") == 0) {
+                // positions of every section, so that a one-token rope rotates
+                std::vector<int32_t> pos(ggml_nelements(t));
+                for (size_t k = 0; k < pos.size(); ++k) { pos[k] = int32_t((k * 7919 + 13) % 4096); }
+                ggml_backend_tensor_set(t, pos.data(), 0, pos.size() * sizeof(int32_t));
+            } else if (t->type == GGML_TYPE_I64 || t->type == GGML_TYPE_I32) {
                 if (ggml_is_view_op(t->op)) {
                     continue;
                 }
@@ -9323,6 +9355,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                 test_cases.emplace_back(new test_rms_norm_mul_rope({8192, 2, 2, 1}, 1e-6f, multi_add, set_rows, rope));
                 test_cases.emplace_back(new test_rms_norm_mul_rope({8192, 2, 2, 1}, 1e-6f, multi_add, set_rows, rope));
             }
+        }
+    }
+    for (auto set_rows : {false, true}) {
+        for (auto rope : {GGML_ROPE_TYPE_MROPE, GGML_ROPE_TYPE_IMROPE}) {
+            test_cases.emplace_back(new test_rms_norm_mul_rope({128, 4, 1, 1}, 1e-6f, false, set_rows, rope));
+            test_cases.emplace_back(new test_rms_norm_mul_rope({256, 16, 1, 1}, 1e-6f, false, set_rows, rope));
+            test_cases.emplace_back(new test_rms_norm_mul_rope({256, 2, 1, 1}, 1e-6f, false, set_rows, rope));
+            test_cases.emplace_back(new test_rms_norm_mul_rope({128, 8, 3, 1}, 1e-6f, false, set_rows, rope));
+            test_cases.emplace_back(new test_rms_norm_mul_rope({256, 2, 5, 1}, 1e-6f, false, set_rows, rope));
         }
     }
     for (int64_t d_conv : {3, 4, 9}) {
