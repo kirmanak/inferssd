@@ -4287,6 +4287,78 @@ struct test_gated_delta_net : public test_case {
     }
 };
 
+// GGML_OP_GATED_DELTA_NET with q and k L2-normalized (RMS_NORM and SCALE) views of one conv output and beta through a
+// SIGMOID, as a recurrent model's one-token graph has them; a backend may fold the norms and the sigmoid into the op
+struct test_gated_delta_net_inputs : public test_case {
+    const int64_t head_k_count;
+    const int64_t head_size;
+    const int     v_repeat;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "GATED_DELTA_NET_INPUTS";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    std::string vars() override {
+        return VARS_TO_STR3(head_k_count, head_size, v_repeat);
+    }
+
+    test_gated_delta_net_inputs(int64_t head_k_count = 16, int64_t head_size = 128, int v_repeat = 3)
+        : head_k_count(head_k_count), head_size(head_size), v_repeat(v_repeat) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int64_t hv = head_k_count * v_repeat;
+        const int64_t channels = head_size * (2 * head_k_count + hv);
+        ggml_tensor * c0 = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, channels);
+        ggml_tensor * cd = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, channels);
+        ggml_set_name(cd, "cd");
+        ggml_tensor * b0 = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, hv);
+        ggml_tensor * bd = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, hv);
+        ggml_tensor * g  = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 1, hv, 1, 1);
+        ggml_tensor * state = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, head_size * head_size * hv, 1);
+
+        // computed inputs and a chain of nodes, as a backend may fuse only in graphs of more than a few nodes
+        ggml_tensor * c = c0;
+        ggml_tensor * b = b0;
+        for (int i = 0; i < 20; ++i) {
+            c = ggml_add(ctx, c, cd);
+            b = ggml_add(ctx, b, bd);
+        }
+        const size_t es = ggml_element_size(c);
+        ggml_tensor * q = ggml_view_4d(ctx, c, head_size, head_k_count, 1, 1, head_size*es, channels*es, channels*es, 0);
+        ggml_tensor * k = ggml_view_4d(ctx, c, head_size, head_k_count, 1, 1, head_size*es, channels*es, channels*es,
+                head_size*head_k_count*es);
+        ggml_tensor * v = ggml_view_4d(ctx, c, head_size, hv, 1, 1, head_size*es, channels*es, channels*es,
+                2*head_size*head_k_count*es);
+        const float eps = 1e-6f;
+        const float n = head_size;
+        q = ggml_scale(ctx, ggml_rms_norm(ctx, q, eps/n), 1.0f/sqrtf(n));
+        k = ggml_scale(ctx, ggml_rms_norm(ctx, k, eps/n), 1.0f/sqrtf(n));
+        ggml_tensor * beta = ggml_sigmoid(ctx, ggml_reshape_4d(ctx, b, 1, hv, 1, 1));
+        ggml_tensor * out = ggml_gated_delta_net(ctx, q, k, v, g, beta, state);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            init_tensor_uniform(t, -0.5f, 0.5f);
+            if (strcmp(t->name, "cd") == 0) {
+                // k's rows several times larger than q's, so that a norm applied to the wrong one shows
+                std::vector<float> d(ggml_nelements(t));
+                ggml_backend_tensor_get(t, d.data(), 0, ggml_nbytes(t));
+                const int64_t k0 = head_size * head_k_count;
+                for (int64_t e = k0; e < 2*k0; ++e) {
+                    d[e] *= 1.0f + 6.0f * (float) ((e - k0) % head_size) / head_size;
+                }
+                ggml_backend_tensor_set(t, d.data(), 0, ggml_nbytes(t));
+            }
+        }
+    }
+};
+
 // GGML_OP_GATED_DELTA_NET with its state gathered from a recurrent cache by GET_ROWS and the new state copied back,
 // as a recurrent model's graph has it; a backend may fold the gather and the copy into the op
 struct test_gated_delta_net_state : public test_case {
@@ -9998,6 +10070,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_topk_moe({896, 4, 1, 1}, 16, true, false, GATING_FUNC_SIGMOID, 1.0f));
 
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, 1, 1));
+    test_cases.emplace_back(new test_gated_delta_net_inputs(16, 128, 3));
+    test_cases.emplace_back(new test_gated_delta_net_inputs(4, 64, 2));
+    test_cases.emplace_back(new test_gated_delta_net_inputs(8, 128, 1));
     test_cases.emplace_back(new test_gated_delta_net_state(4, 32, 1, 3, 2, 2));
     test_cases.emplace_back(new test_gated_delta_net_state(4, 32, 1, 3, 2, 0));
     test_cases.emplace_back(new test_gated_delta_net_state(48, 128, 1, 2, 1, 1));

@@ -36,6 +36,10 @@ layout(push_constant) uniform Parameters {
     uint state_mode;
     uint state_row;
     uint offs_in, offs_ids, offs_out;
+    // inputs_mode 1: q and k unnormalized, normalized here as RMS_NORM (eps qk_eps) and SCALE (qk_scale) do; beta before
+    // its sigmoid
+    uint inputs_mode;
+    float qk_eps, qk_scale;
 };
 
 layout(binding = 0) readonly  buffer QBuf     { FLOAT_TYPE data_q[];     };
@@ -126,7 +130,7 @@ void main() {
         const uint k_off = q_off;
         const uint v_off = seq_id * sv3 + t * sv2 + head_id * sv1;
         const uint gb_off = seq_id * sb3 + t * sb2 + head_id * sb1;
-        const FLOAT_TYPE beta_val = FLOAT_TYPE(data_beta[gb_off]);
+        FLOAT_TYPE beta_val = FLOAT_TYPE(data_beta[gb_off]);
 
         FLOAT_TYPE k_reg[ROWS_PER_LANE];
         FLOAT_TYPE q_reg[ROWS_PER_LANE];
@@ -134,6 +138,23 @@ void main() {
             const uint i = r * LANES_PER_COLUMN + lane;
             k_reg[r] = FLOAT_TYPE(data_k[k_off + i]);
             q_reg[r] = FLOAT_TYPE(data_q[q_off + i]);
+        }
+        if (inputs_mode != 0) {
+            // the column's lanes hold the whole row
+            FLOAT_TYPE qq = 0.0, kk = 0.0;
+            [[unroll]] for (uint r = 0; r < ROWS_PER_LANE; r++) {
+                qq += q_reg[r] * q_reg[r];
+                kk += k_reg[r] * k_reg[r];
+            }
+            qq = reduce_partial(qq);
+            kk = reduce_partial(kk);
+            const FLOAT_TYPE qs = inversesqrt(qq / FLOAT_TYPE(S_V) + FLOAT_TYPE(qk_eps)) * FLOAT_TYPE(qk_scale);
+            const FLOAT_TYPE ks = inversesqrt(kk / FLOAT_TYPE(S_V) + FLOAT_TYPE(qk_eps)) * FLOAT_TYPE(qk_scale);
+            [[unroll]] for (uint r = 0; r < ROWS_PER_LANE; r++) {
+                q_reg[r] *= qs;
+                k_reg[r] *= ks;
+            }
+            beta_val = FLOAT_TYPE(1.0) / (FLOAT_TYPE(1.0) + exp(-beta_val));
         }
 
         FLOAT_TYPE g_exp[ROWS_PER_LANE];

@@ -1558,6 +1558,9 @@ struct vk_op_gated_delta_net_push_constants {
     uint32_t state_mode;
     uint32_t state_row;
     uint32_t offs_in, offs_ids, offs_out;
+    // inputs_mode 1: q and k come unnormalized and beta before its sigmoid; see ggml_vk_fold_gdn_inputs
+    uint32_t inputs_mode;
+    float qk_eps, qk_scale;
 };
 
 struct vk_op_ssm_scan_push_constants {
@@ -2015,6 +2018,11 @@ struct ggml_backend_vk_context {
     // gdn_state_skip); see ggml_vk_fold_conv_state.
     struct conv_state_fold { const ggml_tensor * get_rows; const ggml_tensor * concat; const ggml_tensor * cpy; };
     std::unordered_map<const ggml_tensor *, conv_state_fold> conv_state_io;
+    // And a one-token GATED_DELTA_NET normalizes its q and k and takes the sigmoid of its beta itself: per GDN node, the
+    // sources of the skipped RMS_NORM, SCALE and SIGMOID nodes, which are put in gdn_state_skip; see
+    // ggml_vk_fold_gdn_inputs.
+    struct gdn_inputs_fold { const ggml_tensor * q; const ggml_tensor * k; const ggml_tensor * beta; float eps, scale; };
+    std::unordered_map<const ggml_tensor *, gdn_inputs_fold> gdn_inputs_io;
     // Track which prealloc buffers have pending reads that need to be synchronized.
     // These are checked before writing to the buffer (and call ggml_vk_sync_buffers if set),
     // and set to true after the buffer contents are consumed.
@@ -10940,6 +10948,21 @@ static void ggml_vk_gated_delta_net(ggml_backend_vk_context * ctx, vk_context& s
         out_buf = sub(fold->second.second->src[1], offs_out);
     }
 
+    // folded inputs: q and k as the conv wrote them, beta as its mat-vec wrote it
+    uint32_t inputs_mode = 0;
+    float qk_eps = 0.0f, qk_scale = 0.0f;
+    const auto inputs = ctx->gdn_inputs_io.find(dst);
+    if (inputs != ctx->gdn_inputs_io.end()) {
+        inputs_mode = 1;
+        qk_eps = inputs->second.eps;
+        qk_scale = inputs->second.scale;
+        src_q = inputs->second.q;
+        src_beta = inputs->second.beta;
+        src_buf[0] = ggml_vk_tensor_subbuffer(ctx, inputs->second.q);
+        src_buf[1] = ggml_vk_tensor_subbuffer(ctx, inputs->second.k);
+        src_buf[4] = ggml_vk_tensor_subbuffer(ctx, inputs->second.beta);
+    }
+
     const uint32_t sq1 = (uint32_t)(src_q->nb[1] / sizeof(float));
     const uint32_t sq2 = (uint32_t)(src_q->nb[2] / sizeof(float));
     const uint32_t sq3 = (uint32_t)(src_q->nb[3] / sizeof(float));
@@ -10961,7 +10984,8 @@ static void ggml_vk_gated_delta_net(ggml_backend_vk_context * ctx, vk_context& s
         sb1, sb2, sb3,
         neq1, rq3,
         scale,
-        state_mode, state_row, offs_in, offs_ids, offs_out
+        state_mode, state_row, offs_in, offs_ids, offs_out,
+        inputs_mode, qk_eps, qk_scale
     };
 
     ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
@@ -13678,6 +13702,13 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
             need_sync = overlaps_unsynced(rows, ctx->unsynced_nodes_written) ||
                         overlaps_unsynced(out, ctx->unsynced_nodes_read) || overlaps_unsynced(out, ctx->unsynced_nodes_written);
         }
+        // folded GDN inputs, read in place of the skipped norms and sigmoid
+        const auto gdn_inputs = node->op == GGML_OP_GATED_DELTA_NET ? ctx->gdn_inputs_io.find(node) : ctx->gdn_inputs_io.end();
+        if (!need_sync && gdn_inputs != ctx->gdn_inputs_io.end()) {
+            need_sync = overlaps_unsynced(gdn_inputs->second.q, ctx->unsynced_nodes_written) ||
+                        overlaps_unsynced(gdn_inputs->second.k, ctx->unsynced_nodes_written) ||
+                        overlaps_unsynced(gdn_inputs->second.beta, ctx->unsynced_nodes_written);
+        }
         // and a folded conv state, which also reads the new column in place of the CONCAT
         const auto conv_fold = node->op == GGML_OP_SSM_CONV ? ctx->conv_state_io.find(node) : ctx->conv_state_io.end();
         if (!need_sync && conv_fold != ctx->conv_state_io.end()) {
@@ -13720,6 +13751,11 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
         if (gdn_fold != ctx->gdn_state_io.end()) {
             ctx->unsynced_nodes_read.push_back(gdn_fold->second.first->src[0]);
             ctx->unsynced_nodes_written.push_back(gdn_fold->second.second->src[1]);
+        }
+        if (gdn_inputs != ctx->gdn_inputs_io.end()) {
+            ctx->unsynced_nodes_read.push_back(gdn_inputs->second.q);
+            ctx->unsynced_nodes_read.push_back(gdn_inputs->second.k);
+            ctx->unsynced_nodes_read.push_back(gdn_inputs->second.beta);
         }
         if (conv_fold != ctx->conv_state_io.end()) {
             ctx->unsynced_nodes_read.push_back(conv_fold->second.get_rows->src[0]);
@@ -16847,6 +16883,112 @@ static void ggml_vk_fold_conv_state(ggml_backend_vk_context * ctx, const ggml_cg
     }
 }
 
+// Finds the one-token GATED_DELTA_NET nodes whose q and k are each a SCALE (no bias) of an RMS_NORM of rows of the
+// head size, and whose beta is a SIGMOID, each of these used by the GDN alone. The GDN then normalizes q and k (the
+// column's lanes hold the whole row) and takes beta's sigmoid itself, and the RMS_NORM, SCALE and SIGMOID nodes are
+// skipped. Runs after ggml_vk_fold_gdn_state, whose skip set it adds to.
+static void ggml_vk_fold_gdn_inputs(ggml_backend_vk_context * ctx, const ggml_cgraph * cgraph) {
+    ctx->gdn_inputs_io.clear();
+    if (ctx->device->disable_fusion || cgraph->n_nodes <= 32 || getenv("INFERSSD_NO_GDN_INPUTS")) {
+        return;
+    }
+    bool any = false;
+    for (int i = 0; i < cgraph->n_nodes && !any; ++i) {
+        any = cgraph->nodes[i]->op == GGML_OP_GATED_DELTA_NET;
+    }
+    if (!any) {
+        return;
+    }
+    const auto uses = [cgraph](const ggml_tensor * t) {
+        int n = 0;
+        for (int j = 0; j < cgraph->n_nodes; ++j) {
+            for (int s = 0; s < GGML_MAX_SRC; ++s) {
+                n += cgraph->nodes[j]->src[s] == t;
+            }
+        }
+        return n;
+    };
+    const auto computed = [](const ggml_tensor * t) { return (t->flags & GGML_TENSOR_FLAG_COMPUTE) != 0; };
+    const auto f32 = [](const ggml_tensor * t) { return t->type == GGML_TYPE_F32 && t->nb[0] == sizeof(float); };
+    const auto aligned = [ctx](const ggml_tensor * t) {
+        return t->buffer && (vk_tensor_offset(t) + t->view_offs) % ctx->device->properties.limits.minStorageBufferOffsetAlignment == 0;
+    };
+
+    for (int i = 0; i < cgraph->n_nodes; ++i) {
+        const ggml_tensor * gdn = cgraph->nodes[i];
+        if (gdn->op != GGML_OP_GATED_DELTA_NET || !computed(gdn) || gdn->type != GGML_TYPE_F32) {
+            continue;
+        }
+        const ggml_tensor * v = gdn->src[2];
+        if (v->ne[2] != 1 || v->ne[3] != 1 || gdn->src[3]->ne[0] != 1) {
+            continue;
+        }
+        // q and k: SCALE(RMS_NORM(x)) over rows of S_v, the same scale and eps for both
+        const ggml_tensor * qk[2] = {};
+        const ggml_tensor * skip[5] = {};
+        float eps[2] = {}, scale[2] = {};
+        bool ok = true;
+        for (int s = 0; s < 2 && ok; ++s) {
+            const ggml_tensor * sc = gdn->src[s];
+            ok = sc->op == GGML_OP_SCALE && computed(sc) && uses(sc) == 1 && ggml_get_op_params_f32(sc, 1) == 0.0f &&
+                 f32(sc) && sc->ne[0] == v->ne[0];
+            const ggml_tensor * rn = ok ? sc->src[0] : nullptr;
+            ok = ok && rn->op == GGML_OP_RMS_NORM && computed(rn) && uses(rn) == 1 && f32(rn) &&
+                 f32(rn->src[0]) && ggml_are_same_shape(rn->src[0], sc) && aligned(rn->src[0]);
+            if (ok) {
+                qk[s] = rn->src[0];
+                eps[s] = ggml_get_op_params_f32(rn, 0);
+                scale[s] = ggml_get_op_params_f32(sc, 0);
+                skip[2*s] = sc;
+                skip[2*s + 1] = rn;
+            }
+        }
+        // the shader reads k at q's offsets
+        ok = ok && eps[0] == eps[1] && scale[0] == scale[1] &&
+             qk[0]->nb[1] == qk[1]->nb[1] && qk[0]->nb[2] == qk[1]->nb[2] && qk[0]->nb[3] == qk[1]->nb[3];
+        const ggml_tensor * sig = gdn->src[4];
+        ok = ok && sig->op == GGML_OP_UNARY && ggml_get_unary_op(sig) == GGML_UNARY_OP_SIGMOID && computed(sig) &&
+             uses(sig) == 1 && f32(sig) && f32(sig->src[0]) && ggml_are_same_shape(sig, sig->src[0]) &&
+             sig->src[0]->nb[1] == sig->nb[1] && sig->src[0]->nb[2] == sig->nb[2] && sig->src[0]->nb[3] == sig->nb[3] &&
+             aligned(sig->src[0]);
+        if (!ok) {
+            continue;
+        }
+        skip[4] = sig;
+        // the GDN writes its output while other workgroups still read these
+        if (ggml_vk_tensors_overlap(qk[0], gdn, false) || ggml_vk_tensors_overlap(qk[1], gdn, false) ||
+                ggml_vk_tensors_overlap(sig->src[0], gdn, false)) {
+            continue;
+        }
+        // The allocator frees a source once its skipped reader is placed, unless something else keeps it: a node
+        // run between that reader and the GDN may take its block. Nodes skipped here do not run.
+        const auto clobbered = [&](const ggml_tensor * reader, const ggml_tensor * t) {
+            const int from = ggml_vk_graph_index(cgraph, reader);
+            if (from < 0 || !ggml_backend_buffer_is_vk(t->buffer)) {
+                return true;
+            }
+            for (int j = from + 1; j < i; ++j) {
+                ggml_tensor * n = cgraph->nodes[j];
+                if (std::find(std::begin(skip), std::end(skip), n) != std::end(skip) || ggml_vk_is_empty(n) ||
+                        !computed(n)) {
+                    continue;
+                }
+                if (!n->buffer || !ggml_backend_buffer_is_vk(n->buffer) || ggml_vk_tensors_overlap(n, t, false)) {
+                    return true;
+                }
+            }
+            return false;
+        };
+        if (clobbered(skip[1], qk[0]) || clobbered(skip[3], qk[1]) || clobbered(sig, sig->src[0])) {
+            continue;
+        }
+        for (const ggml_tensor * t : skip) {
+            ctx->gdn_state_skip.insert(t);
+        }
+        ctx->gdn_inputs_io[gdn] = { qk[0], qk[1], sig->src[0], eps[0], scale[0] };
+    }
+}
+
 static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
     std::lock_guard<std::recursive_mutex> compute_lock(vk_compute_mutex);
     VK_LOG_DEBUG("ggml_backend_vk_graph_compute(" << cgraph->n_nodes << " nodes)");
@@ -16869,6 +17011,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
 
     ggml_vk_fold_gdn_state(ctx, cgraph);
     ggml_vk_fold_conv_state(ctx, cgraph);
+    ggml_vk_fold_gdn_inputs(ctx, cgraph);
 
     int last_node = cgraph->n_nodes - 1;
 
