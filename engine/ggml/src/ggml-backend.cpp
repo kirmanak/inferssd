@@ -1827,6 +1827,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                 bool *) = nullptr;
         void (*reads)(ggml_backend_t, const ggml_tensor * const *, const size_t *, int) = nullptr;
         bool (*take_reads)(ggml_backend_t, const ggml_tensor * const *, void * const *, const size_t *, int) = nullptr;
+        bool (*wait_reads)(ggml_backend_t) = nullptr;
         bool enabled = false;
         bool looked = false;
     } park;
@@ -1893,6 +1894,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                 ggml_backend_reg_get_proc_address(reg, "ggml_vk_park_reads");
         park.take_reads = (bool (*)(ggml_backend_t, const ggml_tensor * const *, void * const *, const size_t *, int))
                 ggml_backend_reg_get_proc_address(reg, "ggml_vk_park_take_reads");
+        park.wait_reads = (bool (*)(ggml_backend_t)) ggml_backend_reg_get_proc_address(reg, "ggml_vk_park_wait_reads");
         park.enabled = park.record && park.submit && park.drop;
         read_batch = (bool (*)(const ggml_tensor * const *, void **, const size_t *, int))
                 ggml_backend_reg_get_proc_address(reg, "ggml_vk_read_batch");
@@ -1940,7 +1942,10 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                     }
                 }
                 if (vk_upload_window) { vk_upload_window(1); }
-                ggml_backend_synchronize(producer);
+                // The parked record flags its reads done; the fence follows some 20 us later.
+                if (!(park.wait_reads && park.wait_reads(producer))) {
+                    ggml_backend_synchronize(producer);
+                }
                 if (vk_upload_window) { vk_upload_window(0); }
                 const double sync_us = (double) (ggml_time_us() - sync_t0);
                 const int64_t batch_t0 = ggml_time_us();

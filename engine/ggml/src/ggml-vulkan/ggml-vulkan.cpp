@@ -2117,6 +2117,10 @@ struct ggml_backend_vk_context {
         std::vector<const ggml_tensor *> read_srcs;
         std::vector<size_t> read_sizes;
         bool reads_recorded = false;
+        // The record writes 1 to this word of read_staging after the reads (the submit clears it): the CPU split
+        // waits on it, not on the fence, see ggml_vk_park_wait_reads.
+        size_t flag_off = 0;
+        bool done_flag = false;
         std::vector<vk::DescriptorPool> pools;
         std::vector<vk::DescriptorSet> sets;
         uint32_t set_idx = 0;
@@ -13685,9 +13689,10 @@ static void ggml_vk_record_park_reads(ggml_backend_vk_context * ctx, vk_context 
         buffers.push_back(buf_ctx->dev_buffer->buffer);
         cursor += ctx->park_reads_sizes[i];
     }
-    if (!park.read_staging || !park.read_staging->ptr || park.read_staging->size < cursor) {
+    const size_t flag_off = (cursor + 63u) & ~size_t(63);
+    if (!park.read_staging || !park.read_staging->ptr || park.read_staging->size < flag_off + sizeof(uint32_t)) {
         ggml_vk_destroy_buffer(park.read_staging);
-        park.read_staging = ggml_vk_create_buffer_check(ctx->device, std::max(cursor, size_t(64 * 1024)),
+        park.read_staging = ggml_vk_create_buffer_check(ctx->device, std::max(flag_off + sizeof(uint32_t), size_t(64 * 1024)),
                 vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent | vk::MemoryPropertyFlagBits::eHostCached,
                 vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent);
     }
@@ -13697,9 +13702,20 @@ static void ggml_vk_record_park_reads(ggml_backend_vk_context * ctx, vk_context 
     for (size_t i = 0; i < regions.size(); ++i) {
         cmd.copyBuffer(buffers[i], park.read_staging->buffer, regions[i]);
     }
+    static const bool flag_on = getenv("INFERSSD_NO_PARK_FLAG") == nullptr;
+    if (flag_on) {
+        // The copies are done and available to the host before the flag is written.
+        vk::BufferMemoryBarrier data{ vk::AccessFlagBits::eTransferWrite, vk::AccessFlagBits::eHostRead | vk::AccessFlagBits::eTransferWrite,
+                VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED, park.read_staging->buffer, 0, flag_off };
+        cmd.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer, vk::PipelineStageFlagBits::eTransfer | vk::PipelineStageFlagBits::eHost,
+                {}, nullptr, data, nullptr);
+        cmd.fillBuffer(park.read_staging->buffer, flag_off, sizeof(uint32_t), 1);
+    }
     vk::BufferMemoryBarrier host{ vk::AccessFlagBits::eTransferWrite, vk::AccessFlagBits::eHostRead,
             VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED, park.read_staging->buffer, 0, VK_WHOLE_SIZE };
     cmd.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer, vk::PipelineStageFlagBits::eHost, {}, nullptr, host, nullptr);
+    park.flag_off = flag_off;
+    park.done_flag = flag_on;
     park.read_srcs = ctx->park_reads_srcs;
     park.read_sizes = ctx->park_reads_sizes;
     park.reads_recorded = true;
@@ -18267,6 +18283,10 @@ extern "C" bool ggml_vk_park_submit(ggml_backend_t backend) {
         sub.wait_semaphores.push_back(ctx->transfer_semaphore);
     }
     for (auto & mem : park.held->in_memcpys) { memcpy(mem.dst, mem.src, mem.n); }
+    if (park.reads_recorded && park.done_flag) {
+        // host-coherent: the device sees the clear at the submit
+        *reinterpret_cast<volatile uint32_t *>(static_cast<uint8_t *>(park.read_staging->ptr) + park.flag_off) = 0;
+    }
     ggml_vk_submit(park.held, {});
     ctx->submit_pending = true;
     ctx->park_reads_slot = park.reads_recorded ? ctx->park_ready : -1;
@@ -18308,6 +18328,30 @@ extern "C" void ggml_vk_park_reads(ggml_backend_t backend, const ggml_tensor * c
     if (off || !srcs || !sizes || n <= 0) { return; }
     ctx->park_reads_srcs.assign(srcs, srcs + n);
     ctx->park_reads_sizes.assign(sizes, sizes + n);
+}
+
+// Waits for the submitted park's reads by the flag its record writes after them, instead of a fence: a fence signals
+// some 20 us after the GPU's last write reaches host memory. The fence and the park's slot are left for the next
+// synchronize. Returns false when the park has no flag; the caller then synchronizes.
+extern "C" bool ggml_vk_park_wait_reads(ggml_backend_t backend) {
+    if (!backend) { return false; }
+    std::lock_guard<std::recursive_mutex> compute_lock(vk_compute_mutex);
+    auto * ctx = static_cast<ggml_backend_vk_context *>(backend->context);
+    if (!ctx || ctx->park_reads_slot < 0 || !ctx->compute_ctx.expired()) { return false; }
+    auto & park = ctx->parks[ctx->park_reads_slot];
+    if (!park.in_flight || !park.reads_recorded || !park.done_flag || !park.read_staging || !park.read_staging->ptr) {
+        return false;
+    }
+    const volatile uint32_t * flag =
+            reinterpret_cast<const volatile uint32_t *>(static_cast<const uint8_t *>(park.read_staging->ptr) + park.flag_off);
+    const int64_t t0 = ggml_time_us();
+    for (uint32_t spins = 0; *flag != 1; ++spins) {
+        YIELD();
+        // a lost device or a stuck queue: the fence wait reports it
+        if ((spins & 1023) == 1023 && ggml_time_us() - t0 > 2000000) { return false; }
+    }
+    std::atomic_thread_fence(std::memory_order_acquire);
+    return true;
 }
 
 // After the caller has synchronized the backend: the reads the last submitted park copied at its end, if they are
@@ -19766,6 +19810,9 @@ static void * ggml_backend_vk_reg_get_proc_address(ggml_backend_reg_t reg, const
     }
     if (name && strcmp(name, "ggml_vk_park_take_reads") == 0) {
         return (void *) ggml_vk_park_take_reads;
+    }
+    if (name && strcmp(name, "ggml_vk_park_wait_reads") == 0) {
+        return (void *) ggml_vk_park_wait_reads;
     }
     if (name && strcmp(name, "ggml_vk_park_drop") == 0) {
         return (void *) ggml_vk_park_drop;
